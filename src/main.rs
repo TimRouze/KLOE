@@ -1,14 +1,15 @@
 #![allow(dead_code)]
 
 use clap::Parser;
+use rayon::vec;
 use seq_io::fasta::{Reader, Record};
-use std::collections::HashMap;
+use std::collections::{HashMap, BinaryHeap};
 use std::collections::btree_map::Keys;
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
 use std::path::Path;
 use std::io::{Write, self, BufRead, stdin};
-use std::cmp::{min, max};//bebou
+use std::cmp::{min, max, Reverse};//bebou
 use std::env;
 use::rayon::prelude::*;
 use flate2::write::GzEncoder;
@@ -46,29 +47,104 @@ fn main() {
     let input_fof = args.input.as_str();
     let size =  args.memory * 1_000_000_000;
 
-    env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
+    //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     if let Ok(lines_temp) = read_lines(input_fof){
         let nb_files = lines_temp.count();
-        match process_fof_parallel(input_fof, nb_files, size) {
+        let file = File::open(input_fof).unwrap();
+        let reader = io::BufReader::new(file);
+        let mut vec_of_kmer_vec = Vec::new();
+        reader.lines()
+              .for_each(|line| {
+                let filename = line.unwrap();
+                println!("{}", filename);
+                let curr_vec = read_fasta(&filename);
+                vec_of_kmer_vec.push(curr_vec);
+              });
+        process_vectors(&mut vec_of_kmer_vec);
+        /*match process_fof_parallel(input_fof, nb_files, size) {
             Ok(hist_mutex) => {
                 println!("All {} files have been read...\nWriting output...", nb_files);
                 //let hist = Arc::try_unwrap(hist_mutex).expect("Failed to unnwrap Arc").into_inner().expect("Failed to get Mutex");
                 //write_output(hist, nb_files).unwrap();
             }
             Err(err) => eprintln!("Error reading or processing file: {}", err),
-        }
+        }*/
     }
+
 //    var |-ma-variable-est-un-kebab-|
 //    var ma_variable_est_un_serpent
 //    var maVariableEstUnChameaubebou
 }
 
-fn process_fof_parallel(filename: &str, nb_files: usize, size: usize) -> io::Result<bool>{
+fn read_fasta(filename: &str) -> Vec<u64>{
+    let ( reader, _compression) = niffler::get_reader(Box::new(File::open(&filename).unwrap())).unwrap();
+    let mut fa_reader = Reader::new(reader);
+    let mut kmer_vec = Vec::new();
+    while let Some(record) = fa_reader.next(){
+        let record = record.expect("Error reading record");
+        for s in record.seq_lines(){
+            let seq = String::from_utf8_lossy(s);
+            if seq.len() >= 31{
+                for _i in 0..(seq.len()-K){
+                    let k_mer = str2num(&seq[_i.._i+K]);
+                    let canon = canon(k_mer, rev_comp(k_mer));
+                    kmer_vec.push(canon);
+                }
+            }
+        }
+    }
+    kmer_vec.sort();
+    kmer_vec.dedup();
+    kmer_vec
+}
+
+fn process_vectors(vec_of_kmer_vecs:  &mut Vec<Vec<u64>>){
+    println!("NB lists = {}", vec_of_kmer_vecs.len());
+    let mut indices = vec![0; vec_of_kmer_vecs.len()];
+    let mut kmer_heap = BinaryHeap::new();
+    let mut kmer_color: Vec<(u64, String)> = Vec::new();
+    let mut run = true;
+    let mut counter = 0;
+    vec_of_kmer_vecs.iter().for_each(|kmer_vec|{
+        kmer_heap.push(Reverse(kmer_vec[0]));
+    });
+    while run{
+        if let Some(min_kmer) = kmer_heap.pop(){
+            let mut new_kmer_color: (u64, String) = (min_kmer.0, String::from(""));
+            for i in 0..vec_of_kmer_vecs.len(){
+                if indices[i] < vec_of_kmer_vecs[i].len(){
+                    if min_kmer.0 == vec_of_kmer_vecs[i][indices[i]]{
+                        //TODO UPDATE COLOR
+                        new_kmer_color.1 += &(i.to_string()+"_");
+                        
+                        indices[i] += 1;
+                        //println!("ITS A MATCH");
+                        counter += 1;
+                        if indices[i] < vec_of_kmer_vecs[i].len(){
+                            kmer_heap.push(Reverse(vec_of_kmer_vecs[i][indices[i]]));
+                        }
+                    }
+                }
+            }
+            if new_kmer_color.1 != ""{
+                kmer_color.push(new_kmer_color);
+            }
+        }else{
+            run = false;
+        }
+    }
+    println!("NB kmer in 1 = {}", vec_of_kmer_vecs[0].len());
+    println!("NB kmer in 2 = {}", vec_of_kmer_vecs[1].len());
+    println!("I have seen {} matches!", counter);
+}
+
+
+/*fn process_fof_parallel(filename: &str, nb_files: usize, size: usize) -> io::Result<bool>{
     let file = File::open(filename)?;
     let header = ">\n";
     let new_line = "\n";
     let reader = io::BufReader::new(file);
-    let kmers_mutex: Arc<Mutex<HashMap<u64,String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let kmers_mutex: Arc<Mutex<HashMap<String,HashSet<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
     let colors_mutex: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // Process lines in parallel using rayon
     reader
@@ -79,11 +155,12 @@ fn process_fof_parallel(filename: &str, nb_files: usize, size: usize) -> io::Res
             println!("{}", filename);
             handle_fasta(filename, &kmers_mutex, &colors_mutex);
         });
+        //TODO RECONSTRUCT UNITIGS
     let colors = Arc::try_unwrap(colors_mutex).expect("Failed to unwrap Arc...").into_inner().expect("Failed to access Mutex...");
     let mut kmer_map = Arc::try_unwrap(kmers_mutex).expect("Failed to unwrap Arc...").into_inner().expect("Failed to access Mutex...");
     colors.into_iter().for_each(|color|{
         println!("{}", color);
-        let mut name = color.clone();
+        let mut name = color.clone().to_string();
         name.push_str(".fa");
         let mut file = File::create(name).unwrap();
         file.write_all(b">\n").unwrap();
@@ -97,15 +174,14 @@ fn process_fof_parallel(filename: &str, nb_files: usize, size: usize) -> io::Res
     });
     Ok(true)
 }
-//  TODO ADD MERGE PROCESS OR HANDLE SIMETRICAL KEYS
-fn handle_fasta(filename: String, kmer_mutex: &Arc<Mutex<HashMap<u64,String>>>, color_mutex: &Arc<Mutex<Vec<String>>>){
+fn handle_fasta(filename: String, kmer_mutex: &Arc<Mutex<HashMap<String,HashSet<u64>>>>, color_mutex: &Arc<Mutex<Vec<String>>>){
     let filename_as_vec: Vec<&str> = filename.split('.').collect();
     let temp: Vec<&str> = filename_as_vec[0].split('/').collect();
     let mut id: String = temp.last().unwrap().to_string();
     id.retain(|c| !r#"(),"_"#.contains(c));
     {
     let mut colors = color_mutex.lock().unwrap();
-    colors.push(id.to_string());
+    colors.push(id.to_string());//1);
     }
     /* let mut s=String::new();
     stdin().read_line(&mut s).expect("Did not enter a correct string"); */
@@ -120,83 +196,31 @@ fn handle_fasta(filename: String, kmer_mutex: &Arc<Mutex<HashMap<u64,String>>>, 
                     let k_mer = str2num(&seq[_i.._i+K]);
                     let canon = canon(k_mer, rev_comp(k_mer));
                     let mut kmer_map = kmer_mutex.lock().unwrap();
-                    if let Some(color_id) = kmer_map.insert(canon, id.to_string()){
-                        if !color_id.contains(&id){
-                            //println!("prev id = {}", color_id);
-                            let new_id = format!("{}_{}", color_id, id);
-                            kmer_map.insert(canon, new_id);
-                            let mut colors = color_mutex.lock().unwrap();
-                            if !colors.contains(&format!("{}_{}", min(&color_id, &id), max(&color_id, &id))){
-                                colors.push(format!("{}_{}", min(&color_id, &id), max(&color_id, &id)));
-                            }
-                            /* if color_id.len() > 13{
-                                println!("New id = {}\ncurr id = {}", color_id, &id);
-                                let mut s=String::new();
-                                stdin().read_line(&mut s).expect("Did not enter a correct string");
-                            } */
-                            /* println!("New id = {}\ncurr id = {}", color_id, id);
-                            let mut s=String::new();
-                            stdin().read_line(&mut s).expect("Did not enter a correct string"); */
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-/* fn handle_fasta(filename: String, mutex: &Arc<RwLock<HashMap<String,Vec<u64>>>>){
-    let filename_as_vec: Vec<&str> = filename.split('.').collect();
-    let temp: Vec<&str> = filename_as_vec[0].split('/').collect();
-    let id = temp.last().unwrap();
-    /* let mut s=String::new();
-    stdin().read_line(&mut s).expect("Did not enter a correct string"); */
-    let ( reader, _compression) = niffler::get_reader(Box::new(File::open(&filename).unwrap())).unwrap();
-    let mut fa_reader = Reader::new(reader);
-    while let Some(record) = fa_reader.next(){
-        let record = record.expect("Error reading record");
-        for s in record.seq_lines(){
-            let seq = String::from_utf8_lossy(s);
-            if seq.len() >= 31{
-                for _i in 0..(seq.len()-K){
-                    let k_mer = str2num(&seq[_i.._i+K]);
-                    let canon = canon(k_mer, rev_comp(k_mer));
-                    let map_reader = mutex.read().unwrap();
-                    //let vector = kmer_map.entry(id.to_string()).or_insert(vec![]);
-                    //vector.push(canon);
-                    if map_reader.keys().len() > 1{
-                        let mut tmp = id.to_string();//String::new();
-                        let clone_dunno_why = map_reader.clone();
-                        clone_dunno_why.into_iter().for_each(|(key, vector)|{
-                            /* println!("{}\n{}\n{}", key, num2str(canon), vector.contains(&canon));
-                            let mut s=String::new();
-                            stdin().read_line(&mut s).expect("Did not enter a correct string"); */
-                            if vector.contains(&canon){
-                                tmp += &key;
-                                let mut map_writer = mutex.write().unwrap();
-                                let curr_vec = map_writer.entry(key.to_string()).or_default();
-                                curr_vec.swap_remove(curr_vec.iter().position(|x| *x == canon).expect("kmer not found"));
-                            }
+                    let mut kmers = kmer_map.entry(id).or_default();
+                    if !kmers.contains(&canon){
+                        kmers.insert(canon);
+                        let mut colors = color_mutex.lock().unwrap();
+                        colors.into_iter().for_each(|color|{
+                            
                         });
-                        let mut map_writer = mutex.write().unwrap();
-                        let kmer_vec = map_writer.entry(tmp).or_insert(vec![]);
-                        kmer_vec.push(canon);
-                        /* let display = kmer_map.clone();
-                        display.into_iter().for_each(|(key,val)|{
-                            println!("Key = {}", key);
-                            println!("{}", val.len());
+                        if !colors.contains(&format!("{}_{}", min(&color_id, &id), max(&color_id, &id))){//&3){//
+                            colors.push(format!("{}_{}", min(&color_id, &id), max(&color_id, &id)));//3);
+                        }
+                        /* if color_id.len() > 13{
+                            println!("New id = {}\ncurr id = {}", color_id, &id);
                             let mut s=String::new();
                             stdin().read_line(&mut s).expect("Did not enter a correct string");
-                        }); */
-                    }else{
-                        let mut map_writer = mutex.write().unwrap();
-                        let vector = map_writer.entry(id.to_string()).or_insert(vec![]);
-                        vector.push(canon);
+                        } */
+                        /* println!("New id = {}\ncurr id = {}", color_id, id);
+                        let mut s=String::new();
+                        stdin().read_line(&mut s).expect("Did not enter a correct string"); */
                     }
                 }
             }
         }
     }
-} */
+}*/
+
 /*
 fn write_output(hist: Vec<u64>, nb_files: usize) -> Result<(), Box<dyn Error>>{
 
