@@ -5,6 +5,7 @@ use rayon::vec;
 use seq_io::fasta::{Reader, Record};
 use std::collections::{HashMap, BinaryHeap};
 use std::collections::btree_map::Keys;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
 use std::path::Path;
@@ -47,20 +48,32 @@ fn main() {
     let input_fof = args.input.as_str();
     let size =  args.memory * 1_000_000_000;
 
-    //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
+    env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     if let Ok(lines_temp) = read_lines(input_fof){
         let nb_files = lines_temp.count();
         let file = File::open(input_fof).unwrap();
         let reader = io::BufReader::new(file);
-        let mut vec_of_kmer_vec = Vec::new();
+        let vec_of_kmer_vec_mutex: Arc<Mutex<Vec<Vec<u64>>>> = Arc::new(Mutex::new(Vec::new()));
         reader.lines()
+              .par_bridge()
               .for_each(|line| {
                 let filename = line.unwrap();
                 println!("{}", filename);
                 let curr_vec = read_fasta(&filename);
+                let mut vec_of_kmer_vec = vec_of_kmer_vec_mutex.lock().unwrap();
                 vec_of_kmer_vec.push(curr_vec);
               });
-        process_vectors(&mut vec_of_kmer_vec);
+        let vec_of_kmer_vecs = Arc::try_unwrap(vec_of_kmer_vec_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
+        let mut kmer_colors = process_vectors(&vec_of_kmer_vecs);
+        for (color, mut kmer_vector) in kmer_colors.iter_mut(){
+            let to_write = kmers_assemble(&Arc::new(Mutex::new(kmer_vector.to_vec())));
+            let mut path = color.to_string();
+            path.push_str("simplitigs.fa");
+            let mut f = File::create(path).expect("Unable to create file");                                                                                                          
+            for i in &to_write{                                                                                                                                                                  
+                f.write_all((*i).as_bytes()).expect("Unable to write data");                                                                                                                            
+            }     
+        }
         /*match process_fof_parallel(input_fof, nb_files, size) {
             Ok(hist_mutex) => {
                 println!("All {} files have been read...\nWriting output...", nb_files);
@@ -70,10 +83,6 @@ fn main() {
             Err(err) => eprintln!("Error reading or processing file: {}", err),
         }*/
     }
-
-//    var |-ma-variable-est-un-kebab-|
-//    var ma_variable_est_un_serpent
-//    var maVariableEstUnChameaubebou
 }
 
 fn read_fasta(filename: &str) -> Vec<u64>{
@@ -93,16 +102,16 @@ fn read_fasta(filename: &str) -> Vec<u64>{
             }
         }
     }
-    kmer_vec.sort();
+    kmer_vec.par_sort();
     kmer_vec.dedup();
     kmer_vec
 }
 
-fn process_vectors(vec_of_kmer_vecs:  &mut Vec<Vec<u64>>){
+fn process_vectors(vec_of_kmer_vecs:  &Vec<Vec<u64>>) -> HashMap<String, Vec<u64>>{
     println!("NB lists = {}", vec_of_kmer_vecs.len());
     let mut indices = vec![0; vec_of_kmer_vecs.len()];
     let mut kmer_heap = BinaryHeap::new();
-    let mut kmer_color: Vec<(u64, String)> = Vec::new();
+    let mut kmer_color: HashMap<String, Vec<u64>> = HashMap::new();
     let mut run = true;
     let mut counter = 0;
     vec_of_kmer_vecs.iter().for_each(|kmer_vec|{
@@ -110,13 +119,12 @@ fn process_vectors(vec_of_kmer_vecs:  &mut Vec<Vec<u64>>){
     });
     while run{
         if let Some(min_kmer) = kmer_heap.pop(){
-            let mut new_kmer_color: (u64, String) = (min_kmer.0, String::from(""));
+            let mut new_color: String = String::from("");
             for i in 0..vec_of_kmer_vecs.len(){
                 if indices[i] < vec_of_kmer_vecs[i].len(){
                     if min_kmer.0 == vec_of_kmer_vecs[i][indices[i]]{
                         //TODO UPDATE COLOR
-                        new_kmer_color.1 += &(i.to_string()+"_");
-                        
+                        new_color += &(i.to_string()+"_");
                         indices[i] += 1;
                         //println!("ITS A MATCH");
                         counter += 1;
@@ -126,8 +134,11 @@ fn process_vectors(vec_of_kmer_vecs:  &mut Vec<Vec<u64>>){
                     }
                 }
             }
-            if new_kmer_color.1 != ""{
-                kmer_color.push(new_kmer_color);
+            if new_color != ""{
+                kmer_color
+                .entry(new_color)
+                .and_modify(|kmer_vec| kmer_vec.push(min_kmer.0))
+                .or_insert(vec![min_kmer.0]);
             }
         }else{
             run = false;
@@ -136,8 +147,63 @@ fn process_vectors(vec_of_kmer_vecs:  &mut Vec<Vec<u64>>){
     println!("NB kmer in 1 = {}", vec_of_kmer_vecs[0].len());
     println!("NB kmer in 2 = {}", vec_of_kmer_vecs[1].len());
     println!("I have seen {} matches!", counter);
+    kmer_color
 }
 
+fn kmers_assemble(kmers_mutex: &Arc<Mutex<Vec<u64>>>) -> Vec<String> {
+    println!("New color");
+    let max_simplitigs: Vec<String> = (0..rayon::current_num_threads()).into_par_iter().flat_map(|_| {
+        let mut local_simplitigs = Vec::new();
+        while let Some(seed) = {
+            let mut kmers = kmers_mutex.lock().unwrap();
+            //println!("I will reconstruct simplitigs from {} kmers", kmers.len());
+            kmers.pop()
+        }
+        {
+            let mut simplitig = String::new();
+            let mut kmers = kmers_mutex.lock().unwrap();
+            let (remaining_kmers, extended_simplitig) = compute_max_from_kmer(&mut kmers, &seed);
+            kmers.clone_from(&remaining_kmers);
+            drop(kmers);
+            simplitig.push_str(&extended_simplitig);
+            local_simplitigs.push(simplitig);
+        }
+        local_simplitigs
+    }).collect();
+    
+    max_simplitigs
+}
+
+fn compute_max_from_kmer(available_kmers: &mut Vec<u64>, seed: &u64) -> (Vec<u64>, String) {
+    let mut simplitig = num2str(*seed);
+    let (remaining_kmers, extended_simplitig) = extend_forward(available_kmers, &mut simplitig);
+    let mut reversed_simplitig = rev_comp_str(&extended_simplitig);
+    let (remaining_kmers, final_simplitig) = extend_forward(&mut remaining_kmers.clone(), &mut reversed_simplitig);
+    (remaining_kmers, final_simplitig)
+}
+
+fn extend_forward(available_kmers: &mut Vec<u64>, simplitig: &mut String) -> (Vec<u64>, String) {
+    let mut extend = true;
+    let mask : u64 = ((1 as u64) << (2*K))-1;
+    while extend {
+        let mut query = str2num(&simplitig);
+        extend = false; // Set extend to false by default
+        for x in [b'A', b'C', b'G', b'T'].iter() {
+            query <<= 2;
+            query += nuc2int(x).unwrap();
+            query &= mask;
+            if let Some(pos) = available_kmers.iter().position(|&x| x == query){
+                simplitig.push_str(&x.to_string());
+                available_kmers.swap_remove(pos);
+                extend = true; // Set extend to true if a match is found
+                //println!("found something");
+                break;
+            }
+            query = str2num(&simplitig);
+        }
+    }
+    (available_kmers.to_vec(), simplitig.to_string())
+}
 
 /*fn process_fof_parallel(filename: &str, nb_files: usize, size: usize) -> io::Result<bool>{
     let file = File::open(filename)?;
@@ -265,6 +331,29 @@ fn num2str(mut k_mer: u64) -> String{
     res.chars().rev().collect()
 }
 
+fn nuc2int(b: &u8) -> Option<u64> {
+    match b {
+        b'A' | b'C' | b'G' | b'T' => Some(((b / 2) % 4) as u64),
+        _ => None,
+    }
+}
+
+fn rev_comp_str(seq: &String) -> String{
+    let mut res = String::new();
+    for nuc in seq.chars().into_iter(){
+        if nuc == 'A' {
+            res = format!("T{}", res);
+        }else if nuc == 'C' {
+            res = format!("G{}", res);
+        }else if nuc == 'T' {
+            res = format!("A{}", res);
+        }else{
+            res = format!("C{}", res);
+        }
+    }
+    res
+}
+
 fn rev_comp(k_mer : u64) -> u64 {
     let mut res = k_mer.reverse_bits();
     res = (res >> 1 & 0x5555_5555_5555_5555) | (res & 0x5555_5555_5555_5555) << 1;
@@ -298,6 +387,12 @@ fn test_canon(){
     let revcomp = rev_comp(kmer);
     let k_mer_canon = canon(kmer, revcomp);
     assert_eq!(num2str(k_mer_canon), "ATATTGCCCGTTGCAGTCAGAATGAAAAGCT");
+}
+#[test]
+fn test_rev_comp_str(){
+    let kmer = String::from("AGCTTTTCATTCTGACTGCAACGGGCAATAT");
+    let revcomp = rev_comp_str(&kmer);
+    assert_eq!(revcomp, "ATATTGCCCGTTGCAGTCAGAATGAAAAGCT");
 }
 /*
 #[test]
