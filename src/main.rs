@@ -1,10 +1,8 @@
 #![allow(dead_code)]
 
 use clap::Parser;
-use rayon::vec;
 use seq_io::fasta::{Reader, Record};
 use std::collections::{HashMap, BinaryHeap};
-use std::collections::btree_map::Keys;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
@@ -12,6 +10,7 @@ use std::path::Path;
 use std::io::{Write, self, BufRead, stdin};
 use std::cmp::{min, max, Reverse};//bebou
 use std::env;
+use std::time::Instant;
 use::rayon::prelude::*;
 use flate2::write::GzEncoder;
 
@@ -47,46 +46,49 @@ fn main() {
     let args = Args::parse();
     let input_fof = args.input.as_str();
     let size =  args.memory * 1_000_000_000;
-
+    println!("FILENAME: {}", input_fof);
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     if let Ok(lines_temp) = read_lines(input_fof){
         let nb_files = lines_temp.count();
         let file = File::open(input_fof).unwrap();
         let reader = io::BufReader::new(file);
         let vec_of_kmer_vec_mutex: Arc<Mutex<Vec<Vec<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let color_names_mutex = Arc::new(Mutex::new(Vec::new()));
         reader.lines()
               .par_bridge()
               .for_each(|line| {
                 let filename = line.unwrap();
                 println!("{}", filename);
+                let temp: Vec<&str> = filename.split(&['/', '.']).collect();
+                let mut color_names = color_names_mutex.lock().unwrap();
+                color_names.push(temp[temp.len()-2].to_string());
                 let curr_vec = read_fasta(&filename);
                 let mut vec_of_kmer_vec = vec_of_kmer_vec_mutex.lock().unwrap();
                 vec_of_kmer_vec.push(curr_vec);
               });
         let vec_of_kmer_vecs = Arc::try_unwrap(vec_of_kmer_vec_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
-        let mut kmer_colors = process_vectors(&vec_of_kmer_vecs);
-        for (color, mut kmer_vector) in kmer_colors.iter_mut(){
-            let to_write = kmers_assemble(&Arc::new(Mutex::new(kmer_vector.to_vec())));
+        let color_names = Arc::try_unwrap(color_names_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
+        let mut kmer_colors = process_vectors(&vec_of_kmer_vecs, &color_names);
+        for (color, kmer_vector) in kmer_colors.iter_mut(){
+            println!("Reconstructing simplitigs for {} color", color);
+            let before_kmers_assemble = Instant::now();
+            let to_write = kmers_assemble(&Arc::new(RwLock::new(kmer_vector.to_vec())));
+            println!("Assembly took: {}ms total.", before_kmers_assemble.elapsed().as_micros());
             let mut path = color.to_string();
             path.push_str("simplitigs.fa");
-            let mut f = File::create(path).expect("Unable to create file");                                                                                                          
-            for i in &to_write{                                                                                                                                                                  
-                f.write_all((*i).as_bytes()).expect("Unable to write data");                                                                                                                            
+            let mut f = File::create(path).expect("Unable to create file");
+            println!("I write {} simplitigs from {} kmers when starting.", to_write.len(), kmer_vector.len());                                                                                               
+            for i in &to_write{           
+                f.write(b">\n").unwrap();                                                                                                                                                       
+                f.write_all((*i).as_bytes()).expect("Unable to write data");
+                f.write(b"\n").unwrap();                                                                                                                         
             }     
         }
-        /*match process_fof_parallel(input_fof, nb_files, size) {
-            Ok(hist_mutex) => {
-                println!("All {} files have been read...\nWriting output...", nb_files);
-                //let hist = Arc::try_unwrap(hist_mutex).expect("Failed to unnwrap Arc").into_inner().expect("Failed to get Mutex");
-                //write_output(hist, nb_files).unwrap();
-            }
-            Err(err) => eprintln!("Error reading or processing file: {}", err),
-        }*/
     }
 }
 
 fn read_fasta(filename: &str) -> Vec<u64>{
-    let ( reader, _compression) = niffler::get_reader(Box::new(File::open(&filename).unwrap())).unwrap();
+    let ( reader, _compression) = niffler::get_reader(Box::new(File::open(filename).unwrap())).unwrap();
     let mut fa_reader = Reader::new(reader);
     let mut kmer_vec = Vec::new();
     while let Some(record) = fa_reader.next(){
@@ -107,7 +109,7 @@ fn read_fasta(filename: &str) -> Vec<u64>{
     kmer_vec
 }
 
-fn process_vectors(vec_of_kmer_vecs:  &Vec<Vec<u64>>) -> HashMap<String, Vec<u64>>{
+fn process_vectors(vec_of_kmer_vecs:  &[Vec<u64>], color_names: &[String]) -> HashMap<String, Vec<u64>>{
     println!("NB lists = {}", vec_of_kmer_vecs.len());
     let mut indices = vec![0; vec_of_kmer_vecs.len()];
     let mut kmer_heap = BinaryHeap::new();
@@ -121,20 +123,16 @@ fn process_vectors(vec_of_kmer_vecs:  &Vec<Vec<u64>>) -> HashMap<String, Vec<u64
         if let Some(min_kmer) = kmer_heap.pop(){
             let mut new_color: String = String::from("");
             for i in 0..vec_of_kmer_vecs.len(){
-                if indices[i] < vec_of_kmer_vecs[i].len(){
-                    if min_kmer.0 == vec_of_kmer_vecs[i][indices[i]]{
-                        //TODO UPDATE COLOR
-                        new_color += &(i.to_string()+"_");
-                        indices[i] += 1;
-                        //println!("ITS A MATCH");
-                        counter += 1;
-                        if indices[i] < vec_of_kmer_vecs[i].len(){
-                            kmer_heap.push(Reverse(vec_of_kmer_vecs[i][indices[i]]));
-                        }
+                if indices[i] < vec_of_kmer_vecs[i].len() && min_kmer.0 == vec_of_kmer_vecs[i][indices[i]]{
+                    new_color += &(color_names[i].to_string()+"_");
+                    indices[i] += 1;
+                    counter += 1;
+                    if indices[i] < vec_of_kmer_vecs[i].len(){
+                        kmer_heap.push(Reverse(vec_of_kmer_vecs[i][indices[i]]));
                     }
                 }
             }
-            if new_color != ""{
+            if !new_color.is_empty(){
                 kmer_color
                 .entry(new_color)
                 .and_modify(|kmer_vec| kmer_vec.push(min_kmer.0))
@@ -150,59 +148,61 @@ fn process_vectors(vec_of_kmer_vecs:  &Vec<Vec<u64>>) -> HashMap<String, Vec<u64
     kmer_color
 }
 
-fn kmers_assemble(kmers_mutex: &Arc<Mutex<Vec<u64>>>) -> Vec<String> {
-    println!("New color");
+fn kmers_assemble(kmers_mutex: &Arc<RwLock<Vec<u64>>>) -> Vec<String>{
+    println!("I will reconstruct simplitigs from {} kmers", kmers_mutex.read().unwrap().len());
     let max_simplitigs: Vec<String> = (0..rayon::current_num_threads()).into_par_iter().flat_map(|_| {
         let mut local_simplitigs = Vec::new();
         while let Some(seed) = {
-            let mut kmers = kmers_mutex.lock().unwrap();
-            //println!("I will reconstruct simplitigs from {} kmers", kmers.len());
+            let mut kmers = kmers_mutex.write().unwrap();
             kmers.pop()
         }
         {
             let mut simplitig = String::new();
-            let mut kmers = kmers_mutex.lock().unwrap();
-            let (remaining_kmers, extended_simplitig) = compute_max_from_kmer(&mut kmers, &seed);
-            kmers.clone_from(&remaining_kmers);
-            drop(kmers);
+            let before_max_simplitig = Instant::now();
+            let extended_simplitig = compute_max_from_kmer(kmers_mutex, &seed);
+            println!("Assembly of 1 simplitig took: {}ms total.", before_max_simplitig.elapsed().as_micros());
             simplitig.push_str(&extended_simplitig);
             local_simplitigs.push(simplitig);
         }
         local_simplitigs
     }).collect();
-    
     max_simplitigs
 }
 
-fn compute_max_from_kmer(available_kmers: &mut Vec<u64>, seed: &u64) -> (Vec<u64>, String) {
+fn compute_max_from_kmer(available_kmers_mutex: &Arc<RwLock<Vec<u64>>>, seed: &u64) -> String {
     let mut simplitig = num2str(*seed);
-    let (remaining_kmers, extended_simplitig) = extend_forward(available_kmers, &mut simplitig);
+    let before_forward_canon = Instant::now();
+    let extended_simplitig = extend_forward(available_kmers_mutex, &mut simplitig);
+    println!("Forward extension canonical left took: {}ms total.", before_forward_canon.elapsed().as_micros());
     let mut reversed_simplitig = rev_comp_str(&extended_simplitig);
-    let (remaining_kmers, final_simplitig) = extend_forward(&mut remaining_kmers.clone(), &mut reversed_simplitig);
-    (remaining_kmers, final_simplitig)
+    let before_forward_revcomp = Instant::now();
+    simplitig = extend_forward(available_kmers_mutex, &mut reversed_simplitig);
+    println!("Forward extension reverse way took: {}ms total.", before_forward_revcomp.elapsed().as_micros());
+    simplitig
 }
 
-fn extend_forward(available_kmers: &mut Vec<u64>, simplitig: &mut String) -> (Vec<u64>, String) {
+fn extend_forward(available_kmers_mutex: &Arc<RwLock<Vec<u64>>>, simplitig: &mut String) -> String {
     let mut extend = true;
-    let mask : u64 = ((1 as u64) << (2*K))-1;
+    let mask : u64 = ((1_u64) << (2*K))-1;
     while extend {
-        let mut query = str2num(&simplitig);
+        let mut query = str2num(&simplitig[(simplitig.len()-K)..]);
         extend = false; // Set extend to false by default
         for x in [b'A', b'C', b'G', b'T'].iter() {
             query <<= 2;
             query += nuc2int(x).unwrap();
             query &= mask;
-            if let Some(pos) = available_kmers.iter().position(|&x| x == query){
-                simplitig.push_str(&x.to_string());
-                available_kmers.swap_remove(pos);
+            query = canon(query, rev_comp(query));
+            let mut read_available_kmers = available_kmers_mutex.write().unwrap();
+            if let Some(pos) = read_available_kmers.iter().position(|&x| x == query){
+                simplitig.push(*x as char);
+                read_available_kmers.swap_remove(pos);
                 extend = true; // Set extend to true if a match is found
-                //println!("found something");
                 break;
             }
-            query = str2num(&simplitig);
+            query = str2num(&simplitig[(simplitig.len()-K)..]);
         }
     }
-    (available_kmers.to_vec(), simplitig.to_string())
+    simplitig.to_string()
 }
 
 /*fn process_fof_parallel(filename: &str, nb_files: usize, size: usize) -> io::Result<bool>{
@@ -338,9 +338,9 @@ fn nuc2int(b: &u8) -> Option<u64> {
     }
 }
 
-fn rev_comp_str(seq: &String) -> String{
+fn rev_comp_str(seq: &str) -> String{
     let mut res = String::new();
-    for nuc in seq.chars().into_iter(){
+    for nuc in seq.chars(){
         if nuc == 'A' {
             res = format!("T{}", res);
         }else if nuc == 'C' {
