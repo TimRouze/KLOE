@@ -65,7 +65,7 @@ fn main() {
                 let filename = line.unwrap().clone();
                 println!("{}", filename);
                 let mut color_names = color_names_mutex.lock().unwrap();
-                color_names.push(Path::new(&filename).file_stem().unwrap().to_str().unwrap().to_string());
+                color_names.push(extract_filename(&filename).unwrap().to_string());
                 let curr_vec = read_fasta(&filename);
                 let mut vec_of_kmer_vec = vec_of_kmer_vec_mutex.lock().unwrap();
                 vec_of_kmer_vec.push(curr_vec);
@@ -300,6 +300,23 @@ fn write_output(hist: Vec<u64>, nb_files: usize) -> Result<(), Box<dyn Error>>{
 }
 */
 //bebou
+
+fn extract_filename(path: &str) -> Option<&str> {
+    // Split the path by '/'
+    let parts: Vec<&str> = path.split('/').collect();
+    // Get the last element of the path
+    if let Some(filename) = parts.last() {
+        // Split the filename by '.' and take the first part
+        if let Some(idx) = filename.find('.') {
+            Some(&filename[..idx])
+        } else {
+            Some(filename)
+        }
+    } else {
+        None
+    }
+}
+
 fn canon(k_mer1: u64, k_mer2:u64) -> u64{
     min(k_mer1, k_mer2)
 }
