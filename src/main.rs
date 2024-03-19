@@ -29,6 +29,9 @@ struct Args {
     /// Number of threads (defaults to all available threads)
     #[arg(short, long, default_value_t = 1)]
     threads: usize,
+    ///Output directory
+    #[arg(short, long, default_value_t = String::from(""))]
+    out_dir: String,
     /// Memory (in GB) allocated to Bloom filters (defaults to 4GB)
     #[arg(short, long, default_value_t = 4)]
     memory: usize,
@@ -52,6 +55,7 @@ fn main() {
     let input_fof = args.input.as_str();
     let size =  args.memory * 1_000_000_000;
     println!("FILENAME: {}", input_fof);
+    let output_dir = args.out_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     if let Ok(lines_temp) = read_lines(input_fof){
         let nb_files = lines_temp.count();
@@ -80,7 +84,7 @@ fn main() {
             println!("Assembly took: {}ms total.", before_kmers_assemble.elapsed().as_micros());
             let mut path = color.to_string();
             path.push_str("simplitigs.fa.gz");
-            let mut f = GzEncoder::new(File::create(path).expect("Unable to create file"), Compression::default());
+            let mut f = GzEncoder::new(File::create(output_dir.clone()+&path).expect("Unable to create file"), Compression::default());
             println!("I write {} simplitigs from {} kmers when starting.", to_write.len(), kmer_map.len());                                                                                               
             for i in &to_write{           
                 f.write(b">\n").unwrap();                                                                                                                                                       
