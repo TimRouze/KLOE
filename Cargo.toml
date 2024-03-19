@@ -12,3 +12,10 @@ flate2 = "1.0.28"
 niffler = "2.5.0"
 rayon = "1.8.0"
 seq_io = "0.3.2"
+nuc2bit = {git = "https://github.com/natir/nuc2bit.git"}
+rand = "0.8.5"
+
+
+[profile.release]
+debug = true
+strip = false
