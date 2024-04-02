@@ -4,12 +4,12 @@ mod kmer;
 use clap::Parser;
 use flate2::Compression;
 use seq_io::fasta::{Reader, Record};
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
 use std::path::Path;
 use std::io::{Write, self, BufRead, stdin};
-use std::cmp::{min, max, Reverse};//bebou
+use std::cmp::min;//bebou
 use std::env;
 use std::time::Instant;
 use::rayon::prelude::*;
@@ -17,8 +17,6 @@ use flate2::write::GzEncoder;
 use bit_vec::BitVec;
 
 use kmer::{Kmer, RawKmer, Base};
-
-use crate::kmer::RevComp;
 
 const K: usize = 31;
 pub type KT = u64;
@@ -45,10 +43,7 @@ struct Args {
     seed: u64,
 }
 // TODO:
-    // CREATE FOF INPUT FILE WITH LINK TO COMPRESSED FILES CONTAINING KMERS
-        // ASSOCIATE INPUT FILENAME WITH OUTPUT FILENAMES OF COLORS CONTAINING THIS SET
-        // HASH TABLE
-    // QUERY FUNCTION TO QUERY FILENAME FROM COMPRESSED SET
+    // REPLACE BIT VECTOR BY U64 SETTING BITS TO 1 OR 0
 fn main() {
     let args = Args::parse();
     let input_fof = args.input.as_str();
@@ -66,22 +61,26 @@ fn main() {
               .for_each(|line| {
                 let filename = line.unwrap().clone();
                 println!("{}", filename);
-                let curr_vec = read_fasta(&filename, &kmer_map_mutex, nb_files, &file_number_mutex);
+                read_fasta(&filename, &kmer_map_mutex, nb_files, &file_number_mutex);
+                println!("HASH MAP CURR CAPACITY = {}", kmer_map_mutex.lock().unwrap().capacity());
                 let mut file_number = file_number_mutex.write().unwrap();
                 *file_number += 1;
                 drop(file_number);
               });
         let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
-        let omnicolored_kmers = get_omnicolor(&mut kmer_map, nb_files);
-        let to_write_omnicolor = kmers_assemble(&RwLock::new(omnicolored_kmers.clone()));
-        let mut f = GzEncoder::new(File::create(output_dir.clone()+"omnicolor.fa.gz").expect("Unable to create file"), Compression::default());
+        println!("NB KMER = {}", kmer_map.len());
+        println!("HASH MAP END CAPACITY = {}", kmer_map.capacity());
+        //let omnicolored_kmers = get_omnicolor(&mut kmer_map, nb_files);
+        // let to_write_omnicolor = 
+        //kmers_assemble(&RwLock::new(omnicolored_kmers.clone()), &output_dir);
+        /*let mut f = GzEncoder::new(File::create(output_dir.clone()+"omnicolor.fa.gz").expect("Unable to create file"), Compression::default());
         println!("I write {} simplitigs from {} kmers when starting.", to_write_omnicolor.len(), omnicolored_kmers.len());                                                                                               
         for i in &to_write_omnicolor{           
             f.write(b">\n").unwrap();                                                                                                                                                       
             f.write_all((*i).as_bytes()).expect("Unable to write data");
             f.write(b"\n").unwrap();                                                                                                                         
-        } 
-        handle_other_colors(&mut kmer_map);
+        } */
+        //handle_other_colors(&mut kmer_map, &output_dir);
         /*for (color, kmer_map) in kmer_colors.iter_mut(){
             println!("Reconstructing simplitigs for {} color", color);
             let before_kmers_assemble = Instant::now();
@@ -126,10 +125,9 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, BitVec>>>,
         }
     }
 }
-fn handle_other_colors(kmer_map:  &mut HashMap<u64, BitVec>){
+fn handle_other_colors(kmer_map:  &mut HashMap<u64, BitVec>, output_dir: &String){
     println!("I will reconstruct simplitigs from {} kmers from different colors", kmer_map.len());
-    let nb_kmers = kmer_map.len();
-    let mut simplitigs = Vec::new();
+    let mut f = GzEncoder::new(File::create(output_dir.clone()+"multicolor.fa.gz").expect("Unable to create file"), Compression::default());
     let mut to_remove = Vec::new();
     while let Some(pair) = get_first_key_value(kmer_map){
         let key = pair.0;
@@ -139,7 +137,7 @@ fn handle_other_colors(kmer_map:  &mut HashMap<u64, BitVec>){
         let mut backward = true;
         let mut simplitig = num2str(*key);
         while forward{
-            let mut curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
+            let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
             for succs in curr_kmer.successors(){
                 forward = false;
                 if kmer_map.contains_key(&succs.canonical().to_int()){
@@ -154,7 +152,7 @@ fn handle_other_colors(kmer_map:  &mut HashMap<u64, BitVec>){
             }
         }
         while backward{
-            let mut curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
+            let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
             for preds in curr_kmer.predecessors(){
                 backward = false;
                 if kmer_map.contains_key(&preds.canonical().to_int()){
@@ -168,13 +166,23 @@ fn handle_other_colors(kmer_map:  &mut HashMap<u64, BitVec>){
                 }
             }
         }
+        let mut header = String::from(">");
+        for e in curr_color.iter(){
+            if e{
+                header.push('1');
+            }else{
+                header.push('0');
+            }
+        }
+        header.push('\n');
+        f.write((header).as_bytes()).unwrap();                                                                                                                                                       
+        f.write((simplitig).as_bytes()).expect("Unable to write data");
+        f.write(b"\n").unwrap();
         for e in to_remove.iter(){
             kmer_map.remove(e);
-        }
-        simplitigs.push(simplitig);
+        }                
         to_remove.clear();
     }
-    println!("I have {} simplitigs from {} kmers when starting.", simplitigs.len(), nb_kmers);   
 }
 fn get_first_key_value(kmer_map:  &HashMap<u64, BitVec>) -> Option<(&u64, &BitVec)>{
     kmer_map.iter().next()
@@ -183,18 +191,26 @@ fn get_first_key_value(kmer_map:  &HashMap<u64, BitVec>) -> Option<(&u64, &BitVe
 fn get_omnicolor(kmer_map:  &mut HashMap<u64, BitVec>, nb_files: usize) -> BTreeSet<u64>{
     let mut omnicolored_kmer: BTreeSet<u64> = BTreeSet::new();
     let omni_vec = vec![true; nb_files];
-    for(key, val) in kmer_map.clone().iter(){
-        if val.eq_vec(&omni_vec){
-            omnicolored_kmer.insert(*key);
-            kmer_map.remove(key);
+    let mut to_remove = Vec::new();
+    while let Some(pair) = get_first_key_value(kmer_map) {
+        if pair.1.eq_vec(&omni_vec){
+            omnicolored_kmer.insert(*pair.0);
+           to_remove.push(*pair.0);
+        }else {
+            
         }
+        for e in to_remove.iter(){
+            kmer_map.remove(e);
+        }                
+        to_remove.clear();
     }
     omnicolored_kmer
 }
 
-fn kmers_assemble(kmer_set_mutex: &RwLock<BTreeSet<u64>>) -> Vec<String>{
+fn kmers_assemble(kmer_set_mutex: &RwLock<BTreeSet<u64>>, output_dir: &String){
+    let mut f = GzEncoder::new(File::create(output_dir.clone()+"omnicolor.fa.gz").expect("Unable to create file"), Compression::default());
     println!("I will reconstruct simplitigs from {} kmers", kmer_set_mutex.read().unwrap().len());
-    let mut simplitigs = Vec::new();
+    // let mut simplitigs = Vec::new();
     while let Some(seed) =  {
         let mut kmer_set = kmer_set_mutex.write().unwrap();
         kmer_set.pop_last()
@@ -202,13 +218,16 @@ fn kmers_assemble(kmer_set_mutex: &RwLock<BTreeSet<u64>>) -> Vec<String>{
     {
         // println!("kmer = {}", num2str(seed));
         let mut simplitig = String::new();
-        let before_max_simplitig = Instant::now();
+        // let before_max_simplitig = Instant::now();
         let extended_simplitig = compute_max_from_kmer(&kmer_set_mutex, &seed);
         // println!("Assembly of 1 simplitig took: {}ms total.", before_max_simplitig.elapsed().as_micros());
         simplitig.push_str(&extended_simplitig);
-        simplitigs.push(simplitig);
+        // simplitigs.push(simplitig);
+        f.write(b">\n").unwrap();                                                                                                                                                       
+        f.write_all((*simplitig).as_bytes()).expect("Unable to write data");
+        f.write(b"\n").unwrap();
     }
-    simplitigs
+    // simplitigs
 }
 
 fn compute_max_from_kmer(available_kmers: &RwLock<BTreeSet<u64>>, seed: &u64) -> String {
@@ -228,7 +247,6 @@ fn compute_max_from_kmer(available_kmers: &RwLock<BTreeSet<u64>>, seed: &u64) ->
 
 fn extend_forward(available_kmers_mutex: &RwLock<BTreeSet<u64>>, simplitig: &mut String) -> String {
     let mut extend = true;
-    let mask : u64 = ((1_u64) << (2*K))-1;
     while extend {
         let mut query = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
         // println!("Query kmer = {}", String::from_utf8(query.to_nucs().to_ascii_uppercase()).unwrap());
@@ -244,8 +262,8 @@ fn extend_forward(available_kmers_mutex: &RwLock<BTreeSet<u64>>, simplitig: &mut
                 extend = true;
                 break;
             }
-            query = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes()).canonical();
         }
+        query = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes()).canonical();
     }
     simplitig.to_string()
 }
