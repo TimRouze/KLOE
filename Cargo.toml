@@ -18,7 +18,11 @@ bit-set = "0.5.3"
 bit-vec = "0.6.3"
 num-traits = "0.2.18"
 bitvec = "1.0.1"
+hashbrown = "0.14.3"
+miette = "5"
 
+[build-dependencies]
+miette = { version = "5", features = ["fancy"] }
 
 [profile.release]
 debug = true

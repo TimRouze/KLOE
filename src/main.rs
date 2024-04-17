@@ -4,7 +4,7 @@ mod kmer;
 use clap::Parser;
 use flate2::Compression;
 use seq_io::fasta::{Reader, Record};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
 use std::path::Path;
@@ -17,17 +17,12 @@ use flate2::write::GzEncoder;
 use bitvec::prelude::*;
 use kmer::{Kmer, RawKmer, Base};
 use std::cell::Cell;
+use hashbrown::HashMap;
 
-const K: usize = 31;
-pub type KT = u64;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Input file (.fasta, .fa)
-    input: String,
-    /// Output file (defaults to <input>.csv)
-    ///#[arg(short, long)]
     ///output: Option<String>,
     /// Number of threads (defaults to all available threads)
     #[arg(short, long, default_value_t = 1)]
@@ -41,44 +36,55 @@ struct Args {
     /// Seed used for hash functions
     #[arg(short, long, default_value_t = 101010)]
     seed: u64,
+    ///Number of expected elements
+    #[arg(short = 'N', long, default_value_t = 1_000_000)]
+    nb_elem: usize,
+
 }
+pub mod constants {
+    include!("constants.rs");
+}
+use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF};
+const K: usize = 31;
+pub type KT = u64;
+pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
+
 // TODO:
     // REPLACE BIT VECTOR BY U64 SETTING BITS TO 1 OR 0
 fn main() {
     let args = Args::parse();
-    let input_fof = args.input.as_str();
-    println!("FILENAME: {}", input_fof);
+    let nb_elem = args.nb_elem;
+    println!("FILENAME: {}", INPUT_FOF);
     let output_dir = args.out_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
-    if let Ok(lines_temp) = read_lines(input_fof){
-        let nb_files = lines_temp.count();
-        let file = File::open(input_fof).unwrap();
-        let reader = io::BufReader::new(file);
-        let kmer_map_mutex: Arc<Mutex<HashMap<u64, (bitvec::prelude::BitVec<u8,Msb0>, Cell<bool>)>>> = Arc::new(Mutex::new(HashMap::new()));
-        let file_number_mutex: RwLock<usize> = RwLock::new(0 as usize);
-        reader.lines()
-              .par_bridge()
-              .for_each(|line| {
-                let filename = line.unwrap().clone();
-                println!("{}", filename);
-                read_fasta(&filename, &kmer_map_mutex, nb_files, &file_number_mutex);
-                let mut file_number = file_number_mutex.write().unwrap();
-                *file_number += 1;
-                drop(file_number);
-              });
-        let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
-        println!("NB KMER = {}", kmer_map.len());
-        let omnicolored_kmers = get_omnicolor(&mut kmer_map, nb_files);
-        kmers_assemble(&RwLock::new(omnicolored_kmers.clone()), &output_dir);
-        handle_other_colors(&mut kmer_map, &output_dir);
-    }
+    let file = File::open(INPUT_FOF).unwrap();
+    let reader = io::BufReader::new(file);
+    let kmer_map_mutex: Arc<Mutex<HashMap<u64, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
+    //let set_mutex: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let file_number_mutex: RwLock<usize> = RwLock::new(0 as usize);
+    reader.lines()
+            .par_bridge()
+            .for_each(|line| {
+            let filename = line.unwrap().clone();
+            println!("{}", filename);
+            read_fasta(&filename, &kmer_map_mutex, &file_number_mutex, &nb_elem);
+            let mut file_number = file_number_mutex.write().unwrap();
+            *file_number += 1;
+            drop(file_number);
+            });
+    let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
+    println!("NB KMER = {}", kmer_map.len());
+    kmer_map.shrink_to_fit();
+    let omnicolored_kmers = get_omnicolor(&mut kmer_map);
+    kmers_assemble(&RwLock::new(omnicolored_kmers.clone()), &output_dir);
+    handle_other_colors(&mut kmer_map, &output_dir);
 }
 
-fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, (bitvec::prelude::BitVec<u8,Msb0>, Cell<bool>)>>>, nb_files: usize, file_number: &RwLock<usize>){
+fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: &RwLock<usize>, nb_elem: &usize){
     let ( reader, _compression) = niffler::get_reader(Box::new(File::open(filename).unwrap())).unwrap();
     let mut fa_reader = Reader::new(reader);
     let mut kmer = RawKmer::<K, KT>::new();
-    let mut to_add = HashSet::new();
+    //let mut to_add = HashSet::new();
     while let Some(record) = fa_reader.next(){
         let record = record.expect("Error reading record");
         for (i, nuc) in record.seq().iter().filter_map(KT::from_nuc).enumerate(){
@@ -87,36 +93,40 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, (bitvec::p
             }else{
                 kmer = kmer.append(nuc);
                 let canon = kmer.canonical().to_int();
-                to_add.insert(canon);
-                /*let mut kmer_map = kmer_map_mutex.lock().unwrap();
+                //to_add.insert(canon);
+                let mut kmer_map = kmer_map_mutex.lock().unwrap();
                 kmer_map.entry(canon).and_modify(|pair|{
                     pair.0.set(*file_number.read().unwrap(), true);
-                }).or_insert({let mut bv = bitvec![u8, Msb0;];
-                    bv.extend(vec![false; nb_files].iter());
-                    bv.set(*file_number.read().unwrap(), true);
+                }).or_insert({let bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                     (bv, Cell::new(false))
                 });
-                drop(kmer_map);*/
-                if to_add.len() >= 10000{
-                    let mut kmer_map = kmer_map_mutex.lock().unwrap();
+                if kmer_map.len() >= (80/100)*nb_elem{
+                    kmer_map.reserve((30/100)*nb_elem);
+                }
+                drop(kmer_map);
+                /*if to_add.len() >= 10000{
+                    //let mut kmer_map = kmer_map_mutex.lock().unwrap();
+                    let mut kmer_set = set_mutex.lock().unwrap();
                     for e in to_add.iter(){
-                        kmer_map.entry(*e).and_modify(|pair|{
+                        /*kmer_map.entry(*e).and_modify(|pair|{
                             pair.0.set(*file_number.read().unwrap(), true);
                         }).or_insert({let mut bv = bitvec![u8, Msb0;];
                             bv.extend(vec![false; nb_files].iter());
                             bv.set(*file_number.read().unwrap(), true);
                             (bv, Cell::new(false))
-                        });
+                        });*/
+                        kmer_set.insert(*e);
                     }
-                    drop(kmer_map);
+                    //drop(kmer_map);
+                    drop(kmer_set);
                     to_add.clear();
-                }
+                }*/
             }
             
         }
     }
 }
-fn handle_other_colors(kmer_map:  &mut HashMap<u64, (bitvec::prelude::BitVec<u8,Msb0>, Cell<bool>)>, output_dir: &String){
+fn handle_other_colors(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String){
     println!("I will reconstruct simplitigs from {} kmers from different colors", kmer_map.len());
     let mut f = GzEncoder::new(File::create(output_dir.clone()+"multicolor.fa.gz").expect("Unable to create file"), Compression::default());
     //let mut to_remove = Vec::new();
@@ -190,12 +200,14 @@ fn handle_other_colors(kmer_map:  &mut HashMap<u64, (bitvec::prelude::BitVec<u8,
     
 }
 
-fn get_omnicolor(kmer_map:  &mut HashMap<u64, (bitvec::prelude::BitVec<u8,Msb0>, Cell<bool>)>, nb_files: usize) -> BTreeSet<u64>{
+fn get_omnicolor(kmer_map:  &mut HashMap<u64, COLORPAIR>) -> BTreeSet<u64>{
     println!("getting omnicolored kmers");
     let mut omnicolored_kmer: BTreeSet<u64> = BTreeSet::new();
     let mut to_remove = Vec::new();
-    let mut omni = bitvec![u8, Msb0;];
-    omni.extend(vec![true; nb_files].iter());
+    let mut omni: BitArr!(for 8, in u8) = BitArray::<_>::ZERO;
+    for i in 0..NB_FILES{
+        omni.set(i, true);
+    }
     let mut iterator = kmer_map.iter();
     while let Some(pair) = iterator.next(){//get_first_key_value(kmer_map) {
         //println!("{}", pair.0);
@@ -339,21 +351,20 @@ where P: AsRef<Path>, {
 
 #[test]
 fn test_bitvec_eq_omni(){
-    let mut omni_vec = bitvec![u8, Msb0;];
-    omni_vec.extend(vec![true; 10].iter());
-    let mut omni_vec_2 = bitvec![u8, Msb0;];
-    omni_vec_2.extend(vec![true; 10].iter());
-    assert_eq!(omni_vec.eq(&omni_vec_2), true);
+    let mut omni: BitArr!(for 8, in u8) = BitArray::<_>::ZERO;
+    for i in 0..8{
+        omni.set(i, true);
+    }
+    assert_eq!(omni.all(), true);
 }
 
 #[test]
 fn test_bitvec_eq_non_omni(){
-    let mut omni_vec = bitvec![u8, Msb0;];
-    omni_vec.extend(vec![true; 10].iter());
-    let mut omni_vec_2 = bitvec![u8, Msb0;];
-    omni_vec_2.extend(vec![true; 10].iter());
-    omni_vec_2.set(2, false);
-    assert_eq!(omni_vec.eq(&omni_vec_2), false);
+    let mut omni: BitArr!(for 8, in u8) = BitArray::<_>::ZERO;
+    for i in 0..7{
+        omni.set(i, true);
+    }
+    assert_eq!(omni.all(), false);
 }
 
 #[test]
