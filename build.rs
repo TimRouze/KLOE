@@ -6,7 +6,7 @@ fn build_constants() -> miette::Result<()>  {
     .into();
     let mut code = Vec::new();
 
-    //println!("cargo:rerun-if-env-changed=I");
+    println!("cargo:rerun-if-env-changed=I");
     let input = std::env::var("I")
         .unwrap();
     if let Ok(lines_temp) = read_lines(&input){

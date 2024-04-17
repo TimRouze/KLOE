@@ -97,7 +97,8 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
                 let mut kmer_map = kmer_map_mutex.lock().unwrap();
                 kmer_map.entry(canon).and_modify(|pair|{
                     pair.0.set(*file_number.read().unwrap(), true);
-                }).or_insert({let bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
+                }).or_insert({let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
+                    bv.set(*file_number.read().unwrap(), true);
                     (bv, Cell::new(false))
                 });
                 if kmer_map.len() >= (80/100)*nb_elem{
@@ -203,7 +204,7 @@ fn handle_other_colors(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &Str
 fn get_omnicolor(kmer_map:  &mut HashMap<u64, COLORPAIR>) -> BTreeSet<u64>{
     println!("getting omnicolored kmers");
     let mut omnicolored_kmer: BTreeSet<u64> = BTreeSet::new();
-    let mut to_remove = Vec::new();
+    //let mut to_remove = Vec::new();
     let mut omni: BitArr!(for 8, in u8) = BitArray::<_>::ZERO;
     for i in 0..NB_FILES{
         omni.set(i, true);
@@ -213,13 +214,13 @@ fn get_omnicolor(kmer_map:  &mut HashMap<u64, COLORPAIR>) -> BTreeSet<u64>{
         //println!("{}", pair.0);
         if pair.1.0.eq(&omni){
             //println!("coucou");
-            to_remove.push(*pair.0);
+            //to_remove.push(*pair.0);
+            pair.1.1.set(true);
             omnicolored_kmer.insert(*pair.0);
         }
     }
-    for e in to_remove.iter(){
-        kmer_map.remove(e);
-    }
+    kmer_map.retain(|_, v| v.1.get() != true);
+    kmer_map.shrink_to_fit();
     omnicolored_kmer
 }
 
