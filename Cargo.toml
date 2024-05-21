@@ -20,6 +20,7 @@ num-traits = "0.2.18"
 bitvec = "1.0.1"
 hashbrown = "0.14.3"
 miette = "5"
+zstd = "0.13.1"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
