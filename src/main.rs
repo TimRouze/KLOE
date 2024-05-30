@@ -96,7 +96,7 @@ fn main() {
     }else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -o out_dir/ -t 12");
-        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.gz --multicolor-file out_dir/multicolor.fa.gz -t 12");
+        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
     }
     
         //     reader.lines()
@@ -188,7 +188,7 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
 }
 fn handle_other_colors(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String){
     println!("I will reconstruct simplitigs from {} kmers from different colors", kmer_map.len());
-    let mut f = Encoder::new(File::create(output_dir.clone()+"multicolor.fa.gz").expect("Unable to create file"), 0).unwrap();
+    let mut f = Encoder::new(File::create(output_dir.clone()+"multicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
     let mut iterator = kmer_map.iter();
     while let Some((key, curr_cell)) = iterator.next(){
         if !curr_cell.1.get(){
@@ -279,7 +279,7 @@ fn get_omnicolor(kmer_map:  &mut HashMap<u64, COLORPAIR>) -> BTreeSet<(u64, Cell
 
 fn assemble_omnicolor(kmer_set: &mut BTreeSet<(u64, Cell<bool>)>, output_dir: &String){
     println!("I will reconstruct simplitigs from {} Omnicolored kmers", kmer_set.len());
-    let mut f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.gz").expect("Unable to create file"), 0).unwrap();//File::create(output_dir.clone()+"omnicolor.fa").expect("Unable to create file");
+    let mut f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();//File::create(output_dir.clone()+"omnicolor.fa").expect("Unable to create file");
     //let mut counter = 0;
     for key in kmer_set.iter(){
         if !key.1.get(){

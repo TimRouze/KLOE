@@ -17,49 +17,44 @@ use::rayon::prelude::*;
 /// Multicolored kmers are split according to their colors
 pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str){
     let input_fof = File::open(input_names).unwrap();
-    let file_number_mutex: RwLock<usize> = RwLock::new(0 as usize);
     let reader = BufReader::new(input_fof);
-    reader.lines()
-            .par_bridge()
-            .for_each(|line| {
-            let filename = line.unwrap().clone();
-            println!("{}", filename);
-            let path = Path::new(&filename).file_stem().unwrap().to_str().unwrap();
-            let without_path = Path::new(path).file_name().unwrap();
-            let dump_curr_file = "Dump_".to_string() + without_path.to_str().unwrap();
-            let mut dump_file = Encoder::new(File::create(dump_curr_file+".fa.zstd").expect("Unable to create file"), 0).unwrap();
-            let ( reader, _compression) = niffler::get_reader(Box::new(File::open(multicolor).unwrap())).unwrap();
-            let mut fa_reader = Reader::new(reader);
-            while let Some(data) = fa_reader.next(){
-                let line = data.unwrap();
-                let header: &str = line.id().unwrap();
-                if header.chars().nth(*file_number_mutex.read().unwrap()).unwrap() == '1'{
-                    let mut header_fa = String::from(">");
-                    header_fa.push_str(header.clone());
-                    header_fa.push('\n');
-                    let to_write = std::str::from_utf8(line.seq()).unwrap();
-                    dump_file.write_all((header_fa).as_bytes()).unwrap();
-                    dump_file.write_all(to_write.as_bytes()).unwrap(); 
-                    dump_file.write_all(b"\n").unwrap();
-                }
-            }
-            let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
-            let mut fa_reader = Reader::new(reader);
-            //let mut counter = 0;
-            while let Some(data) = fa_reader.next(){
-                let line = data.unwrap();
-                let to_write = std::str::from_utf8(line.seq()).unwrap();
+    let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
+    (0..filenames.len()).into_par_iter().for_each(|file_number|{
+        let filename = filenames.get(file_number).unwrap();
+        println!("{}", filename);
+        let path = Path::new(&filename).file_stem().unwrap().to_str().unwrap();
+        let without_path = Path::new(path).file_name().unwrap();
+        let dump_curr_file = "Dump_".to_string() + without_path.to_str().unwrap();
+        let mut dump_file = Encoder::new(File::create(dump_curr_file+".fa.zstd").expect("Unable to create file"), 0).unwrap();
+        let ( reader, _compression) = niffler::get_reader(Box::new(File::open(multicolor).unwrap())).unwrap();
+        let mut fa_reader = Reader::new(reader);
+        while let Some(data) = fa_reader.next(){
+            let line = data.unwrap();
+            let header: &str = line.id().unwrap();
+            if header.chars().nth(file_number).unwrap() == '1'{
                 let mut header_fa = String::from(">");
-                //counter += to_write.len()-31+1;
-                header_fa.push_str("OMNI\n");
+                header_fa.push_str(header.clone());
+                header_fa.push('\n');
+                let to_write = std::str::from_utf8(line.seq()).unwrap();
                 dump_file.write_all((header_fa).as_bytes()).unwrap();
-                dump_file.write_all(to_write.as_bytes()).unwrap();
+                dump_file.write_all(to_write.as_bytes()).unwrap(); 
                 dump_file.write_all(b"\n").unwrap();
             }
-            //println!("During decompression, I have seen {} k-mers", counter);
-            dump_file.finish().expect("Error writing decompressed data");
-            let mut file_number = file_number_mutex.write().unwrap();
-            *file_number += 1;
-            drop(file_number);
-    });
+        }
+        let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
+        let mut fa_reader = Reader::new(reader);
+        //let mut counter = 0;
+        while let Some(data) = fa_reader.next(){
+            let line = data.unwrap();
+            let to_write = std::str::from_utf8(line.seq()).unwrap();
+            let mut header_fa = String::from(">");
+            //counter += to_write.len()-31+1;
+            header_fa.push_str("OMNI\n");
+            dump_file.write_all((header_fa).as_bytes()).unwrap();
+            dump_file.write_all(to_write.as_bytes()).unwrap();
+            dump_file.write_all(b"\n").unwrap();
+        }
+        //println!("During decompression, I have seen {} k-mers", counter);
+        dump_file.finish().expect("Error writing decompressed data");
+    }); 
 }
