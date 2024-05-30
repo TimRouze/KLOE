@@ -59,7 +59,6 @@ fn main() {
     let file = File::open(INPUT_FOF).unwrap();
     let reader = io::BufReader::new(file);
     let kmer_map_mutex: Arc<Mutex<HashMap<u64, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
-    let file_number_mutex: Arc<ParkingRwLock<usize>> = Arc::new(ParkingRwLock::new(0));
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
@@ -71,15 +70,21 @@ fn main() {
                 println!("Error, multicolor and/or omnicolor file(s) are mandatory");
             }
         }else if do_decompress == "compress"{
-            filenames.into_par_iter().for_each(|filename|{
+            (0..NB_FILES).into_par_iter().for_each(|file_number|{
                 let kmer_map_mutex = Arc::clone(&kmer_map_mutex);
-                let file_number_mutex = Arc::clone(&file_number_mutex);
-                println!("{}", filename);
-                read_fasta(&filename, &kmer_map_mutex, &file_number_mutex, &nb_elem);
-
-                let mut file_number = file_number_mutex.write();
-                *file_number += 1;
+                println!("{}", filenames.get(file_number).unwrap());
+                read_fasta(&filenames.get(file_number).unwrap(), &kmer_map_mutex, file_number, &nb_elem);
             });
+            // filenames.into_par_iter().for_each(|filename|{
+            //     let kmer_map_mutex = Arc::clone(&kmer_map_mutex);
+            //     let file_number_mutex = Arc::clone(&file_number_mutex);
+            //     println!("{}", filename);
+            //     let mut file_number = file_number_mutex.write();
+            //     *file_number += 1;
+            //     drop(file_number);
+            //     read_fasta(&filename, &kmer_map_mutex, &file_number_mutex, &nb_elem);
+
+            // });
             let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
             println!("NB KMER = {}", kmer_map.len());
             kmer_map.shrink_to_fit();
@@ -108,7 +113,7 @@ fn main() {
         // }
 }
 
-fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: &Arc<ParkingRwLock<usize>>, nb_elem: &usize){
+fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
     //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(filename).unwrap())).unwrap();
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
     //let mut fa_reader = Reader::new(reader);
@@ -127,10 +132,10 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
             
             let curr_kmer: RawKmer<K, u64> = RawKmer::from_nucs(kmer.1);
             let mut kmer_map = kmer_map_mutex.lock().unwrap();
-            let file_nb = *file_number.read();
+            //let file_nb = *file_number.read();
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
                 counter_modify += 1;
-                pair.0.set(file_nb, true);
+                pair.0.set(file_number, true);
                 // if *file_number.read().unwrap() == 1{
                 //     println!("NEW KMER");
                 //     for i in 0..NB_FILES{
@@ -142,7 +147,7 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
                 // }
             }).or_insert_with(|| {
                 let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-                bv.set(file_nb, true);
+                bv.set(file_number, true);
                 counter_insert += 1;
                 (bv, Cell::new(false))
             });
