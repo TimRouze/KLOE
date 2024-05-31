@@ -1,5 +1,5 @@
 use seq_io::fasta::{Reader, Record};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::sync::RwLock;
 use std::io::{BufReader, Write, BufRead};
@@ -15,7 +15,7 @@ use::rayon::prelude::*;
 /// Creating one output file per genome requested.
 /// Omnicolored kmers are dumped in every out file.
 /// Multicolored kmers are split according to their colors
-pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str){
+pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir: PathBuf){
     let input_fof = File::open(input_names).unwrap();
     let reader = BufReader::new(input_fof);
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
@@ -24,8 +24,8 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str){
         println!("{}", filename);
         let path = Path::new(&filename).file_stem().unwrap().to_str().unwrap();
         let without_path = Path::new(path).file_name().unwrap();
-        let dump_curr_file = "Dump_".to_string() + without_path.to_str().unwrap();
-        let mut dump_file = Encoder::new(File::create(dump_curr_file+".fa.zstd").expect("Unable to create file"), 0).unwrap();
+        let dump_curr_file = out_dir.join(format!("Dump_{}.fa.zstd", without_path.to_str().unwrap()));
+        let mut dump_file = Encoder::new(File::create(dump_curr_file).expect("Unable to create file"), 0).unwrap();
         let ( reader, _compression) = niffler::get_reader(Box::new(File::open(multicolor).unwrap())).unwrap();
         let mut fa_reader = Reader::new(reader);
         while let Some(data) = fa_reader.next(){

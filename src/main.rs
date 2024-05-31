@@ -7,7 +7,7 @@ use seq_io::fasta::{Reader, Record};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::io::{Write, self, BufRead, Stdin};
 use std::env;
 use::rayon::prelude::*;
@@ -50,6 +50,11 @@ const K: usize = 31;
 pub type KT = u64;
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
+//TODO COUNT NB KMER PER COLOR
+//TODO SORT COLORS
+//TODO QUERY
+//TODO STOP USING HASHSET FOR OMNI, JUST CREATE OMNICOLORED SIMPLITIGS FROM EXISTING HASHMAP
+
 fn main() {
     let args = Args::parse();
     let nb_elem = args.nb_elem;
@@ -65,7 +70,7 @@ fn main() {
             let multi_file = args.multicolor_file;
             let omni_file = args.omnicolor_file;
             if multi_file != "" && omni_file != ""{
-                decompress::decompress(&omni_file, &multi_file, INPUT_FOF);
+                decompress::decompress(&omni_file, &multi_file, INPUT_FOF, PathBuf::from(output_dir));
             }else{
                 println!("Error, multicolor and/or omnicolor file(s) are mandatory");
             }
@@ -136,15 +141,6 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
                 counter_modify += 1;
                 pair.0.set(file_number, true);
-                // if *file_number.read().unwrap() == 1{
-                //     println!("NEW KMER");
-                //     for i in 0..NB_FILES{
-                //         println!("FILE NB: {}", file_number.read().unwrap());
-                //         println!("{}", pair.0.get(i).unwrap());
-                //         let mut input = String::new();
-                //         io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                //     }
-                // }
             }).or_insert_with(|| {
                 let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                 bv.set(file_number, true);
@@ -156,31 +152,6 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
             }
             drop(kmer_map);
         });
-        /*for (i, nuc) in record.seq().iter().filter_map(KT::from_nuc).enumerate(){
-            if i < K - 1{
-                kmer = kmer.extend(nuc);
-            }else{
-                kmer = kmer.append(nuc);
-                let canon = kmer.canonical().to_int();
-                //counter += 1;
-                //to_add.insert(canon);
-                let mut kmer_map = kmer_map_mutex.lock().unwrap();
-                kmer_map.entry(canon).and_modify(|pair|{
-                    //counter_modify += 1;
-                    pair.0.set(*file_number.read().unwrap(), true);
-                }).or_insert({
-                    let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-                    bv.set(*file_number.read().unwrap(), true);
-                    //counter_insert += 1;
-                    (bv, Cell::new(false))
-                });
-                if kmer_map.len() >= (80/100)*nb_elem{
-                    kmer_map.reserve((30/100)*nb_elem);
-                }
-                drop(kmer_map);
-            }
-            
-        }*/
     }
     println!("I have inserted {} k-mers", counter_insert);
     println!("I have seen {} already inserted k-mers", counter_modify);
