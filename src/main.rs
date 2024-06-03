@@ -50,10 +50,9 @@ const K: usize = 31;
 pub type KT = u64;
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
-//TODO COUNT NB KMER PER COLOR
+
 //TODO SORT COLORS
 //TODO QUERY
-//TODO STOP USING HASHSET FOR OMNI, JUST CREATE OMNICOLORED SIMPLITIGS FROM EXISTING HASHMAP
 
 fn main() {
     let args = Args::parse();
@@ -80,42 +79,16 @@ fn main() {
                 println!("{}", filenames.get(file_number).unwrap());
                 read_fasta(&filenames.get(file_number).unwrap(), &kmer_map_mutex, file_number, &nb_elem);
             });
-            // filenames.into_par_iter().for_each(|filename|{
-            //     let kmer_map_mutex = Arc::clone(&kmer_map_mutex);
-            //     let file_number_mutex = Arc::clone(&file_number_mutex);
-            //     println!("{}", filename);
-            //     let mut file_number = file_number_mutex.write();
-            //     *file_number += 1;
-            //     drop(file_number);
-            //     read_fasta(&filename, &kmer_map_mutex, &file_number_mutex, &nb_elem);
-
-            // });
             let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
             println!("NB KMER = {}", kmer_map.len());
             kmer_map.shrink_to_fit();
-            //let mut omnicolored_kmers = get_omnicolor(&mut kmer_map);
-            //assemble_omnicolor(&mut omnicolored_kmers, &output_dir);
-            //kmers_assemble(&RwLock::new(omnicolored_kmers.clone()), &output_dir);
-            handle_other_colors(&mut kmer_map, &output_dir);
+            compute_colored_simplitigs(&mut kmer_map, &output_dir);
         }
     }else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
     }
-    
-        //     reader.lines()
-        //             .par_bridge()
-        //             .for_each(|line| {
-        //                 let filename = line.unwrap().clone();
-        //                 println!("{}", filename);
-        //                 read_fasta(&filename, &kmer_map_mutex, &file_number_mutex, &nb_elem);
-        //                 let mut file_number = file_number_mutex.write().unwrap();
-        //                 *file_number += 1;
-        //                 drop(file_number);
-        //             });
-            
-        // }
 }
 
 fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
@@ -157,8 +130,9 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
     println!("I have seen {} already inserted k-mers", counter_modify);
     //println!("I have seen {} k-mers", counter);
 }
-fn handle_other_colors(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String){
-    println!("I will reconstruct simplitigs from {} kmers from different colors", kmer_map.len());
+
+fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String){
+    println!("I will reconstruct simplitigs from {} kmers", kmer_map.len());
     let mut multi_f = Encoder::new(File::create(output_dir.clone()+"multicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
     let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
     let mut iterator = kmer_map.iter();
@@ -179,159 +153,77 @@ fn handle_other_colors(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &Str
             let mut simplitig = num2str(*key);
             while forward{
                 let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
-                for succs in curr_kmer.successors(){
-                    forward = false;
-                    if kmer_map.contains_key(&succs.canonical().to_int()){
-                        let succ_pair = kmer_map.get(&succs.canonical().to_int()).unwrap();
-                        if succ_pair.0.eq(&curr_cell.0) & !succ_pair.1.get() {
-                            simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                            succ_pair.1.set(true);
-                            forward = true;
-                            break;
-                        }
-                    }
-                }
+                forward = extend_forward(&curr_kmer, &kmer_map, &mut simplitig, &curr_cell.0);
             }
             while backward{
                 let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
-                for preds in curr_kmer.predecessors(){
-                    backward = false;
-                    if kmer_map.contains_key(&preds.canonical().to_int()){
-                        let pred_pair = kmer_map.get(&preds.canonical().to_int()).unwrap();
-                        if pred_pair.0.eq(&curr_cell.0) & !pred_pair.1.get() {
-                            simplitig.insert(0,*preds.to_nucs().last().unwrap() as char);
-                            pred_pair.1.set(true);
-                            backward = true;
-                            break;
-                        }
-                    }
-                }
+                backward = extend_backward(&curr_kmer, &kmer_map, &mut simplitig, &curr_cell.0);
             }
-            let mut header = String::from(">");
             color_nbkmer.entry(curr_cell.0)
                         .and_modify(|nb_kmer| *nb_kmer += simplitig.len()-K+1)
                         .or_insert(simplitig.len()-K+1);
-            
-            if is_omni{
-                header.push('\n');
-                omni_f.write_all((header).as_bytes()).unwrap();                                                                                                                                                       
-                omni_f.write_all((simplitig).as_bytes()).expect("Unable to write data");
-                omni_f.write_all(b"\n").unwrap();
-            }else{
-                for e in curr_cell.0.iter(){
-                    if *e{
-                        header.push('1');
-                    }else{
-                        header.push('0');
-                    }
-                }
-                header.push('\n');
-                multi_f.write_all((header).as_bytes()).unwrap();                                                                                                                                                       
-                multi_f.write_all((simplitig).as_bytes()).expect("Unable to write data");
-                multi_f.write_all(b"\n").unwrap();
-            }
+            write_simplitig(&simplitig, &is_omni, &mut multi_f, &mut omni_f, &curr_cell.0);
             is_omni = false;
-            
         }
     }
     multi_f.finish().expect("Error finishing writing in file");
     omni_f.finish().expect("Error finishing writing in file");
     println!("Color to nb kmer map has {} lines", color_nbkmer.len());
-    write_hashmap_to_file(&color_nbkmer);
+    let _ = write_hashmap_to_file(&color_nbkmer);
     
 }
 
-fn get_omnicolor(kmer_map:  &mut HashMap<u64, COLORPAIR>) -> BTreeSet<(u64, Cell<bool>)>{
-    println!("getting omnicolored kmers");
-    let mut omnicolored_kmer: BTreeSet<(u64, Cell<bool>)> = BTreeSet::new();
-    let mut omni: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-    //let mut counter = 0;
-    for i in 0..NB_FILES{
-        omni.set(i, true);
-    }
-    let mut iterator = kmer_map.iter();
-    while let Some(pair) = iterator.next(){
-        //counter += 1;
-        // println!("{}", pair.1.0.len());
-        // println!("{}", omni.len());
-        // println!("{}", NB_FILES);
-        // for i in 0..NB_FILES{
-        //     println!("BV   = {}", pair.1.0.get(i).unwrap());
-        //     println!("omni = {}", omni.get(i).unwrap());
-        // }
-        // println!("{}", pair.1.0.eq(&omni));
-        // let mut input = String::new();
-        // io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        if pair.1.0.eq(&omni){
-            //println!("wsh");
-            pair.1.1.set(true);
-            omnicolored_kmer.insert((*pair.0, Cell::new(false)));
+fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
+    for succs in curr_kmer.successors(){
+        //forward = false;
+        if kmer_map.contains_key(&succs.canonical().to_int()){
+            let succ_pair = kmer_map.get(&succs.canonical().to_int()).unwrap();
+            if succ_pair.0.eq(color) & !succ_pair.1.get() {
+                simplitig.push(*succs.to_nucs().last().unwrap() as char);
+                succ_pair.1.set(true);
+                return true;
+            }
         }
     }
-    //println!("in kmer map i have seen {} kmers", counter);
-    kmer_map.retain(|_, v| v.1.get() != true);
-    kmer_map.shrink_to_fit();
-    omnicolored_kmer
+    false
 }
 
-fn assemble_omnicolor(kmer_set: &mut BTreeSet<(u64, Cell<bool>)>, output_dir: &String){
-    println!("I will reconstruct simplitigs from {} Omnicolored kmers", kmer_set.len());
-    let mut f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();//File::create(output_dir.clone()+"omnicolor.fa").expect("Unable to create file");
-    //let mut counter = 0;
-    for key in kmer_set.iter(){
-        if !key.1.get(){
-            key.1.set(true);
-            let mut forward = true;
-            let mut backward = true;
-            let mut simplitig = num2str(key.0);
-            while forward{
-                let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
-                for succs in curr_kmer.successors(){
-                    forward = false;
-                    if let Some(successor) = kmer_set.get(&(succs.canonical().to_int(), false.into())){
-                        simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                        //kmer_set.remove(successor);
-                        successor.1.set(true);
-                        //to_remove.push(successor);
-                        forward = true;
-                        break;
-                    }
-                }
+fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
+    for preds in curr_kmer.predecessors(){
+        //backward = false;
+        if kmer_map.contains_key(&preds.canonical().to_int()){
+            let pred_pair = kmer_map.get(&preds.canonical().to_int()).unwrap();
+            if pred_pair.0.eq(color) & !pred_pair.1.get() {
+                simplitig.insert(0,*preds.to_nucs().last().unwrap() as char);
+                pred_pair.1.set(true);
+                return true;
             }
-            while backward{
-                let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
-                for preds in curr_kmer.predecessors(){
-                    backward = false;
-                    if let Some(predecessor) = kmer_set.get(&(preds.canonical().to_int(), false.into())){
-                        //INSERT FIRST NUCLEOTIDE OF PREDECESSOR. VALIDATED.
-                        simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
-                        //let mut input = String::new();
-                        //io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                        //kmer_set.remove(predecessor);
-                        predecessor.1.set(true);
-                        //to_remove.push(predecessor);
-                        backward = true;
-                        break;
-                    }
-                }
-            }
-            //kmer_set.retain(|v| !to_remove.contains(&v));
-            /*for elem in to_remove.iter(){
-                kmer_set.remove(elem);
-            }*/
-            //to_remove.clear();
-            //counter += simplitig.len()-K+1;
-            let mut header = String::from(">");
-            header.push('\n');
-            f.write_all((header).as_bytes()).unwrap();                                                                                                                                                       
-            f.write_all((simplitig).as_bytes()).expect("Unable to write data");
-            f.write_all(b"\n").unwrap();
         }
     }
-    //println!("After simplitig reconstruction, I have seen {} kmers", counter);
-    f.finish().expect("UNABLE TO WRITE OUTPUT");
+    false
 }
 
+fn write_simplitig(simplitig: &String, is_omni: &bool, multi_f: &mut Encoder<'static, File>, omni_f: &mut Encoder<'static, File>, color: &BitArray<[u8;1]>){
+    let mut header = String::from(">");
+    if *is_omni{
+        header.push('\n');
+        omni_f.write_all((header).as_bytes()).unwrap();                                                                                                                                                       
+        omni_f.write_all((simplitig).as_bytes()).expect("Unable to write data");
+        omni_f.write_all(b"\n").unwrap();
+    }else{
+        for e in color.iter(){
+            if *e{
+                header.push('1');
+            }else{
+                header.push('0');
+            }
+        }
+        header.push('\n');
+        multi_f.write_all((header).as_bytes()).unwrap();                                                                                                                                                       
+        multi_f.write_all((simplitig).as_bytes()).expect("Unable to write data");
+        multi_f.write_all(b"\n").unwrap();
+    }
+}
 
 fn write_hashmap_to_file(map: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, usize>) -> io::Result<()> {
     let mut file = File::create("color_kmer_stats.txt")?;
