@@ -53,7 +53,11 @@ pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 //TODO SORT COLORS
 //TODO QUERY
+    //TODO INTERFACE FILE: FILENAME TO COLOR
+    //TODO INTERFACE FILE: COLOR TO SIMPLITIG SIZE
+    //TODO MAP COLOR -> SIMPLITIGS TOTAL SIZE
 
+//TODO MULTITHREADING
 fn main() {
     let args = Args::parse();
     let nb_elem = args.nb_elem;
@@ -90,7 +94,10 @@ fn main() {
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
     }
 }
-
+/*
+READS FASTA FILES.
+CREATES K-MER -> COLOR MAP.
+*/
 fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
     //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(filename).unwrap())).unwrap();
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
@@ -131,12 +138,20 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
     //println!("I have seen {} k-mers", counter);
 }
 
+/*
+CONSTRUCTS SIMPLITIGS FROM K-MERS GATHERED IN "READ_FASTA".
+SIMPLITIGS ARE MONOCHROMATIC.
+OMNICOLORED (SEEN IN EVERY INPUT FILE) SIMPLITIGS ARE WRITTEN IN THE SAME FILE (omnicolor.fa.zstd)
+MULTICOLORED SIMPLITIGS ARE WRITTEN IN ANOTHER FILE (multicolor.fa.zstd).
+SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
+*/
 fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String){
     println!("I will reconstruct simplitigs from {} kmers", kmer_map.len());
     let mut multi_f = Encoder::new(File::create(output_dir.clone()+"multicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
     let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
     let mut iterator = kmer_map.iter();
     let mut color_nbkmer: HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, usize> = HashMap::new();
+    let mut color_simplitig_size: HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, usize> = HashMap::new();
     let mut omni: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
     let mut is_omni = false;
     for i in 0..NB_FILES{
@@ -162,6 +177,10 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
             color_nbkmer.entry(curr_cell.0)
                         .and_modify(|nb_kmer| *nb_kmer += simplitig.len()-K+1)
                         .or_insert(simplitig.len()-K+1);
+
+            color_simplitig_size.entry(curr_cell.0)
+                        .and_modify(|total_size| *totaal_size += simplitig.len())
+                        .or_insert(simplitig.len());
             write_simplitig(&simplitig, &is_omni, &mut multi_f, &mut omni_f, &curr_cell.0);
             is_omni = false;
         }
@@ -173,6 +192,10 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
     
 }
 
+/*
+FORWARD EXTENSION FOR SIMPLITIG CREATION.
+CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
+*/
 fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
     for succs in curr_kmer.successors(){
         //forward = false;
@@ -188,13 +211,18 @@ fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAI
     false
 }
 
+/*
+BACKWARD EXTENSION FOR SIMPLITIG CREATION.
+CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
+INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
+*/
 fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
     for preds in curr_kmer.predecessors(){
         //backward = false;
         if kmer_map.contains_key(&preds.canonical().to_int()){
             let pred_pair = kmer_map.get(&preds.canonical().to_int()).unwrap();
             if pred_pair.0.eq(color) & !pred_pair.1.get() {
-                simplitig.insert(0,*preds.to_nucs().last().unwrap() as char);
+                simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
                 pred_pair.1.set(true);
                 return true;
             }
