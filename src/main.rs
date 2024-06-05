@@ -178,7 +178,7 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
     
 }
 
-fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
+fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
     for succs in curr_kmer.successors(){
         //forward = false;
         if kmer_map.contains_key(&succs.canonical().to_int()){
@@ -193,7 +193,7 @@ fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAI
     false
 }
 
-fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
+fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
     for preds in curr_kmer.predecessors(){
         //backward = false;
         if kmer_map.contains_key(&preds.canonical().to_int()){
