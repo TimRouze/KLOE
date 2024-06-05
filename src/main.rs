@@ -4,7 +4,6 @@ mod kmer;
 mod decompress;
 use clap::Parser;
 use seq_io::fasta::{Reader, Record};
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -17,7 +16,6 @@ use kmer::{Kmer, RawKmer, Base};
 use std::cell::Cell;
 use hashbrown::HashMap;
 use needletail::{parse_fastx_file, Sequence, FastxReader};
-use parking_lot::RwLock as ParkingRwLock;
 
 
 #[derive(Parser, Debug)]
@@ -179,7 +177,7 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
                         .or_insert(simplitig.len()-K+1);
 
             color_simplitig_size.entry(curr_cell.0)
-                        .and_modify(|total_size| *totaal_size += simplitig.len())
+                        .and_modify(|total_size| *total_size += simplitig.len())
                         .or_insert(simplitig.len());
             write_simplitig(&simplitig, &is_omni, &mut multi_f, &mut omni_f, &curr_cell.0);
             is_omni = false;
@@ -190,6 +188,40 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
     println!("Color to nb kmer map has {} lines", color_nbkmer.len());
     let _ = write_hashmap_to_file(&color_nbkmer);
     
+}
+
+fn sort_simplitigs() {
+    let temp_file = File::open("temp_multicolor.fa");
+    let path = output_dir.clone()+"multicolor.fa.zstd";
+    let mut temp_reader = Reader::new(temp_file);
+    let mut color_writing_size: HashMap<String, usize> = HashMap::new();
+    while let Some(data) = temp_reader.next(){
+        let line = data.unwrap();
+        color_writing_size.
+        color_writing_size.entry(line.id().unwrap())
+                            .and_modify(|size| size += line.seq().len()+3)
+                            .or_insert(line.id().len()+1+line.seq().len()+1);
+
+    }
+}
+
+fn write_at_position_without_truncation(file_path: &str, content: &str, position: u64) -> io::Result<()> {
+    let out_mult_file = File::options().write(true).read(true).open(file_path).expect("Unable to create file");
+    // Move the cursor to the specified position
+    out_mult_file.seek(SeekFrom::Start(position))?;
+
+    // Read the rest of the file from the position to handle partial writes
+    let mut remainder = Vec::new();
+    out_mult_file.read_to_end(&mut remainder)?;
+
+    // Move the cursor back to the specified position and write the content
+    out_mult_file.seek(SeekFrom::Start(position))?;
+    out_mult_file.write_all(content.as_bytes())?;
+
+    // Append the remainder of the file
+    out_mult_file.write_all(&remainder)?;
+
+    Ok(())
 }
 
 /*
