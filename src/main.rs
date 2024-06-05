@@ -208,7 +208,7 @@ fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPA
     false
 }
 
-fn write_simplitig(simplitig: &String, is_omni: &bool, multi_f: &mut Encoder<'static, File>, omni_f: &mut Encoder<'static, File>, color: &BitArray<[u8;1]>){
+fn write_simplitig(simplitig: &String, is_omni: &bool, multi_f: &mut Encoder<'static, File>, omni_f: &mut Encoder<'static, File>, color: &BitArray<[u8;ARRAY_SIZE]>){
     let mut header = String::from(">");
     if *is_omni{
         header.push('\n');
