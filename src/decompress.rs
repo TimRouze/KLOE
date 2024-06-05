@@ -1,7 +1,6 @@
 use seq_io::fasta::{Reader, Record};
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::sync::RwLock;
 use std::io::{BufReader, Write, BufRead};
 use zstd::stream::write::Encoder;
 use::rayon::prelude::*;
