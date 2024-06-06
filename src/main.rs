@@ -2,9 +2,10 @@
 
 mod kmer;
 mod decompress;
+mod stats;
 use clap::Parser;
-use seq_io::fasta::{Reader, Record};
-use std::sync::{Arc, Mutex, RwLock};
+use stats::compute_stats;
+use std::sync::{Arc, Mutex};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::io::{Write, self, BufRead, Stdin};
@@ -12,17 +13,17 @@ use std::env;
 use::rayon::prelude::*;
 use zstd::stream::write::Encoder;
 use bitvec::prelude::*;
-use kmer::{Kmer, RawKmer, Base};
+use kmer::{Kmer, RawKmer};
 use std::cell::Cell;
 use hashbrown::HashMap;
-use needletail::{parse_fastx_file, Sequence, FastxReader};
+use needletail::{parse_fastx_file, Sequence};
 
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     ///output: Option<String>,
-    /// Decompression "compress" to compress input, "decompress" to decompress input
+    /// Decompression "compress" to compress input, "decompress" to decompress input, "stats" to get kmer stats
     decompress: Option<String>,
     ///multicolor file (only for decompression)
     #[arg(long, default_value_t=String::from(""))]
@@ -85,6 +86,15 @@ fn main() {
             println!("NB KMER = {}", kmer_map.len());
             kmer_map.shrink_to_fit();
             compute_colored_simplitigs(&mut kmer_map, &output_dir);
+        }else if do_decompress == "stats"{
+            let multi_file = args.multicolor_file;
+            let omni_file = args.omnicolor_file;
+            let k = K;
+            if multi_file != "" && omni_file != ""{
+                compute_stats(&omni_file, &multi_file, "kmer_per_color_stats.txt", &k);
+            }else{
+                println!("Error, multicolor and/or omnicolor file(s) are mandatory");
+            }
         }
     }else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
@@ -97,10 +107,7 @@ READS FASTA FILES.
 CREATES K-MER -> COLOR MAP.
 */
 fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
-    //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(filename).unwrap())).unwrap();
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
-    //let mut fa_reader = Reader::new(reader);
-    let mut kmer = RawKmer::<K, KT>::new();
     //let mut counter = 0;
     let mut counter_insert = 0;
     let mut counter_modify = 0;
@@ -108,7 +115,7 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
     while let Some(record) = fa_reader.next(){
         let seqrec = record.expect("Error reading record");
         let norm_seq = seqrec.normalize(false);
-        let mut norm_rc = norm_seq.reverse_complement();
+        let norm_rc = norm_seq.reverse_complement();
         let mut canon_kmers = norm_seq.canonical_kmers(31, &norm_rc);
         canon_kmers.for_each(|kmer|{
             //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
@@ -190,6 +197,24 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
     
 }
 
+/*
+FORWARD EXTENSION FOR SIMPLITIG CREATION.
+CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
+*/
+fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
+    for succs in curr_kmer.successors(){
+        //forward = false;
+        if kmer_map.contains_key(&succs.canonical().to_int()){
+            let succ_pair = kmer_map.get(&succs.canonical().to_int()).unwrap();
+            if succ_pair.0.eq(color) & !succ_pair.1.get() {
+                simplitig.push(*succs.to_nucs().last().unwrap() as char);
+                succ_pair.1.set(true);
+                return true;
+            }
+        }
+    }
+    false
+}
 fn sort_simplitigs() {
     let temp_file = File::open("temp_multicolor.fa");
     let path = output_dir.clone()+"multicolor.fa.zstd";
@@ -224,31 +249,13 @@ fn write_at_position_without_truncation(file_path: &str, content: &str, position
     Ok(())
 }
 
-/*
-FORWARD EXTENSION FOR SIMPLITIG CREATION.
-CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
-*/
-fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
-    for succs in curr_kmer.successors(){
-        //forward = false;
-        if kmer_map.contains_key(&succs.canonical().to_int()){
-            let succ_pair = kmer_map.get(&succs.canonical().to_int()).unwrap();
-            if succ_pair.0.eq(color) & !succ_pair.1.get() {
-                simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                succ_pair.1.set(true);
-                return true;
-            }
-        }
-    }
-    false
-}
 
 /*
 BACKWARD EXTENSION FOR SIMPLITIG CREATION.
 CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
 */
-fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;1]>) -> bool{
+fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
     for preds in curr_kmer.predecessors(){
         //backward = false;
         if kmer_map.contains_key(&preds.canonical().to_int()){
@@ -263,7 +270,7 @@ fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPA
     false
 }
 
-fn write_simplitig(simplitig: &String, is_omni: &bool, multi_f: &mut Encoder<'static, File>, omni_f: &mut Encoder<'static, File>, color: &BitArray<[u8;1]>){
+fn write_simplitig(simplitig: &String, is_omni: &bool, multi_f: &mut Encoder<'static, File>, omni_f: &mut Encoder<'static, File>, color: &BitArray<[u8;ARRAY_SIZE]>){
     let mut header = String::from(">");
     if *is_omni{
         header.push('\n');
@@ -288,9 +295,8 @@ fn write_simplitig(simplitig: &String, is_omni: &bool, multi_f: &mut Encoder<'st
 fn write_hashmap_to_file(map: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, usize>) -> io::Result<()> {
     let mut file = File::create("color_kmer_stats.txt")?;
     let mut counter = 0;
-    let mut count_files = 0;
     println!("Writing color stats in file...");
-    for (key, value) in map {
+    for (_key, value) in map {
         /*let mut key_str = String::new();
         for e in key.iter(){
             if *e{
