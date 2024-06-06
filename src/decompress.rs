@@ -23,7 +23,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         println!("{}", filename);
         let path = Path::new(&filename).file_stem().unwrap().to_str().unwrap();
         let without_path = Path::new(path).file_name().unwrap();
-        let dump_curr_file = out_dir.join(format!("Dump_{}.fa.zstd", without_path.to_str().unwrap()));
+        let dump_curr_file = out_dir.join(format!("Dump_{}.zstd", without_path.to_str().unwrap()));
         let mut dump_file = Encoder::new(File::create(dump_curr_file).expect("Unable to create file"), 0).unwrap();
         let ( reader, _compression) = niffler::get_reader(Box::new(File::open(multicolor).unwrap())).unwrap();
         let mut fa_reader = Reader::new(reader);
