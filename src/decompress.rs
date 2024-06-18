@@ -32,7 +32,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
             let header: &str = line.id().unwrap();
             if header.chars().nth(file_number).unwrap() == '1'{
                 let mut header_fa = String::from(">");
-                header_fa.push_str(header.clone());
+                header_fa.push_str(header);
                 header_fa.push('\n');
                 let to_write = std::str::from_utf8(line.seq()).unwrap();
                 dump_file.write_all((header_fa).as_bytes()).unwrap();
