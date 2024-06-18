@@ -6,7 +6,7 @@ mod stats;
 use clap::Parser;
 use stats::compute_stats;
 use zstd::stream::AutoFinishEncoder;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,6 @@ use::rayon::prelude::*;
 use zstd::stream::write::Encoder;
 use bitvec::prelude::*;
 use kmer::{Kmer, RawKmer};
-use std::cell::Cell;
 use hashbrown::HashMap;
 use needletail::{parse_fastx_file, Sequence};
 use dashmap::DashMap;
@@ -78,7 +77,7 @@ fn main() {
             (0..NB_FILES).into_par_iter().for_each(|file_number|{
                 let mut kmer_map_mutex = Arc::clone(&kmer_map_mutex);
                 println!("{}", filenames.get(file_number).unwrap());
-                read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
+                read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, /*&nb_elem*/);
             });
             println!("NB KMER = {}", kmer_map_mutex.len());
             compute_colored_simplitigs(kmer_map_mutex, &output_dir);
@@ -87,7 +86,7 @@ fn main() {
             let omni_file = args.omnicolor_file;
             let k = K;
             if multi_file != "" && omni_file != ""{
-                compute_stats(&omni_file, &multi_file, "kmer_per_color_stats.txt", &k);
+                compute_stats(&omni_file, &multi_file, &output_dir, &k);
             }else{
                 println!("Error, multicolor and/or omnicolor file(s) are mandatory");
             }
@@ -99,7 +98,7 @@ fn main() {
     }
 }
 
-fn read_fasta(filename: &str, kmer_map: &mut Arc<DashMap<u64, COLORPAIR>>, file_number: usize, nb_elem: &usize){
+fn read_fasta(filename: &str, kmer_map: &mut Arc<DashMap<u64, COLORPAIR>>, file_number: usize, /*nb_elem: &usize*/){
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
     //let mut counter = 0;
     let mut counter_insert = 0;
