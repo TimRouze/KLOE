@@ -17,7 +17,7 @@ use zstd::stream::write::Encoder;
 use bitvec::prelude::*;
 use kmer::{Kmer, RawKmer};
 use std::cell::Cell;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use needletail::{parse_fastx_file, Sequence};
 
 
@@ -112,8 +112,8 @@ CREATES K-MER -> COLOR MAP.
 fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
     //let mut counter = 0;
-    let mut counter_insert = 0;
-    let mut counter_modify = 0;
+    //let mut counter_insert = 0;
+    //let mut counter_modify = 0;
     //let mut to_add = HashSet::new();
     while let Some(record) = fa_reader.next(){
         let seqrec = record.expect("Error reading record");
@@ -127,12 +127,12 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
             let mut kmer_map = kmer_map_mutex.lock().unwrap();
             //let file_nb = *file_number.read();
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
-                counter_modify += 1;
+                //counter_modify += 1;
                 pair.0.set(file_number, true);
             }).or_insert_with(|| {
                 let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                 bv.set(file_number, true);
-                counter_insert += 1;
+                //counter_insert += 1;
                 (bv, Cell::new(false))
             });
             if kmer_map.len() >= (80/100)*nb_elem{
@@ -141,8 +141,8 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
             drop(kmer_map);
         });
     }
-    println!("I have inserted {} k-mers", counter_insert);
-    println!("I have seen {} already inserted k-mers", counter_modify);
+    //println!("I have inserted {} k-mers", counter_insert);
+    //println!("I have seen {} already inserted k-mers", counter_modify);
     //println!("I have seen {} k-mers", counter);
 }
 
@@ -225,15 +225,26 @@ fn compute_cursor_start_pos(color_simplitig: &mut HashMap<bitvec::prelude::BitAr
 
         value.1 = pos_begin;
         pos_begin += value.0+key.len()+2;
-        println!("CURSOR BEGINS AT: {}", value.1);
-        println!("SIMPLITIGS TOTAL SIZE = {}", value.0);
-        println!("NEXT CURSOR AT: {}", pos_begin);
+        //let mut header = String::new();
+        //for e in key.iter(){
+        //    if *e{
+        //        header.push('1');
+        //    }else{
+        //        header.push('0');
+        //    }
+        //}
+        //println!("CURR KEY: {}", header);
+        //println!("CURSOR BEGINS AT: {}", value.1);
+        //println!("SIMPLITIGS TOTAL SIZE = {}", value.0);
+        //println!("NEXT CURSOR AT: {}", pos_begin);
     });
 }
 
 fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, usize)>, output_dir: &String ) {
     let path = output_dir.clone()+"multicolor.fa.zstd";
     let file = File::create(path.clone());
+    let mut out_mult_file = File::options().write(true).read(true).open(path).expect("Unable to create file");
+    let mut color_set = HashSet::new();
     //let mut multi_f = Encoder::new(File::create(output_dir.clone()+"multicolor.fa.zst").expect("Unable to create file"), 0).unwrap();
     //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
     compute_cursor_start_pos(color_simplitig);
@@ -242,15 +253,20 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     while let Some(record) = fa_reader.next(){
         let seqrec = record.expect("Error reading record");
         let id = seqrec.id();
+        let mut to_write = String::new();
+        let seq = std::str::from_utf8(seqrec.raw_seq()).unwrap();
+        if color_set.insert(String::from(std::str::from_utf8(id).unwrap())){
+            to_write = String::from(">")+std::str::from_utf8(id).unwrap()+"\n"+seq+"\n";
+        }else{
+            to_write = String::from(seq)+"\n";
+        }
         let bitarr = chararray_to_bitarray(id);
-        let to_write = String::from(">")+std::str::from_utf8(id).unwrap()+"\n"+std::str::from_utf8(seqrec.raw_seq()).unwrap()+"\n";
-        let _ = write_at_position_without_truncation(path.as_str(), &to_write, (color_simplitig.get(&bitarr).unwrap().1) as u64);
-        
+        let _ = write_at_position_without_truncation(&mut out_mult_file, &to_write, (color_simplitig.get(&bitarr).unwrap().1) as u64);
+        color_simplitig.get_mut(&bitarr).unwrap().1 += to_write.len();
     }
 }
 
-fn write_at_position_without_truncation(file_path: &str, content: &String, position: u64) -> io::Result<()> {
-    let mut out_mult_file = File::options().write(true).read(true).open(file_path).expect("Unable to create file");
+fn write_at_position_without_truncation(out_mult_file: &mut File, content: &String, position: u64) -> io::Result<()> {
     // Move the cursor to the specified position
     out_mult_file.seek(SeekFrom::Start(position))?;
 
@@ -357,7 +373,7 @@ fn chararray_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRAY_SIZ
     let mut cpt = 0;
     let seq_str = std::str::from_utf8(seq).unwrap();
     seq_str.chars().enumerate().for_each(|c|{
-        println!("{}", c.1);
+        //println!("{}", c.1);
         if c.1 != '0'{
             bit_array.set(cpt, true);
         }else{

@@ -25,19 +25,31 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         let without_path = Path::new(path).file_name().unwrap();
         let dump_curr_file = out_dir.join(format!("Dump_{}.zstd", without_path.to_str().unwrap()));
         let mut dump_file = Encoder::new(File::create(dump_curr_file).expect("Unable to create file"), 0).unwrap();
-        let ( reader, _compression) = niffler::get_reader(Box::new(File::open(multicolor).unwrap())).unwrap();
-        let mut fa_reader = Reader::new(reader);
-        while let Some(data) = fa_reader.next(){
-            let line = data.unwrap();
-            let header: &str = line.id().unwrap();
-            if header.chars().nth(file_number).unwrap() == '1'{
-                let mut header_fa = String::from(">");
-                header_fa.push_str(header.clone());
-                header_fa.push('\n');
-                let to_write = std::str::from_utf8(line.seq()).unwrap();
-                dump_file.write_all((header_fa).as_bytes()).unwrap();
-                dump_file.write_all(to_write.as_bytes()).unwrap(); 
-                dump_file.write_all(b"\n").unwrap();
+        let ( mut reader, _compression) = niffler::get_reader(Box::new(File::open(multicolor).unwrap())).unwrap();
+        let mut contents = String::new();
+        reader.read_to_string(&mut contents).unwrap();
+        let mut header_fa = String::new();
+        let mut iterator = contents.lines();
+        println!("FILENUMBER = {}", file_number);
+        while let Some(line) = iterator.next(){
+            if line != ""{
+                if line.chars().nth(0).unwrap() == '>'{
+                    if line.chars().nth(file_number).unwrap() == '1'{
+                        if file_number == 0{
+                            println!("COUCOU");
+                        }
+                        header_fa.clear();
+                        header_fa.push_str(line.clone());
+                        header_fa.push('\n');
+                    }
+                }else{
+                    if file_number == 0{
+                        println!("COUCOU");
+                    }
+                    dump_file.write_all((header_fa).as_bytes()).unwrap();
+                    dump_file.write_all(line.as_bytes()).unwrap(); 
+                    dump_file.write_all(b"\n").unwrap();
+                }
             }
         }
         let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
