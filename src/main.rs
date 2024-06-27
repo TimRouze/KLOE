@@ -222,7 +222,6 @@ fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAI
 fn compute_cursor_start_pos(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, usize)>){
     let mut pos_begin = 0;
     color_simplitig.iter_mut().for_each(|(key, value)|{
-
         value.1 = pos_begin;
         pos_begin += value.0+key.len()+2;
         //let mut header = String::new();
@@ -241,7 +240,7 @@ fn compute_cursor_start_pos(color_simplitig: &mut HashMap<bitvec::prelude::BitAr
 }
 
 fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, usize)>, output_dir: &String ) {
-    let path = output_dir.clone()+"multicolor.fa.zstd";
+    let path = output_dir.clone()+"multicolor.fa";
     let file = File::create(path.clone());
     let mut out_mult_file = File::options().write(true).read(true).open(path).expect("Unable to create file");
     let mut color_set = HashSet::new();
@@ -260,27 +259,17 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
         }else{
             to_write = String::from(seq)+"\n";
         }
-        let bitarr = chararray_to_bitarray(id);
-        let _ = write_at_position_without_truncation(&mut out_mult_file, &to_write, (color_simplitig.get(&bitarr).unwrap().1) as u64);
+        let bitarr = char_array_to_bitarray(id);
+        let _ = write_sorted(&mut out_mult_file, &to_write, (color_simplitig.get(&bitarr).unwrap().1) as u64);
         color_simplitig.get_mut(&bitarr).unwrap().1 += to_write.len();
     }
 }
 
-fn write_at_position_without_truncation(out_mult_file: &mut File, content: &String, position: u64) -> io::Result<()> {
+fn write_sorted(out_mult_file: &mut File, content: &String, position: u64) -> io::Result<()> {
     // Move the cursor to the specified position
     out_mult_file.seek(SeekFrom::Start(position))?;
-
-    // Read the rest of the file from the position to handle partial writes
-    let mut remainder = Vec::new();
-    out_mult_file.read_to_end(&mut remainder)?;
-
     // Move the cursor back to the specified position and write the content
-    out_mult_file.seek(SeekFrom::Start(position))?;
     out_mult_file.write_all(content.as_bytes())?;
-
-    // Append the remainder of the file
-    out_mult_file.write_all(&remainder)?;
-
     Ok(())
 }
 
@@ -368,7 +357,7 @@ fn extract_filename(path: &str) -> Option<&str> {
     }
 }
 
-fn chararray_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>{
+fn char_array_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>{
     let mut bit_array = BitArray::<[u8; ARRAY_SIZE]>::ZERO;
     let mut cpt = 0;
     let seq_str = std::str::from_utf8(seq).unwrap();
