@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::Hash;
-use std::io::{Write};
+use std::io::Write;
 use seq_io::fasta::{Reader, Record};
 
 /*
@@ -45,7 +44,7 @@ pub fn compute_stats(omnicolor: &str, multicolor: &str, out_dir: &str, k: &usize
     }
     let mut counter = 0;
     let mut counter_2 = 0;
-    for (key, value) in color_nb_kmer_map {
+    for (_key, value) in color_nb_kmer_map {
         /*let mut key_str = String::new();
         for e in key.iter(){
             if *e{
@@ -60,11 +59,11 @@ pub fn compute_stats(omnicolor: &str, multicolor: &str, out_dir: &str, k: &usize
         }*/
         counter += 1;
         //writeln!(file, "{}: {}", key_str, value)?;
-        writeln!(kmer_per_color_file, "{}", value);
+        writeln!(kmer_per_color_file, "{}", value).expect("Unable to write in stat file");
     }
     for(key, value) in size_nb_simplitig_map{
         counter_2 += 1;
-        writeln!(simplitig_per_simplitig_size_file, "{}: {}", key, value);
+        writeln!(simplitig_per_simplitig_size_file, "{}: {}", key, value).expect("Unable to write in stat file");
     }
     println!("Wrote {} lines in kmer per color file.", counter);
     println!("Wrote {} lines in kmer per simplitig size file.", counter_2)
