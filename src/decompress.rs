@@ -87,7 +87,7 @@ fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wante
 fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor: &mut u64) -> String{
     let mut decompressor = Decompressor::new().unwrap();
     multicolor_reader.seek(std::io::SeekFrom::Start(*prev_cursor)).expect("Unable to seek to specified position");
-    let mut buffer = vec![0; size];
+    let mut buffer = vec![0; size.div_ceil(4)];
     multicolor_reader.read_exact(&mut buffer).unwrap();
     println!("Cursor is at: {}", prev_cursor);
     println!("Size to read: {}", size);
