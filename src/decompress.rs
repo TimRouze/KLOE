@@ -1,11 +1,13 @@
 use clap::error::Result;
 use rayon::str::Chars;
 use seq_io::fasta::{Reader, Record};
+use std::ops::Div;
 use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use::rayon::prelude::*;
 use zstd::bulk::Decompressor;
+use crate::utils::vec2str;
 
 /// DECOMPRESS
 /// Omnicolor: file containing omnicolored kmers
@@ -24,6 +26,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     if wanted_files_path != ""{
         input_fof = File::open(wanted_files_path).unwrap();
     }else{
+        //TODO ASK CONFIRMATION TO DECOMPRESS EVERYTHING.
         input_fof = File::open(input_names).unwrap();
     }
     let reader = BufReader::new(input_fof);
@@ -35,20 +38,34 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         }
     }
     decompress_multicolor("multicolor_bucket_size.txt", "filename_to_color.txt", wanted_files_path, multicolor, &out_dir);
+   
     (0..filenames.len()).into_par_iter().for_each(|file_number|{
         let filename = filenames.get(file_number).unwrap();
         println!("{}", filename);
-        let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
-        let mut fa_reader = Reader::new(reader);
+        let mut curr_file = File::open(omnicolor).unwrap();
+        let mut curr_reader = BufReader::new(&curr_file);
+        //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
         //let mut counter = 0;
-        while let Some(data) = fa_reader.next(){
-            let line = data.unwrap();
-            let to_write = std::str::from_utf8(line.seq()).unwrap();
-            let header_fa = String::from(">OMNI\n");
+        let mut cursor = 0;
+
+        let metadata = curr_file.metadata().unwrap();
+        let mut file_size: usize = metadata.len() as usize;
+        //println!("FILE SIZE = {}", file_size);
+        while cursor < file_size{
+            let mut size_buf = [0; 4];
+            cursor += 4;
+            curr_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
+            let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
+            let size_simplitig: u32 = u32::from_le_bytes(size_buf);
+            println!("READING CURSOR = {}", cursor);
+            cursor += size_to_read as usize;
+            println!("SIZE: {}", size_simplitig);
+            let mut simplitig = vec![0; size_to_read as usize];
+            println!("Reading {} Bytes", simplitig.len());
+            curr_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
+            let to_write = vec2str(&simplitig, &(size_simplitig as usize));
             //counter += to_write.len()-31+1;
-            let mut content = header_fa.clone();
-            content.push_str(to_write);
-            content.push('\n');
+            let mut content = to_write;
             println!("CURR PATH: {}", filename);
             write_output(&content, &filename, &out_dir);
         }
@@ -85,7 +102,7 @@ fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wante
 }
 
 fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor: &mut u64) -> String{
-    let mut decompressor = Decompressor::new().unwrap();
+    //let mut decompressor = Decompressor::new().unwrap();
     multicolor_reader.seek(std::io::SeekFrom::Start(*prev_cursor)).expect("Unable to seek to specified position");
     let mut buffer = vec![0; size.div_ceil(4)];
     multicolor_reader.read_exact(&mut buffer).unwrap();
@@ -93,10 +110,10 @@ fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor
     println!("Size to read: {}", size);
     println!("Buffer size: {}", buffer.len());
     println!("I have read {} bytes this time", multicolor_reader.stream_position().unwrap()- *prev_cursor);
-    let decompressed = decompressor.decompress(&buffer, size*100).unwrap();
-    println!("Decompressed: {}", String::from_utf8(decompressed.clone()).unwrap());
-    *prev_cursor += size as u64;
-    String::from_utf8(decompressed).unwrap()
+    //let decompressed = decompressor.decompress(&buffer, size*100).unwrap();
+    println!("Decompressed: {}", vec2str(&buffer, &size));
+    *prev_cursor += size.div_ceil(4) as u64;
+    vec2str(&buffer, &size)
 }
 
 fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool, sizes: &Vec<&str>){
@@ -107,10 +124,13 @@ fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool, sizes: &V
         *cursor += end_pos.parse::<u64>().unwrap();
     }else{
         for size in sizes.iter(){
-            already_read += size.parse::<u64>().unwrap();
+            already_read += size.parse::<u64>().unwrap().div_ceil(4);
         }
         *cursor += end_pos.parse::<u64>().unwrap() - already_read;
     }
+    println!("end_pos: {}", end_pos);
+    println!("parsed end_pos: {}", end_pos.parse::<u64>().unwrap());
+    println!("already read = {}", already_read);
     println!("CURSOR AFTER INCREMENT: {}", cursor);
 }
 
@@ -218,5 +238,7 @@ fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
     let mut out_file = File::options().write(true).read(true).create(true).open(&path).expect("Unable to create file");
     println!("OUTFILENAME: {}", path.display());
     out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");
+    out_file.write_all(&">\n".as_bytes()).unwrap();
     out_file.write_all(content.as_bytes()).unwrap();
+    out_file.write_all(&"\n".as_bytes()).unwrap();
 }

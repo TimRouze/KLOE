@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod utils;
 mod kmer;
 mod decompress;
 mod stats;
@@ -20,6 +21,7 @@ use std::cell::Cell;
 use hashbrown::{HashMap, HashSet};
 use needletail::{parse_fastx_file, Sequence};
 
+use crate::utils::{num2str, str2num, };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -163,7 +165,8 @@ SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
 fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String) -> HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>{
     println!("I will reconstruct simplitigs from {} kmers", kmer_map.len());
     let mut multi_f = File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file");
-    let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
+    //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("Unable to create file"), 0).unwrap();
+    let mut omni_f = File::create(output_dir.clone()+"omnicolor.kloe").expect("unable to create file");
     let mut iterator = kmer_map.iter();
     let mut color_simplitig_size: HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)> = HashMap::new();
     let mut omni: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
@@ -200,7 +203,6 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
             is_omni = false;
         }
     }
-    omni_f.finish().expect("Error finishing writing in file");
     color_simplitig_size
 }
 
@@ -242,7 +244,7 @@ fn compute_cursor_start_pos(color_simplitig: &HashMap<bitvec::prelude::BitArray<
 // REECRITURE TRIÉ PUIS COMPRESSION
 fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, output_dir: &String ) {
     let path = output_dir.clone()+"multicolor.kloe";
-    let compressed_path = output_dir.clone()+"multicolor.zstd";
+    //let compressed_path = output_dir.clone()+"multicolor.zstd";
     let mut out_mult_file = File::options().write(true).read(true).create(true).open(path.clone()).expect("Unable to create file");
     let out_compressed_file = File::create(path+".zstd").unwrap();
     let mut out_compressed_encoder = zstd::Encoder::new(out_compressed_file, 9).unwrap();
@@ -329,8 +331,8 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     write_interface_file(color_simplitig, output_dir);
 }
 
-fn zstd_compress_file(in_file: &File, output_path: &Path) -> io::Result<()> {
-    let input_file = File::open(input_path)?;
+/* fn zstd_compress_file(in_file: &File, output_path: &Path) -> io::Result<()> {
+    let in_file = File::open(input_path)?;
     let mut reader = BufReader::new(input_file);
 
     let output_file = File::create(output_path)?;
@@ -338,7 +340,7 @@ fn zstd_compress_file(in_file: &File, output_path: &Path) -> io::Result<()> {
 
     copy_encode(&mut reader, &mut writer, 9)?;
     Ok(())
-}
+} */
 
 fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &u8, size: &u32) -> io::Result<()> {
     //let mut encoder = Compressor::new(12).unwrap();
@@ -358,14 +360,14 @@ fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &m
     });*/
     let position = color_cursor_pos.get(&color_vec).unwrap();
     out_mult_file.seek(SeekFrom::Start(*position))?;
-    let mut encoder = zstd::Encoder::new(out_mult_file, 9);
-    encoder.write_all(&content)?;
+    //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
+    out_mult_file.write_all(&content)?;
         //io::stdin().read_line(&mut input).expect("error: unable to read user input");
     //println!("Cursor is at: {}", position);
     //println!("I wrote: {} bytes", compressed.len());
     //println!("Cursor is now at: {}", *position+(content.len() as u64));
     //*position += compressed.len() as u64;
-    encoder.finish()?;
+    //encoder.finish()?;
     color_cursor_pos.entry(color_vec).and_modify(|cursor| {*cursor += content.len() as u64});
     Ok(())
 }
@@ -416,15 +418,21 @@ fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8;
     }
 }
 
-fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni_f: &mut Encoder<'static, File>, color: &BitArray<[u8;ARRAY_SIZE]>, size_str : &usize){
+fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni_f: &mut File, color: &BitArray<[u8;ARRAY_SIZE]>, size_str : &usize){
     //let mut cursor = 0;
+    let size:u32 = *size_str as u32;
     if *is_omni{
-        let mut header = String::from(">");
-        header.push('\n');
-        omni_f.write_all((header).as_bytes()).unwrap();      
+        let mut cursor = 0;
+        //let mut header = String::from(">");
+        //header.push('\n');
+        println!("OMNI SIZE: {}", size);
+        println!("SHOULD READ: {}", simplitig.len());
+        println!("size div ceil 4: {}", size.div_ceil(4));
+        omni_f.write_all(&size.to_le_bytes()).unwrap();    
+        cursor += 4;  
         omni_f.write_all(&simplitig).expect("Unable to write data");
-        //omni_f.write_all(b" ");                     
-        omni_f.write_all(b"\n").unwrap();
+        cursor += simplitig.len();
+        println!("cursor: {}", cursor);
     }else{
         let mut id = Vec::new();
         let mut cpt = 0;
@@ -453,7 +461,6 @@ fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni
         //println!("Color size {}", id.len());
         //let mut input = String::new();
         //io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        let size: u32 = *size_str as u32;
         multi_f.write_all(&id).expect("Unable to write color");
         multi_f.write_all(&size.to_le_bytes()).expect("Unable to write simplitig size");  
         multi_f.write_all(&simplitig).expect("Unable to write data");
@@ -487,139 +494,6 @@ fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni
     Ok(())
 }*/
 
-fn extract_filename(path: &str) -> Option<&str> {
-    // Split the path by '/'
-    let parts: Vec<&str> = path.split('/').collect();
-    // Get the last element of the path
-    if let Some(filename) = parts.last() {
-        // Split the filename by '.' and take the first part
-        if let Some(idx) = filename.find('.') {
-            Some(&filename[..idx])
-        } else {
-            Some(filename)
-        }
-    } else {
-        None
-    }
-}
-
-fn char_array_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>{
-    let mut bit_array = BitArray::<[u8; ARRAY_SIZE]>::ZERO;
-    let mut cpt = 0;
-    let seq_str = std::str::from_utf8(seq).unwrap();
-    seq_str.chars().enumerate().for_each(|c|{
-        //println!("{}", c.1);
-        if c.1 != '0'{
-            bit_array.set(cpt, true);
-        }else{
-            bit_array.set(cpt, false);
-        }
-        cpt += 1;
-    });
-    bit_array
-}
-
-fn vec2str(seq: &Vec<u8>, size: &usize) -> String{
-    let mut res = String::from("");
-    let mask = 3;
-    for elem in seq.iter(){
-        res += nuc2str(&(elem&mask));
-        res += nuc2str(&((elem >> 2)&mask));
-        res += nuc2str(&((elem >> 4)&mask));
-        res += nuc2str(&((elem >> 6)&mask));
-    }
-    let _ = res.drain(size..);
-    res
-}
-
-fn num2str(mut k_mer: u64) -> String{
-    let mut res = String::from("");
-    let mut nuc: u64;
-    for _i in 0..K{
-        nuc = k_mer%4;
-        if nuc == 0{
-            res.push('A');
-        }else if nuc == 1{
-            res.push('C');
-        }else if nuc == 2{//bebou
-            res.push('G');
-        }else if nuc == 3{
-            res.push('T');
-        }
-        k_mer >>= 2;
-    }
-    res.chars().rev().collect()
-}
-
-fn nuc2str(nuc: &u8) -> &str{
-
-    if nuc%4 == 0{
-        "A"
-    }else if nuc%4 == 1{
-        "C"
-    }else if nuc%4 == 2{//bebou
-        "G"
-    }else{
-        "T"
-    }
-}
-
-fn str2num(sequence: &String) -> Vec<u8>{
-    let mut res = Vec::new();
-    let mut tmp_res: u8 = 0;
-    let mask = 3;
-    let mut i = 0;
-    let mut shift = 0;
-    let mut char_list = sequence.chars();
-    //println!("{}", sequence.len());
-    while let Some(nuc) = char_list.next(){
-        tmp_res += nuc2int(&(nuc as u8)).unwrap() << shift;
-        shift += 2;
-        i += 1;
-        //tmp_res += nuc2int(&(curr_byte.chars().nth(1).unwrap() as u8)).unwrap() << 2;
-        //tmp_res += nuc2int(&(curr_byte.chars().nth(2).unwrap() as u8)).unwrap() << 4;
-        //tmp_res += nuc2int(&(curr_byte.chars().nth(3).unwrap() as u8)).unwrap() << 6;
-        if i%4 == 0{
-            res.push(tmp_res);
-            tmp_res = 0;
-            shift = 0;
-        }
-    }
-    if shift != 0{
-        res.push(tmp_res);
-    }
-    //println!("SIZE AS BYTES: {}", res.len());
-    res
-}
-
-fn nuc2int(b: &u8) -> Option<u8> {
-    match b {
-        b'A' | b'C' | b'T' | b'G' => Some((b / 3-1) % 4),
-        _ => None,
-    }
-}
-
-fn rev_comp_str(seq: &str) -> String{
-    let mut res = String::new();
-    for nuc in seq.chars(){
-        if nuc == 'A' {
-            res = format!("T{}", res);
-        }else if nuc == 'C' {
-            res = format!("G{}", res);
-        }else if nuc == 'T' {
-            res = format!("A{}", res);
-        }else{
-            res = format!("C{}", res);
-        }
-    }
-    res
-}
-
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where P: AsRef<Path>, {
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
-}
 
 
 #[test]
