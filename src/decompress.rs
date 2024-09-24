@@ -4,6 +4,7 @@ use seq_io::fasta::{Reader, Record};
 use std::ops::Div;
 use std::path::{Path, PathBuf};
 use std::fs::File;
+use std::io;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use::rayon::prelude::*;
 use zstd::bulk::Decompressor;
@@ -110,8 +111,16 @@ fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor
     println!("Size to read: {}", size);
     println!("Buffer size: {}", buffer.len());
     println!("I have read {} bytes this time", multicolor_reader.stream_position().unwrap()- *prev_cursor);
+    if vec2str(&buffer.to_vec(), &(size)).contains("AAAAAAAAAA"){
+        println!("CURSOR AFTER READ: {}", *prev_cursor + size.div_ceil(4) as u64);
+        println!("SIMPLITIG: {}", vec2str(&buffer.to_vec(), &size));
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).expect("error: unable to read user input");
+    }
+    //let mut input = String::new();
+    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
     //let decompressed = decompressor.decompress(&buffer, size*100).unwrap();
-    println!("Decompressed: {}", vec2str(&buffer, &size));
+    //println!("Decompressed: {}", vec2str(&buffer, &size));
     *prev_cursor += size.div_ceil(4) as u64;
     vec2str(&buffer, &size)
 }
@@ -190,14 +199,23 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
             }
         }
         if to_read{
-            println!("color: {}", color);
-            println!("pos: {}", pos);
+            if color == "01101100"{
+                println!("color: {}", color);
+                println!("pos: {}", pos);
+            
+            }
             for size in sizes.iter(){
-                println!("Reading {} bytes", size);
-                println!("cursor: {}", prev_cursor);
-                println!("current size: {}", size);
-                println!("Decompressing color: {}", color);
                 content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
+                if color == "01101100"{
+                    println!("Reading {} bytes", size);
+                    println!("Cursor then: {}", prev_cursor-size.parse::<u64>().unwrap());
+                    println!("cursor now: {}", prev_cursor);
+                    println!("current size: {}", size);
+                    println!("Decompressing color: {}", color);
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                }
+                
                 let pos = positions_in_color.iter().position(|&r| r == pos).unwrap();
                 write_output(&content, filenames.get(pos).unwrap(), out_dir);
             }
@@ -212,7 +230,7 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
 fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(String, Vec<&str>, String)>{
     let mut color_to_sizes: Vec<(String, Vec<&str>, String)> = Vec::new();
     for color_size in color_to_pos{
-        
+        //01000000,32984:11349,24210,13602,4395,11693,4809,9139,...
         let first_part = color_size.split(':').collect::<Vec<_>>()[0];
         let sizes = color_size.split(':').collect::<Vec<_>>()[1];
         let color = first_part.split(',').collect::<Vec<_>>()[0];
