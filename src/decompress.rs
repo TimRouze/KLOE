@@ -132,10 +132,10 @@ fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool, sizes: &V
         println!("SKIPPING COLOR");
         *cursor += end_pos.parse::<u64>().unwrap();
     }else{
-        for size in sizes.iter(){
+        /*for size in sizes.iter(){
             already_read += size.parse::<u64>().unwrap().div_ceil(4);
-        }
-        *cursor += end_pos.parse::<u64>().unwrap() - already_read;
+        }*/
+        *cursor += end_pos.parse::<u64>().unwrap() - *cursor;
     }
     println!("end_pos: {}", end_pos);
     println!("parsed end_pos: {}", end_pos.parse::<u64>().unwrap());

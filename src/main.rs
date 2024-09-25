@@ -21,6 +21,7 @@ use kmer::{Kmer, RawKmer};
 use std::cell::Cell;
 use hashbrown::{HashMap, HashSet};
 use needletail::{parse_fastx_file, Sequence};
+use indexmap::IndexMap;
 
 use crate::utils::{num2str, str2num, };
 
@@ -58,7 +59,6 @@ pub type KT = u64;
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 
-//TODO SORT COLORS
 //TODO QUERY
     //TODO INTERFACE FILE: FILENAME TO COLOR
     //TODO INTERFACE FILE: COLOR TO SIMPLITIG SIZE
@@ -255,15 +255,24 @@ fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAI
     false
 }
 
-fn compute_cursor_start_pos(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>) -> HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>{
-    let mut color_to_cursor = HashMap::new();
+fn compute_cursor_start_pos(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>) -> IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>{
+    let mut color_to_cursor = IndexMap::new();
     let mut prev_cursor: u64 = 0;
     for (key, value) in color_simplitig.iter(){
-        color_to_cursor.entry(*key).or_insert({
-            let proxy = prev_cursor;
-            prev_cursor += value.0 as u64;
-            proxy
-        });
+        
+        if key.count_ones() != NB_FILES{
+            color_to_cursor.entry(*key).or_insert({
+                let proxy = prev_cursor;
+                prev_cursor += value.0 as u64;
+                proxy
+            });
+        }
+        else {
+            println!("oui?");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        
+        }
     }
     color_to_cursor
 }
@@ -333,7 +342,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
                 color_str.push('0');
             }
         }
-        /* if color_str == "011011"{
+        if vec2str(&simplitig.to_vec(), &(size_simplitig as usize)).contains("AAAAAAAAAA"){
             println!("CURSOR: {}", cursor);
             /*let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
             for i in 0..NB_FILES{
@@ -344,7 +353,9 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
             }*/
             println!("color cursor pos: {}", color_cursor_pos.get(&color_vec).unwrap());
             println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
-        } */
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        }
         //println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
         let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &id.to_vec()[0], &size_simplitig);
         //println!("READING CURSOR = {}", cursor);
@@ -357,7 +368,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     out_compressed_encoder.write_all(&buffer).unwrap();
     out_compressed_encoder.finish();
     //zstd_compress_file(&out_mult_file, compressed_path);
-    write_interface_file(color_simplitig, output_dir);
+    write_interface_file(color_simplitig, color_cursor_pos, output_dir);
 }
 
 /* fn zstd_compress_file(in_file: &File, output_path: &Path) -> io::Result<()> {
@@ -371,7 +382,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     Ok(())
 } */
 
-fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &u8, size: &u32) -> io::Result<()> {
+fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &mut IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &u8, size: &u32) -> io::Result<()> {
     //let mut encoder = Compressor::new(12).unwrap();
     //let compressed = encoder.compress(content.as_bytes()).unwrap();
     let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
@@ -422,10 +433,10 @@ fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPA
     false
 }
 
-fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, output_dir: &String){
+fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, color_cursor_pos: IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, output_dir: &String){
     let mut file = File::create(output_dir.clone()+"multicolor_bucket_size.txt").expect("Unable to create interface file");
     let mut nb_seen = 0;
-    for (key, pair) in color_simplitig{
+    for (key, cursor_end) in color_cursor_pos{
         let mut color = String::new();
         for e in key.iter(){
             if *e{
@@ -436,12 +447,13 @@ fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8;
             }
         }
         let mut bucket_sizes = String::new();
-        for e in pair.1.iter(){
+        let curr_values = color_simplitig.get(&key).unwrap();
+        for e in curr_values.1.iter(){
             bucket_sizes += &(e.to_string().to_owned()+",");
         }
         if nb_seen < NB_FILES{
             bucket_sizes.pop();
-            writeln!(file, "{},{}:{}", color, pair.0, bucket_sizes).unwrap();
+            writeln!(file, "{},{}:{}", color, cursor_end, bucket_sizes).unwrap();
         }
         nb_seen = 0;
     }
