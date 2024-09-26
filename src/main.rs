@@ -5,21 +5,17 @@ mod kmer;
 mod decompress;
 mod stats;
 use clap::Parser;
-use num_traits::ToBytes;
 use stats::compute_stats;
-use utils::vec2str;
-use std::ops::Div;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Stdin, Write, BufReader};
 use std::env;
 use::rayon::prelude::*;
-use zstd::stream::write::Encoder;
 use bitvec::prelude::*;
 use kmer::{Kmer, RawKmer};
 use std::cell::Cell;
-use hashbrown::{HashMap, HashSet};
 use needletail::{parse_fastx_file, Sequence};
 use indexmap::IndexMap;
 
@@ -121,9 +117,9 @@ CREATES K-MER -> COLOR MAP.
 */
 fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
-    //let mut counter = 0;
-    //let mut counter_insert = 0;
-    //let mut counter_modify = 0;
+    let mut counter = 0;
+    let mut counter_insert = 0;
+    let mut counter_modify = 0;
     //let mut to_add = HashSet::new();
     while let Some(record) = fa_reader.next(){
         let seqrec = record.expect("Error reading record");
@@ -132,17 +128,17 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
         let canon_kmers = norm_seq.canonical_kmers(31, &norm_rc);
         canon_kmers.for_each(|kmer|{
             //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
-            
+            counter += 1;
             let curr_kmer: RawKmer<K, u64> = RawKmer::from_nucs(kmer.1);
             let mut kmer_map = kmer_map_mutex.lock().unwrap();
             //let file_nb = *file_number.read();
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
-                //counter_modify += 1;
+                counter_modify += 1;
                 pair.0.set(file_number, true);
             }).or_insert_with(|| {
                 let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                 bv.set(file_number, true);
-                //counter_insert += 1;
+                counter_insert += 1;
                 (bv, Cell::new(false))
             });
             if kmer_map.len() >= (80/100)*nb_elem{
@@ -151,9 +147,9 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
             drop(kmer_map);
         });
     }
-    //println!("I have inserted {} k-mers", counter_insert);
-    //println!("I have seen {} already inserted k-mers", counter_modify);
-    //println!("I have seen {} k-mers", counter);
+    println!("I have inserted {} k-mers", counter_insert);
+    println!("I have seen {} already inserted k-mers", counter_modify);
+    println!("I have seen {} k-mers", counter);
 }
 
 /*
@@ -199,40 +195,10 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
                             total_size.1.push(simplitig_size);
                         })
                         .or_insert((simplitig_size.div_ceil(4), vec![simplitig_size]));
-            let mut color = String::new();
-            for e in curr_cell.0.iter(){
-                if *e{
-                    color.push('1');
-                }else{
-                    color.push('0');
-                }
-            }
             write_simplitig(&str2num(&simplitig), &is_omni, &mut multi_f, &mut omni_f, &curr_cell.0, &simplitig.len());
             is_omni = false;
         }
     }
-    /* for (key, (bucket_total_bin_size, sizes)) in color_simplitig_size.iter(){
-        let mut cpt_total = 0;
-        for size in sizes{
-            cpt_total += size.div_ceil(4);
-        }
-        let mut str_color = String::new();
-        for e in key.iter(){
-            if *e{
-                str_color.push('1');
-            }else {
-                str_color.push('0');
-            }
-        }
-        if cpt_total != *bucket_total_bin_size{
-
-            println!("DIFFERENCE DE TAILLE SUR COULEUR: {}", str_color);
-            println!("TAILLE TOTALE ATTENDUE: {}", bucket_total_bin_size);
-            println!("TAILLE TOTALE CALULEE: {}", cpt_total);
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        }
-    }  */
     color_simplitig_size
 }
 
@@ -259,19 +225,12 @@ fn compute_cursor_start_pos(color_simplitig: &HashMap<bitvec::prelude::BitArray<
     let mut color_to_cursor = IndexMap::new();
     let mut prev_cursor: u64 = 0;
     for (key, value) in color_simplitig.iter(){
-        
         if key.count_ones() != NB_FILES{
             color_to_cursor.entry(*key).or_insert({
                 let proxy = prev_cursor;
                 prev_cursor += value.0 as u64;
                 proxy
             });
-        }
-        else {
-            println!("oui?");
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        
         }
     }
     color_to_cursor
@@ -289,29 +248,12 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     let mut out_compressed_encoder = zstd::Encoder::new(out_compressed_file, 9).unwrap();
     //let mut color_set = HashSet::new();
     let mut color_cursor_pos = compute_cursor_start_pos(color_simplitig);
-    /* for (key, val) in color_cursor_pos.clone(){
-        let mut col = String::new();
-        for e in key.iter(){
-            if *e{
-                col.push('1');
-            }else{
-                col.push('0');
-            }
-        }
-        println!("ID = {}", col);
-        println!("cursor pos: {}", val);
-    } */
-    //println!("\n\n\n");
-    //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.fa.zstd").expect("Unable to create file"), 0).unwrap();
-    //compute_cursor_start_pos(color_simplitig);
-    let mut temp_multicolor_file = File::open(output_dir.clone()+"temp_multicolor.fa").unwrap();
+    let temp_multicolor_file = File::open(output_dir.clone()+"temp_multicolor.fa").unwrap();
     let mut temp_multicolor_reader = BufReader::new(&temp_multicolor_file);
-
-    let mut to_write: String = String::new();
     const color_size: usize = NB_FILES.div_ceil(8);
     let mut cursor: usize = 0;
     let metadata = temp_multicolor_file.metadata().unwrap();
-    let mut file_size: usize = metadata.len() as usize;
+    let file_size: usize = metadata.len() as usize;
     //println!("FILE SIZE = {}", file_size);
     while cursor < file_size{
         cursor+= color_size;
@@ -322,51 +264,23 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
         temp_multicolor_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
         let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
         let size_simplitig: u32 = u32::from_le_bytes(size_buf);
-        println!("READING CURSOR = {}", cursor);
+        //println!("READING CURSOR = {}", cursor);
         cursor += size_to_read as usize;
-        println!("COLOR: {}\nSIZE: {}", &id.to_vec()[0], size_simplitig);
+        //println!("COLOR: {}\nSIZE: {}", &id.to_vec()[0], size_simplitig);
         let mut simplitig = vec![0; size_to_read as usize];
-        println!("Reading {} Bytes", simplitig.len());
+        //println!("Reading {} Bytes", simplitig.len());
         temp_multicolor_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
-        
-        //DEBUG
-        let mut color_str = String::new();
-        let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-        for i in 0..NB_FILES{
-            let bit = (id.to_vec()[0] >> i) & 1;
-            //println!("{}", bit);
-            if bit == 1{
-                color_str.push('1');
-                color_vec.set(i,true);
-            }else{
-                color_str.push('0');
-            }
-        }
-        if vec2str(&simplitig.to_vec(), &(size_simplitig as usize)).contains("AAAAAAAAAA"){
-            println!("CURSOR: {}", cursor);
-            /*let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-            for i in 0..NB_FILES{
-                let bit = (id.to_vec()[0] >> i) & 1;
-                if bit == 1{
-                    color_vec.set(i,true);
-                }
-            }*/
-            println!("color cursor pos: {}", color_cursor_pos.get(&color_vec).unwrap());
-            println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        }
         //println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
-        let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &id.to_vec()[0], &size_simplitig);
+        let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &id.to_vec()[0]);
         //println!("READING CURSOR = {}", cursor);
         //let mut input = String::new();
         //io::stdin().read_line(&mut input).expect("error: unable to read user input");
     }
-    out_mult_file.seek(std::io::SeekFrom::Start(0));
+    let _ = out_mult_file.seek(std::io::SeekFrom::Start(0));
     let mut buffer = Vec::new();
     out_mult_file.read_to_end(&mut buffer).unwrap();
     out_compressed_encoder.write_all(&buffer).unwrap();
-    out_compressed_encoder.finish();
+    let _ = out_compressed_encoder.finish();
     //zstd_compress_file(&out_mult_file, compressed_path);
     write_interface_file(color_simplitig, color_cursor_pos, output_dir);
 }
@@ -382,7 +296,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     Ok(())
 } */
 
-fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &mut IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &u8, size: &u32) -> io::Result<()> {
+fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &mut IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &u8) -> io::Result<()> {
     //let mut encoder = Compressor::new(12).unwrap();
     //let compressed = encoder.compress(content.as_bytes()).unwrap();
     let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
@@ -392,20 +306,10 @@ fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &m
             color_vec.set(i,true);
         }
     }
-    //let mut input = String::new();
-    //io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    /*color_simplitig.entry(color_vec)
-                   .and_modify(|total_size| {
-                        total_size.1.push(compressed.len());
-    });*/
     let position = color_cursor_pos.get(&color_vec).unwrap();
     out_mult_file.seek(SeekFrom::Start(*position))?;
     //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
     out_mult_file.write_all(&content)?;
-        //io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    //println!("Cursor is at: {}", position);
-    //println!("I wrote: {} bytes", compressed.len());
-    //println!("Cursor is now at: {}", *position+(content.len() as u64));
     //*position += compressed.len() as u64;
     //encoder.finish()?;
     color_cursor_pos.entry(color_vec).and_modify(|cursor| {*cursor += content.len() as u64});
@@ -483,12 +387,6 @@ fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni
                 curr_int = 0;
             }
         }
-        /* if str_color == "01101100"{
-            println!("AH BON");
-            println!("SIMPLITIG: {}", vec2str(simplitig, size_str));
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        } */
         //println!("");
         //println!("str color: {}", str_color);
         //println!("color size = {}", id.len());
@@ -503,33 +401,6 @@ fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni
         multi_f.write_all(&simplitig).expect("Unable to write data");
     }
 }
-
-/*fn write_hashmap_to_file(map: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, usize>) -> io::Result<()> {
-    let mut file = File::create("color_kmer_stats.txt")?;
-    let mut counter = 0;
-    println!("Writing color stats in file...");
-    for (_key, value) in map {
-        /*let mut key_str = String::new();
-        for e in key.iter(){
-            if *e{
-                key_str.push('1');
-            }else{
-                key_str.push('0');
-            }
-            count_files += 1;
-            if count_files >= NB_FILES{
-                break;
-            }
-        }*/
-        counter += 1;
-        //writeln!(file, "{}: {}", key_str, value)?;
-        writeln!(file, "{}", value)?;
-    }
-    println!("Wrote {} lines in stat file.", counter);
-    Ok(())
-}*/
-
-
 
 #[test]
 fn test_bitvec_eq_omni(){

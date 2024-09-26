@@ -1,7 +1,7 @@
 use bitvec::prelude::BitArray;
 use std::path::Path;
 use std::io;
-use std::io::{BufReader, BufRead};
+use std::io::BufRead;
 use std::fs::File;
 use std::cell::Cell;
 
@@ -94,7 +94,6 @@ pub fn nuc2str(nuc: &u8) -> &str{
 pub fn str2num(sequence: &String) -> Vec<u8>{
     let mut res = Vec::new();
     let mut tmp_res: u8 = 0;
-    let mask = 3;
     let mut i = 0;
     let mut shift = 0;
     let mut char_list = sequence.chars();
