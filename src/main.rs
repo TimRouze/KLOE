@@ -46,8 +46,8 @@ pub mod constants {
     include!("constants.rs");
 }
 use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF};
-const K: usize = 31;
-pub type KT = u64;
+const K: usize = 61;
+pub type KT = u128;
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Arc<AtomicBool>);
 
 
@@ -62,7 +62,7 @@ fn main() {
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let file = File::open(INPUT_FOF).unwrap();
     let reader = io::BufReader::new(file);
-    let kmer_map_mutex: Arc<DashMap<u64, COLORPAIR>> = Arc::new(DashMap::with_capacity(nb_elem));
+    let kmer_map_mutex: Arc<DashMap<KT, COLORPAIR>> = Arc::new(DashMap::with_capacity(nb_elem));
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
@@ -98,7 +98,7 @@ fn main() {
     }
 }
 
-fn read_fasta(filename: &str, kmer_map: &mut Arc<DashMap<u64, COLORPAIR>>, file_number: usize, /*nb_elem: &usize*/){
+fn read_fasta(filename: &str, kmer_map: &mut Arc<DashMap<KT, COLORPAIR>>, file_number: usize, /*nb_elem: &usize*/){
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
     //let mut counter = 0;
     let mut counter_insert = 0;
@@ -108,11 +108,11 @@ fn read_fasta(filename: &str, kmer_map: &mut Arc<DashMap<u64, COLORPAIR>>, file_
         let seqrec = record.expect("Error reading record");
         let norm_seq = seqrec.normalize(false);
         let norm_rc = norm_seq.reverse_complement();
-        let canon_kmers = norm_seq.canonical_kmers(31, &norm_rc);
+        let canon_kmers = norm_seq.canonical_kmers(K as u8, &norm_rc);
         canon_kmers.for_each(|kmer|{
             //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
             
-            let curr_kmer: RawKmer<K, u64> = RawKmer::from_nucs(kmer.1);
+            let curr_kmer: RawKmer<K, KT> = RawKmer::from_nucs(kmer.1);
             //let file_nb = *file_number.read();
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
                 counter_modify += 1;
@@ -135,7 +135,7 @@ fn read_fasta(filename: &str, kmer_map: &mut Arc<DashMap<u64, COLORPAIR>>, file_
 }
 
 
-fn compute_colored_simplitigs(kmer_map: Arc<DashMap<u64, COLORPAIR>>, output_dir: &String) {
+fn compute_colored_simplitigs(kmer_map: Arc<DashMap<KT, COLORPAIR>>, output_dir: &String) {
     println!("I will reconstruct simplitigs from {} kmers", kmer_map.len());
 
     let multi_f = Arc::new(Mutex::new(Encoder::new(File::create(output_dir.clone() + "multicolor.fa.zstd").expect("Unable to create file"), 0).unwrap().auto_finish()));
@@ -150,7 +150,7 @@ fn compute_colored_simplitigs(kmer_map: Arc<DashMap<u64, COLORPAIR>>, output_dir
         tmp
     };
 
-    let keys: Vec<u64> = kmer_map.iter().map(|entry| *entry.key()).collect();
+    let keys: Vec<KT> = kmer_map.iter().map(|entry| *entry.key()).collect();
 
     keys.par_iter().for_each(|&key| {
             let curr_cell = kmer_map.get(&key).unwrap();
@@ -179,7 +179,7 @@ fn compute_colored_simplitigs(kmer_map: Arc<DashMap<u64, COLORPAIR>>, output_dir
     let _ = write_hashmap_to_file(&color_nbkmer_mutex.lock().unwrap());
 }
 
-fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map: &Arc<DashMap<u64, COLORPAIR>>, simplitig: &mut String, color: &bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>) -> bool {
+fn extend_forward(curr_kmer: &RawKmer<K, KT>, kmer_map: &Arc<DashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>) -> bool {
     for succs in curr_kmer.successors() {
         if kmer_map.contains_key(&succs.canonical().to_int()) {
             let curr_cell = kmer_map.get(&succs.canonical().to_int()).unwrap();
@@ -194,7 +194,7 @@ fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map: &Arc<DashMap<u64, COLOR
     false
 }
 
-fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map: &Arc<DashMap<u64, COLORPAIR>>, simplitig: &mut String, color: &bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>) -> bool {
+fn extend_backward(curr_kmer: &RawKmer<K, KT>, kmer_map: &Arc<DashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>) -> bool {
     for preds in curr_kmer.predecessors() {
         if kmer_map.contains_key(&preds.canonical().to_int()) {
             let pred_pair = kmer_map.get(&preds.canonical().to_int()).unwrap();
@@ -274,9 +274,9 @@ fn extract_filename(path: &str) -> Option<&str> {
     }
 }
 
-fn num2str(mut k_mer: u64) -> String{
+fn num2str(mut k_mer: KT) -> String{
     let mut res = String::from("");
-    let mut nuc: u64;
+    let mut nuc: KT;
     for _i in 0..K{
         nuc = k_mer%4;
         if nuc == 0{
