@@ -8,6 +8,7 @@ use clap::Parser;
 use stats::compute_stats;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs::File;
 use std::path::PathBuf;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Stdin, Write, BufReader};
@@ -52,7 +53,6 @@ pub mod constants {
 use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF, K, KT};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
-
 //TODO QUERY
     //TODO INTERFACE FILE: FILENAME TO COLOR
     //TODO INTERFACE FILE: COLOR TO SIMPLITIG SIZE
@@ -84,9 +84,9 @@ fn main() {
                 writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
             }
             (0..NB_FILES).into_par_iter().for_each(|file_number|{
-                let kmer_map_mutex = Arc::clone(&kmer_map_mutex);
+                let mut kmer_map_mutex = Arc::clone(&kmer_map_mutex);
                 println!("{}", filenames.get(file_number).unwrap());
-                read_fasta(&filenames.get(file_number).unwrap(), &kmer_map_mutex, file_number, &nb_elem);
+                read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, /*&nb_elem*/);
             });
             let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
             println!("NB KMER = {}", kmer_map.len());
@@ -123,11 +123,12 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, COLORPAIR>>
         let seqrec = record.expect("Error reading record");
         let norm_seq = seqrec.normalize(false);
         let norm_rc = norm_seq.reverse_complement();
-        let canon_kmers = norm_seq.canonical_kmers(31, &norm_rc);
+        let canon_kmers = norm_seq.canonical_kmers(K as u8, &norm_rc);
         canon_kmers.for_each(|kmer|{
             //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
-            counter += 1;
+            
             let curr_kmer: RawKmer<K, KT> = RawKmer::from_nucs(kmer.1);
+            counter += 1;
             let mut kmer_map = kmer_map_mutex.lock().unwrap();
             //let file_nb = *file_number.read();
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
@@ -137,18 +138,19 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, COLORPAIR>>
                 let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                 bv.set(file_number, true);
                 counter_insert += 1;
-                (bv, Cell::new(false))
+                (bv, Arc::new(AtomicBool::new(false)))
             });
-            if kmer_map.len() >= (80/100)*nb_elem{
-                kmer_map.reserve((30/100)*nb_elem);
-            }
-            drop(kmer_map);
+            //TODO FIND A WAY TO RESIZE WITH DASHMAP
+            /*if kmer_map.capacity() <= (20/100)*nb_elem{
+                kmer_map.try_reserve((30/100)*nb_elem);
+            }*/
         });
     }
     println!("I have inserted {} k-mers", counter_insert);
     println!("I have seen {} already inserted k-mers", counter_modify);
     println!("I have seen {} k-mers", counter);
 }
+
 
 /*
 CONSTRUCTS SIMPLITIGS FROM K-MERS GATHERED IN "READ_FASTA".
@@ -199,7 +201,6 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<KT, COLORPAIR>, output_dir
     }
     color_simplitig_size
 }
-
 /*
 FORWARD EXTENSION FOR SIMPLITIG CREATION.
 CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
@@ -211,9 +212,31 @@ fn extend_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &HashMap<KT, COLORPAIR>
             let succ_pair = kmer_map.get(&succs.canonical().to_int()).unwrap();
             if succ_pair.0.eq(color) & !succ_pair.1.get() {
                 simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                succ_pair.1.set(true);
+                curr_cell.1.store(true, Ordering::Relaxed);
                 return true;
             }
+            drop(curr_cell);
+        }
+    }
+    false
+}
+
+/*
+BACKWARD EXTENSION FOR SIMPLITIG CREATION.
+CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
+INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
+*/
+fn extend_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &HashMap<KT, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
+    for preds in curr_kmer.predecessors(){
+        //backward = false;
+        if kmer_map.contains_key(&preds.canonical().to_int()){
+            let pred_pair = kmer_map.get(&preds.canonical().to_int()).unwrap();
+            if pred_pair.0.eq(color) & !pred_pair.1.get() {
+                simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
+                pred_pair.1.set(true);
+                return true;
+            }
+            drop(pred_pair);
         }
     }
     false
@@ -315,25 +338,6 @@ fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &m
 }
 
 
-/*
-BACKWARD EXTENSION FOR SIMPLITIG CREATION.
-CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
-INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
-*/
-fn extend_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &HashMap<KT, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
-    for preds in curr_kmer.predecessors(){
-        //backward = false;
-        if kmer_map.contains_key(&preds.canonical().to_int()){
-            let pred_pair = kmer_map.get(&preds.canonical().to_int()).unwrap();
-            if pred_pair.0.eq(color) & !pred_pair.1.get() {
-                simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
-                pred_pair.1.set(true);
-                return true;
-            }
-        }
-    }
-    false
-}
 
 fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, color_cursor_pos: IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, output_dir: &String){
     let mut file = File::create(output_dir.clone()+"multicolor_bucket_size.txt").expect("Unable to create interface file");
