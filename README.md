@@ -9,3 +9,8 @@ I=../../fof_6_salmonellas.txt K=31 cargo r -r -- decompress --omnicolor-file omn
 #DECOMPRESS WHOLE ARCHIVE
 I=../../fof_6_salmonellas.txt K=31 cargo r -r -- decompress --omnicolor-file omnicolor.kloe --multicolor-file multicolor.kloe-t 12
 ```
+
+## TODO
+- FIX K > 31
+- DELETE UTILITY FILES AFTER DECOMPRESSION?
+- STORE ABUNDANCES
