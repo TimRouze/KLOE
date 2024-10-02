@@ -49,9 +49,7 @@ struct Args {
 pub mod constants {
     include!("constants.rs");
 }
-use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF};
-const K: usize = 31;
-pub type KT = u64;
+use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF, K, KT};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 
@@ -68,7 +66,7 @@ fn main() {
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let file = File::open(INPUT_FOF).unwrap();
     let reader = io::BufReader::new(file);
-    let kmer_map_mutex: Arc<Mutex<HashMap<u64, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
+    let kmer_map_mutex: Arc<Mutex<HashMap<KT, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     let wanted_path = args.wanted_files;
     if let Some(do_decompress) = args.decompress{
@@ -115,7 +113,7 @@ fn main() {
 READS FASTA FILES.
 CREATES K-MER -> COLOR MAP.
 */
-fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
+fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
     let mut counter = 0;
     let mut counter_insert = 0;
@@ -129,7 +127,7 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<u64, COLORPAIR>
         canon_kmers.for_each(|kmer|{
             //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
             counter += 1;
-            let curr_kmer: RawKmer<K, u64> = RawKmer::from_nucs(kmer.1);
+            let curr_kmer: RawKmer<K, KT> = RawKmer::from_nucs(kmer.1);
             let mut kmer_map = kmer_map_mutex.lock().unwrap();
             //let file_nb = *file_number.read();
             kmer_map.entry(curr_kmer.to_int()).and_modify(|pair|{
@@ -159,7 +157,7 @@ OMNICOLORED (SEEN IN EVERY INPUT FILE) SIMPLITIGS ARE WRITTEN IN THE SAME FILE (
 MULTICOLORED SIMPLITIGS ARE WRITTEN IN ANOTHER FILE (multicolor.fa.zstd).
 SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
 */
-fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_dir: &String) -> HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>{
+fn compute_colored_simplitigs(kmer_map:  &mut HashMap<KT, COLORPAIR>, output_dir: &String) -> HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>{
     println!("I will reconstruct simplitigs from {} kmers", kmer_map.len());
     let mut multi_f = File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file");
     //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("Unable to create file"), 0).unwrap();
@@ -206,7 +204,7 @@ fn compute_colored_simplitigs(kmer_map:  &mut HashMap<u64, COLORPAIR>, output_di
 FORWARD EXTENSION FOR SIMPLITIG CREATION.
 CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 */
-fn extend_forward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
+fn extend_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &HashMap<KT, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
     for succs in curr_kmer.successors(){
         //forward = false;
         if kmer_map.contains_key(&succs.canonical().to_int()){
@@ -322,7 +320,7 @@ BACKWARD EXTENSION FOR SIMPLITIG CREATION.
 CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
 */
-fn extend_backward(curr_kmer: &RawKmer<K, u64>, kmer_map:  &HashMap<u64, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
+fn extend_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &HashMap<KT, COLORPAIR>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>) -> bool{
     for preds in curr_kmer.predecessors(){
         //backward = false;
         if kmer_map.contains_key(&preds.canonical().to_int()){

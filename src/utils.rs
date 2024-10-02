@@ -8,9 +8,7 @@ use std::cell::Cell;
 pub mod constants {
     include!("constants.rs");
 }
-use constants::ARRAY_SIZE;
-const K: usize = 31;
-pub type KT = u64;
+use constants::{ARRAY_SIZE, K, KT};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 
@@ -59,9 +57,9 @@ pub fn vec2str(seq: &Vec<u8>, size: &usize) -> String{
     res
 }
 
-pub fn num2str(mut k_mer: u64) -> String{
+pub fn num2str(mut k_mer: KT) -> String{
     let mut res = String::from("");
-    let mut nuc: u64;
+    let mut nuc: KT;
     for _i in 0..K{
         nuc = k_mer%4;
         if nuc == 0{
