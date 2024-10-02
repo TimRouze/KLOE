@@ -28,7 +28,9 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     let reader = BufReader::new(input_fof);
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     for filename in filenames.iter(){
-        let path = out_dir.join(String::from("Dump_")+ Path::new(filename).file_name().unwrap().to_str().unwrap());
+        let mut stem_filename = Path::new(filename).file_stem().unwrap();
+        let path = out_dir.join(String::from("Dump_")+ stem_filename.to_str().unwrap());
+        println!("{}", path.to_str().unwrap());
         if path.is_file(){
             std::fs::remove_file(path).expect("Unable to remove file");
         }
@@ -211,7 +213,7 @@ fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(String, Vec<&str>
 }
 
 fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
-    let path = out_dir.join(String::from("Dump_")+ Path::new(filename).file_name().unwrap().to_str().unwrap());
+    let path = out_dir.join(String::from("Dump_")+ Path::new(filename).file_stem().unwrap().to_str().unwrap());
     /*else{
         let mut file = File::options().write(true).read(true).create_new(true).open(path);
     }*/
