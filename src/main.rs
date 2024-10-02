@@ -86,7 +86,7 @@ fn main() {
             (0..NB_FILES).into_par_iter().for_each(|file_number|{
                 let mut kmer_map_mutex = Arc::clone(&kmer_map_mutex);
                 println!("{}", filenames.get(file_number).unwrap());
-                read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, /*&nb_elem*/);
+                read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
             });
             let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
             println!("NB KMER = {}", kmer_map.len());
@@ -138,7 +138,7 @@ fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, COLORPAIR>>
                 let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                 bv.set(file_number, true);
                 counter_insert += 1;
-                (bv, Arc::new(AtomicBool::new(false)))
+                (bv, Cell::new(false))
             });
             //TODO FIND A WAY TO RESIZE WITH DASHMAP
             /*if kmer_map.capacity() <= (20/100)*nb_elem{
@@ -212,10 +212,10 @@ fn extend_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &HashMap<KT, COLORPAIR>
             let succ_pair = kmer_map.get(&succs.canonical().to_int()).unwrap();
             if succ_pair.0.eq(color) & !succ_pair.1.get() {
                 simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                curr_cell.1.store(true, Ordering::Relaxed);
+                succ_pair.1.set(true);
                 return true;
             }
-            drop(curr_cell);
+            drop(succ_pair);
         }
     }
     false
