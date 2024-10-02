@@ -27,8 +27,9 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     }
     let reader = BufReader::new(input_fof);
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
+    //let filename_to_nb_kmer = HashMap::new();
     for filename in filenames.iter(){
-        let mut stem_filename = Path::new(filename).file_stem().unwrap();
+        let stem_filename = Path::new(filename).file_stem().unwrap();
         let path = out_dir.join(String::from("Dump_")+ stem_filename.to_str().unwrap());
         println!("{}", path.to_str().unwrap());
         if path.is_file(){
@@ -43,7 +44,6 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         let curr_file = File::open(omnicolor).unwrap();
         let mut curr_reader = BufReader::new(&curr_file);
         //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
-        let mut counter = 0;
         let mut cursor = 0;
         let metadata = curr_file.metadata().unwrap();
         let file_size: usize = metadata.len() as usize;
@@ -61,12 +61,10 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
             //println!("Reading {} Bytes", simplitig.len());
             curr_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
             let to_write = vec2str(&simplitig, &(size_simplitig as usize));
-            counter += to_write.len()-31+1;
             let content = to_write;
             //println!("CURR PATH: {}", filename);
             write_output(&content, &filename, &out_dir);
         }
-        println!("During decompression, I have seen {} k-mers", counter);
         //dump_file.finish().expect("Error writing decompressed data");
     }); 
 }
@@ -111,18 +109,14 @@ fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor
     vec2str(&buffer, &size)
 }
 
-fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool, sizes: &Vec<&str>){
+fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool){
     //println!("CURSOR BEFORE INCREMENT: {}", cursor);
-    //let mut already_read = 0;
     if !to_read{
-        println!("SKIPPING COLOR");
-        *cursor += end_pos.parse::<u64>().unwrap();
+        *cursor = end_pos.parse::<u64>().unwrap();
     }else{
-        /*for size in sizes.iter(){
-            already_read += size.parse::<u64>().unwrap().div_ceil(4);
-        }*/
         *cursor += end_pos.parse::<u64>().unwrap() - *cursor;
     }
+    //println!("cursor after increment: {}", cursor);
 }
 
 fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut Vec<String>) -> (Vec<String>, Vec<usize>){
@@ -143,7 +137,7 @@ fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut 
         }
     }
     //ERROR HANDLING
-    println!("NB file found: {}", filename_to_color.len());
+    println!("There are {} files in the compressed archive", filename_to_color.len());
     if filenames.len() != wanted_files_list.len(){
         println!("ERROR: I found a different number of files than the number asked.");
         println!("Maybe you asked files that where not in the initial input ?");
@@ -162,31 +156,33 @@ fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut 
 
 fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &PathBuf, filenames: &Vec<String>, positions_in_color: &Vec<usize>){
     let mut prev_cursor: u64 = 0;
-    let mut content: String = String::new();
     let color_to_sizes = organise_interface_data(color_to_pos);
     //OPEN MULTICOLOR FILE
     let multicolor_file = File::open(multicolor).unwrap();
     let mut multicolor_reader = BufReader::new(multicolor_file);
-
-    //let mut seen_color = false;
     let mut to_read = false;
-    let mut pos = 0;
     for (color, sizes, end_cursor_pos) in color_to_sizes.iter(){
         for i in positions_in_color.iter(){
             if color.chars().nth(*i).unwrap() == '1'{
                 to_read = true;
-                pos = *i as usize;
+                break;
             }
         }
         if to_read{
             for size in sizes.iter(){
-                content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
-                let pos = positions_in_color.iter().position(|&r| r == pos).unwrap();
-                write_output(&content, filenames.get(pos).unwrap(), out_dir);
+                let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
+                for elem in positions_in_color{
+                    if color.chars().nth(*elem).unwrap() == '1'{
+                        write_output(&content, filenames.get(positions_in_color.iter().position(|pos| pos == elem).unwrap()).unwrap(), out_dir);
+                    }
+                }
             }
         }
-        //println!("Color is: {}", color);
-        increment_cursor(&mut prev_cursor, end_cursor_pos, to_read, sizes);
+        //println!("filename: {}", filenames.get(pos).unwrap());
+        //println!("NB KMER = {}", counter);
+        increment_cursor(&mut prev_cursor, end_cursor_pos, to_read);
+        //let mut input = String::new();
+        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
         to_read = false;
     }
 }
@@ -222,5 +218,5 @@ fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
     out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");
     out_file.write_all(&">\n".as_bytes()).unwrap();
     out_file.write_all(content.as_bytes()).unwrap();
-    out_file.write_all(&"\n".as_bytes()).unwrap();
+    out_file.write_all(&"\n".as_bytes()).unwrap();    
 }
