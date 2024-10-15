@@ -38,20 +38,20 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     }
     decompress_multicolor("multicolor_bucket_size.txt", "filename_to_color.txt", wanted_files_path, multicolor, &out_dir);
    
-    (0..filenames.len()).into_par_iter().for_each(|file_number|{
-        let filename = filenames.get(file_number).unwrap();
-        println!("{}", filename);
-        let curr_file = File::open(omnicolor).unwrap();
-        let mut curr_reader = BufReader::new(&curr_file);
+    //(0..filenames.len()).into_par_iter().for_each(|file_number|{
+        //let filename = filenames.get(file_number).unwrap();
+        //println!("{}", filename);
+        let omni_file = File::open(omnicolor).unwrap();
+        let mut omni_reader = BufReader::new(&omni_file);
         //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
         let mut cursor = 0;
-        let metadata = curr_file.metadata().unwrap();
+        let metadata = omni_file.metadata().unwrap();
         let file_size: usize = metadata.len() as usize;
-        //println!("FILE SIZE = {}", file_size);
+        println!("FILE SIZE = {}", file_size);
         while cursor < file_size{
             let mut size_buf = [0; 4];
             cursor += 4;
-            curr_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
+            omni_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
             let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
             let size_simplitig: u32 = u32::from_le_bytes(size_buf);
             //println!("READING CURSOR = {}", cursor);
@@ -59,14 +59,17 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
             //println!("SIZE: {}", size_simplitig);
             let mut simplitig = vec![0; size_to_read as usize];
             //println!("Reading {} Bytes", simplitig.len());
-            curr_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
+            if cursor > 900000{
+                println!("Cursor = {}", cursor);
+            }
+            omni_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
             let to_write = vec2str(&simplitig, &(size_simplitig as usize));
             let content = to_write;
             //println!("CURR PATH: {}", filename);
-            write_output(&content, &filename, &out_dir);
+            write_out_omni(&content, &filenames, &out_dir);
         }
         //dump_file.finish().expect("Error writing decompressed data");
-    }); 
+    //}); 
 }
 
 fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wanted_files_path: &str, multicolor: &str, out_dir: &PathBuf){
@@ -206,6 +209,12 @@ fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(String, Vec<&str>
         }
     }
     color_to_sizes
+}
+
+fn write_out_omni(content: &String, filenames: &Vec<String>, out_dir: &PathBuf){
+    for filename in filenames{
+        write_output(content, filename, out_dir);
+    }
 }
 
 fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
