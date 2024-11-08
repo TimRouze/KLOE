@@ -13,6 +13,7 @@ use std::fs::{remove_file, File};
 use std::path::PathBuf;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Stdin, Write, BufReader};
 use std::env;
+use std::time::Instant;
 use::rayon::prelude::*;
 use bitvec::prelude::*;
 use kmer::{Kmer, RawKmer};
@@ -53,11 +54,6 @@ pub mod constants {
 use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF, K, KT};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
-//TODO QUERY
-    //TODO INTERFACE FILE: FILENAME TO COLOR
-    //TODO INTERFACE FILE: COLOR TO SIMPLITIG SIZE
-    //TODO MAP COLOR -> SIMPLITIGS TOTAL SIZE
-//TODO SET COMPRESSION RATIO AS ARG
 fn main() {
     let args = Args::parse();
     let nb_elem = args.nb_elem;
@@ -83,16 +79,26 @@ fn main() {
             for i in 0..NB_FILES{
                 writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
             }
+            let now = Instant::now();
             (0..NB_FILES).into_par_iter().for_each(|file_number|{
                 let mut kmer_map_mutex = Arc::clone(&kmer_map_mutex);
                 println!("{}", filenames.get(file_number).unwrap());
                 read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
             });
+            let elapsed = now.elapsed();
+            println!("Filling map took: {:.2?} seconds.", elapsed);
             let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
             println!("NB KMER = {}", kmer_map.len());
             kmer_map.shrink_to_fit();
+
+            let now = Instant::now();
             let mut color_simplitig = compute_colored_simplitigs(&mut kmer_map, &output_dir);
-            sort_simplitigs(&mut color_simplitig, &output_dir)
+            let elapsed = now.elapsed();
+            println!("Construction of simplitigs took: {:.2?} seconds.", elapsed);
+            let now = Instant::now();
+            sort_simplitigs(&mut color_simplitig, &output_dir);
+            let elapsed = now.elapsed();
+            println!("Sorting Simplitigs took: {:.2?} seconds.", elapsed);
         }else if do_decompress == "stats"{
             let multi_file = args.multicolor_file;
             let omni_file = args.omnicolor_file;
