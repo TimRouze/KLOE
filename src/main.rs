@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+// WHILE NEEDLETAIL DOES NOT HANDLE ZST.
+extern crate needletail;
 
 mod utils;
 mod kmer;
