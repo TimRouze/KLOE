@@ -26,7 +26,10 @@ fn build_constants() -> miette::Result<()>  {
     if let Ok(lines_temp) = read_lines(&input){
         let mut nb_files = lines_temp.count();
         code.push(format!("pub const NB_FILES: usize = {nb_files};"));
-        if nb_files%8 == 0{
+        if nb_files == 1{
+            nb_files = 1;
+        }
+        else if nb_files%8 == 0{
             nb_files = ((nb_files-1)/8)+1;
         }else{
             nb_files = (nb_files/8)+1
