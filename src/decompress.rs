@@ -47,7 +47,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     if let Some(parent_path) = full_path.parent() {
         println!("a{}a", parent_path.display());
         if parent_path.to_str().unwrap() != ""{
-            color_size_path = String::from(parent_path.to_str().unwrap().clone())+"/multicolor_bucket_size.txt";
+            color_size_path = String::from(parent_path.to_str().unwrap().clone())+"/multicolor_bucket_size.txt.zst";
             filename_color_path = String::from(parent_path.to_str().unwrap().clone())+"/filename_to_color.txt";
         }
         println!("{}", color_size_path);
