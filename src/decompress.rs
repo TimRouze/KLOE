@@ -1,7 +1,9 @@
 use clap::error::Result;
+use std::os::unix::process::parent_id;
 use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
+use zstd::stream::read::Decoder;
 use::rayon::prelude::*;
 use crate::utils::vec2str;
 
@@ -28,6 +30,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     let reader = BufReader::new(input_fof);
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     //let filename_to_nb_kmer = HashMap::new();
+
     for filename in filenames.iter(){
         let stem_filename = Path::new(filename).file_stem().unwrap();
         let path = out_dir.join(String::from("Dump_")+ stem_filename.to_str().unwrap());
@@ -36,7 +39,21 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
             std::fs::remove_file(path).expect("Unable to remove file");
         }
     }
-    decompress_multicolor("multicolor_bucket_size.txt", "filename_to_color.txt", wanted_files_path, multicolor, &out_dir);
+    let full_path = Path::new(omnicolor);
+
+    let mut color_size_path = String::from("multicolor_bucket_size.txt.zst");
+    let mut filename_color_path = String::from("filename_to_color.txt");
+    println!("{}", full_path.display());
+    if let Some(parent_path) = full_path.parent() {
+        println!("a{}a", parent_path.display());
+        if parent_path.to_str().unwrap() != ""{
+            color_size_path = String::from(parent_path.to_str().unwrap().clone())+"/multicolor_bucket_size.txt";
+            filename_color_path = String::from(parent_path.to_str().unwrap().clone())+"/filename_to_color.txt";
+        }
+        println!("{}", color_size_path);
+        println!("{}", filename_color_path);
+    }
+    decompress_multicolor(&color_size_path, &filename_color_path, wanted_files_path, multicolor, &out_dir);
    
     //(0..filenames.len()).into_par_iter().for_each(|file_number|{
         //let filename = filenames.get(file_number).unwrap();
@@ -83,7 +100,9 @@ fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wante
     //Color is the array (e.g. 011001) The size is the size in bytes to be read for this specific bucket.
     let color_size_file = File::open(out_dir.clone().join(color_size_path)).unwrap();
     let color_size_reader = BufReader::new(color_size_file);
-    let color_to_pos: Vec<_> = color_size_reader.lines().collect::<Result<_, _>>().unwrap();
+    let mut color_size_decoder = Decoder::new(color_size_reader).unwrap();
+    let decoder_reader = BufReader::new(color_size_decoder);
+    let color_to_pos: Vec<_> = decoder_reader.lines().collect::<Result<Vec<String>, _>>().unwrap();
     let mut filenames = Vec::new();
     let mut positions_in_color = Vec::new();
     if wanted_files_path == ""{
