@@ -22,6 +22,7 @@ use kmer::{Kmer, RawKmer};
 use std::cell::Cell;
 use needletail::{parse_fastx_file, Sequence};
 use indexmap::IndexMap;
+use zstd::stream::write::Encoder;
 
 use crate::utils::{num2str, str2num, };
 
@@ -110,6 +111,16 @@ fn main() {
             }else{
                 println!("Error, multicolor and/or omnicolor file(s) are mandatory");
             }
+        }else if do_decompress == "test"{
+            let kmer_map_test_mutex: Arc<Mutex<HashMap<KT, u32>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
+            let now = Instant::now();
+            (0..NB_FILES).into_par_iter().for_each(|file_number|{
+                let mut kmer_map_mutex = Arc::clone(&kmer_map_test_mutex);
+                println!("{}", filenames.get(file_number).unwrap());
+                test_fill_map(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
+            });
+            let elapsed = now.elapsed();
+            println!("Filling map took: {:.2?} seconds.", elapsed);
         }
     }else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
@@ -117,15 +128,53 @@ fn main() {
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
     }
 }
+
+fn test_fill_map(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, u32>>>, file_number: usize, nb_elem: &usize){
+    let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
+    let mut counter : u64 = 0;
+    let mut counter_insert : u64 = 0;
+    let mut counter_modify : u64 = 0;
+    //let mut to_add = HashSet::new();
+    while let Some(record) = fa_reader.next(){
+        let seqrec = record.expect("Error reading record");
+        let norm_seq = seqrec.normalize(false);
+        let norm_rc = norm_seq.reverse_complement();
+        let canon_kmers = norm_seq.canonical_kmers(K as u8, &norm_rc);
+        canon_kmers.for_each(|kmer|{
+            //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
+            
+            let curr_kmer: RawKmer<K, KT> = RawKmer::from_nucs(kmer.1);
+            counter += 1;
+            let mut kmer_map = kmer_map_mutex.lock().unwrap();
+            //let file_nb = *file_number.read();
+            kmer_map.entry(curr_kmer.to_int()).and_modify(|cpt|{
+                counter_modify += 1;
+                *cpt = *cpt+1;
+            }).or_insert_with(|| {
+                counter_insert += 1;
+                let mut cpt : u32 = 0;
+                cpt
+            });
+            //TODO FIND A WAY TO RESIZE WITH DASHMAP
+            /*if kmer_map.capacity() <= (20/100)*nb_elem{
+                kmer_map.try_reserve((30/100)*nb_elem);
+            }*/
+        });
+    }
+    println!("I have inserted {} k-mers", counter_insert);
+    println!("I have seen {} already inserted k-mers", counter_modify);
+    println!("I have seen {} k-mers", counter);
+}
+
 /*
 READS FASTA FILES.
 CREATES K-MER -> COLOR MAP.
 */
 fn read_fasta(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, COLORPAIR>>>, file_number: usize, nb_elem: &usize){
     let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
-    let mut counter = 0;
-    let mut counter_insert = 0;
-    let mut counter_modify = 0;
+    let mut counter : u64 = 0;
+    let mut counter_insert : u64 = 0;
+    let mut counter_modify : u64 = 0;
     //let mut to_add = HashSet::new();
     while let Some(record) = fa_reader.next(){
         let seqrec = record.expect("Error reading record");
@@ -343,8 +392,9 @@ fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &m
 
 
 fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, color_cursor_pos: IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, output_dir: &String){
-    let mut file = File::create(output_dir.clone()+"multicolor_bucket_size.txt").expect("Unable to create interface file");
+    //let mut file = Encoder::new(File::create(output_dir.clone()+"multicolor_bucket_size.txt.zst").expect("Unable to create interface file"));
     let mut nb_seen = 0;
+    let mut color_file = Encoder::new(File::create(output_dir.clone()+"multicolor_bucket_size.txt.zst").expect("Unable to create file"), 12).unwrap();
     for (key, cursor_end) in color_cursor_pos{
         let mut color = String::new();
         for e in key.iter(){
@@ -362,10 +412,13 @@ fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8;
         }
         if nb_seen < NB_FILES{
             bucket_sizes.pop();
-            writeln!(file, "{},{}:{}", color, cursor_end, bucket_sizes).unwrap();
+            let buf : String = String::from(color + "," + &(cursor_end.to_string()) + ":" + &bucket_sizes + "\n");
+            color_file.write_all(buf.as_bytes());
+            //writeln!(file, "{},{}:{}", color, cursor_end, bucket_sizes).unwrap();
         }
         nb_seen = 0;
     }
+    color_file.finish();
 }
 
 fn write_simplitig(simplitig: &Vec<u8>, is_omni: &bool, multi_f: &mut File, omni_f: &mut File, color: &BitArray<[u8;ARRAY_SIZE]>, size_str : &usize){
