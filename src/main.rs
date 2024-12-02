@@ -44,6 +44,9 @@ struct Args {
     ///Output directory
     #[arg(short, long, default_value_t = String::from(""))]
     out_dir: String,
+    ///input directory for decompression
+    #[arg(short, long, default_value_t = String::from(""))]
+    input_dir: String,
     ///Number of expected k-mers
     #[arg(short = 'N', long, default_value_t = 1_000_000)]
     nb_elem: usize,
@@ -62,6 +65,7 @@ fn main() {
     let nb_elem = args.nb_elem;
     println!("FILENAME: {}", INPUT_FOF);
     let output_dir = args.out_dir;
+    let input_dir = args.input_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let file = File::open(INPUT_FOF).unwrap();
     let reader = io::BufReader::new(file);
