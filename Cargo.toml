@@ -26,6 +26,7 @@ crossbeam = "0.8.4"
 indexmap = "2.5.0"
 needletail = {git = "https://github.com/onecodex/needletail.git", rev = "a4c203ef9a3d311e6e9daa8b8a0b5ccaa18e4ff7"}
 dashmap = "6.1.0"
+minimizer-iter = "1.2.1"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }

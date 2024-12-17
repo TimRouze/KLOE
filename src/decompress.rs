@@ -1,10 +1,8 @@
 use clap::error::Result;
-use std::os::unix::process::parent_id;
 use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use zstd::stream::read::Decoder;
-use::rayon::prelude::*;
 use crate::utils::vec2str;
 
 /// DECOMPRESS
@@ -47,8 +45,8 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     if let Some(parent_path) = full_path.parent() {
         println!("a{}a", parent_path.display());
         if parent_path.to_str().unwrap() != ""{
-            color_size_path = String::from(parent_path.to_str().unwrap().clone())+"/multicolor_bucket_size.txt.zst";
-            filename_color_path = String::from(parent_path.to_str().unwrap().clone())+"/filename_to_color.txt";
+            color_size_path = String::from(parent_path.to_str().unwrap())+"/multicolor_bucket_size.txt.zst";
+            filename_color_path = String::from(parent_path.to_str().unwrap())+"/filename_to_color.txt";
         }
         println!("{}", color_size_path);
         println!("{}", filename_color_path);
@@ -100,7 +98,7 @@ fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wante
     //Color is the array (e.g. 011001) The size is the size in bytes to be read for this specific bucket.
     let color_size_file = File::open(out_dir.clone().join(color_size_path)).unwrap();
     let color_size_reader = BufReader::new(color_size_file);
-    let mut color_size_decoder = Decoder::new(color_size_reader).unwrap();
+    let color_size_decoder = Decoder::new(color_size_reader).unwrap();
     let decoder_reader = BufReader::new(color_size_decoder);
     let color_to_pos: Vec<_> = decoder_reader.lines().collect::<Result<Vec<String>, _>>().unwrap();
     let mut filenames = Vec::new();
