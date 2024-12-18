@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::fs::{remove_file, File};
 use std::ffi::OsStr;
 use std::path::{PathBuf, Path};
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Stdin, Write, BufReader};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Stdin, Write, BufReader, BufWriter};
 use std::env;
 use std::time::Instant;
 use::rayon::prelude::*;
@@ -117,8 +117,8 @@ fn main() {
             println!("COMPUTED NB KMER: {}", tot_nb_kmer);
             //println!("NB KMER = {}", filled_omni_kmer_map.len()+filled_multi_kmer_map.len());
             let now = Instant::now();
-            let mut color_simplitig = HashMap::new();
-            rayon::scope(|s| {
+            //let mut color_simplitig = HashMap::new();
+            /*rayon::scope(|s| {
                 s.spawn(|_| compute_omnicolored_simplitigs(&mut filled_omni_vec, &output_dir));
 
                 s.spawn(|_| {
@@ -126,9 +126,9 @@ fn main() {
                     //color_simplitig = Arc::try_unwrap(color_simplitig_mutex).unwrap().into_inner().unwrap();
                     color_simplitig = compute_multicolored_simplitigs(&mut filled_multi_vec, &output_dir);
                 });
-            });
-            //compute_omnicolored_simplitigs(&mut omni_kmer_map, &output_dir);
-            //let mut color_simplitig = compute_multicolored_simplitigs(&mut multi_kmer_map, &output_dir);
+            });*/
+            compute_omnicolored_simplitigs(&mut filled_omni_vec, &output_dir);
+            let mut color_simplitig = compute_multicolored_simplitigs(&mut filled_multi_vec, &output_dir);
             let elapsed = now.elapsed();
             println!("Construction of simplitigs took: {:.2?} seconds.", elapsed);
             let now = Instant::now();
@@ -234,8 +234,6 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
         std::process::exit(1);
     }
 
-    
-
     let kmer_counter_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_insert_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_modify_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
@@ -260,8 +258,9 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
                 for (minimizer, position) in min_iter{
 
                 }*/
-                let mini = find_min(curr_kmer.canonical());
-                let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+                //let mini = find_min(curr_kmer.canonical());
+                //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+                let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
                 counter += 1;
                 let mut omni_kmer_map_lock = omni_kmer_map.get(pos).unwrap().lock().unwrap();
                 if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
@@ -367,7 +366,7 @@ fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool
 
     let omni_simpli = Instant::now();
     //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("Unable to create file"), 0).unwrap();
-    let mut omni_f = File::create(output_dir.clone()+"omnicolor.kloe").expect("unable to create file");
+    let mut omni_f = BufWriter::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("unable to create file"));
     for i in 0..SHARD_AMOUNT{
         let kmer_map = omni_kmer_map.get(i).unwrap();
         let mut kmer_iterator = kmer_map.iter();
@@ -401,8 +400,9 @@ CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 */
 fn extend_omnicolor_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<KT, Cell<bool>>>, simplitig: &mut String) -> bool{
     for succs in curr_kmer.successors(){
-        let mini = find_min(succs.canonical());
-        let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+        //let mini = find_min(succs.canonical());
+        //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+        let pos = succs.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
         let kmer_map = kmer_map.get(pos).unwrap();
         if kmer_map.contains_key(&succs.canonical().to_int()){
             if !kmer_map.get(&succs.to_int()).unwrap().get() {
@@ -422,8 +422,9 @@ INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
 */
 fn extend_omnicolor_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<KT, Cell<bool>>>, simplitig: &mut String) -> bool{
     for preds in curr_kmer.predecessors(){
-        let mini = find_min(preds.canonical());
-        let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+        //let mini = find_min(preds.canonical());
+        //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+        let pos = preds.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
         let kmer_map = kmer_map.get(pos).unwrap();
         if kmer_map.contains_key(&preds.canonical().to_int()){
             if !kmer_map.get(&preds.to_int()).unwrap().get() {
@@ -448,7 +449,7 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
     println!("I will reconstruct simplitigs from {} kmers", multi_kmer_map.len());
 
     let multi_simpli = Instant::now();
-    let mut multi_f = File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file");
+    let mut multi_f = BufWriter::new(File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file"));
     //let mut color_simplitig_size: Arc<Mutex<HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut color_simplitig_size: HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)> = HashMap::new();
     for i in 0..SHARD_AMOUNT{
@@ -504,8 +505,9 @@ fn extend_forward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, CO
                 return true;
             }
         }else{
-            let mini = find_min(succs.canonical());
-            let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+            //let mini = find_min(succs.canonical());
+            //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+            let pos = succs.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
             let kmer_map = vec_kmer_map.get(pos).unwrap();
             if let Some(succ_pair) = kmer_map.get(&succs.to_int()){
                 if succ_pair.0.eq(color) & !succ_pair.1.get() {
@@ -533,8 +535,9 @@ fn extend_backward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, C
                 return true;
             }
         }else{
-            let mini = find_min(preds.canonical());
-            let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+            //let mini = find_min(preds.canonical());
+            //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+            let pos = preds.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
             let kmer_map = vec_kmer_map.get(pos).unwrap();
             if let Some(pred_pair) = kmer_map.get(&preds.to_int()){
                 if pred_pair.0.eq(color) & !pred_pair.1.get() {
@@ -570,7 +573,7 @@ fn compute_cursor_start_pos(color_simplitig: &HashMap<bitvec::prelude::BitArray<
 fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, output_dir: &String ) {
     let path = output_dir.clone()+"multicolor.kloe";
     //let compressed_path = output_dir.clone()+"multicolor.zstd";
-    let mut out_mult_file = File::options().write(true).read(true).create(true).open(path.clone()).expect("Unable to create file");
+    let mut out_mult_file = BufWriter::new(File::options().write(true).read(true).create(true).open(path.clone()).expect("Unable to create file"));
     //let mut color_set = HashSet::new();
     let mut color_cursor_pos = compute_cursor_start_pos(color_simplitig);
     let temp_multicolor_file = File::open(output_dir.clone()+"temp_multicolor.fa").unwrap();
@@ -617,7 +620,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     Ok(())
 } */
 
-fn write_sorted(out_mult_file: &mut File, content: Vec<u8>, color_cursor_pos: &mut IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &Vec<u8>) -> io::Result<()> {
+fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cursor_pos: &mut IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &Vec<u8>) -> io::Result<()> {
     //let mut encoder = Compressor::new(12).unwrap();
     //let compressed = encoder.compress(content.as_bytes()).unwrap();
     let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
@@ -674,7 +677,7 @@ fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8;
 
 
 
-fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut File, color: &BitArray<[u8;ARRAY_SIZE]>, size_str : &usize){
+fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<File>, color: &BitArray<[u8;ARRAY_SIZE]>, size_str : &usize){
     let size:u32 = *size_str as u32;
     let mut id = Vec::new();
     let mut cpt = 0;

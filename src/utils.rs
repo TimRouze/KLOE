@@ -165,32 +165,3 @@ pub fn find_min(kmer: RawKmer<K, KT>) -> u64{
     }
     min
 }
-
-pub fn find_minimizer(seq: u64, m: &u8) -> u64{
-	let mut tmp: u64 = seq;
-	let mut mini: u64 = 0;
-	let mut hash_mini: u64;
-    let mut mmer: u64;
-    let mut offsetUpdateMinimizer: u64 = 1 << (2*m);
-    let mut hasher = DefaultHasher::new();
-	mmer = seq & offsetUpdateMinimizer;
-    let max: u64 = (K-m.to_usize().unwrap()).to_u64().unwrap();
-	mmer.hash(&mut hasher);
-    hash_mini = hasher.finish();
-	// For every m-mer in kmer
-	for i in 1..max{
-
-        let mut hasher_2 = DefaultHasher::new();
-		tmp >>= 2;
-		mmer = seq & offsetUpdateMinimizer;
-        mmer.hash(&mut hasher_2);
-		let hash: u64 = hasher_2.finish();
-		// If current m-mer is smaller than current minimizer
-		// Replace previous by new minimizer
-		if hash_mini > hash{
-			mini = mmer;
-			hash_mini = hash;
-		}
-    }
-	mini
-}
