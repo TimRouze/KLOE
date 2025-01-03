@@ -1,7 +1,7 @@
 use clap::error::Result;
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write, BufWriter};
 use zstd::stream::read::Decoder;
 use crate::utils::vec2str;
 
@@ -193,6 +193,16 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                 let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
                 for elem in positions_in_color{
                     if color.chars().nth(*elem).unwrap() == '1'{
+                        println!("{}", color);
+                        if *elem == 1{
+                            println!("POS IN COLOR: {}", elem);
+                            println!("IS AT POS: {}", positions_in_color.iter().position(|pos| pos == elem).unwrap());
+                            let mut input = String::new();
+                            std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                        }
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                    
                         write_output(&content, filenames.get(positions_in_color.iter().position(|pos| pos == elem).unwrap()).unwrap(), out_dir);
                     }
                 }
@@ -239,7 +249,7 @@ fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
     /*else{
         let mut file = File::options().write(true).read(true).create_new(true).open(path);
     }*/
-    let mut out_file = File::options().write(true).read(true).create(true).open(&path).expect("Unable to create file");
+    let mut out_file = BufWriter::new(File::options().write(true).read(true).create(true).open(&path).expect("Unable to create file"));
     //println!("OUTFILENAME: {}", path.display());
     out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");
     out_file.write_all(&">\n".as_bytes()).unwrap();

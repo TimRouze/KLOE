@@ -362,7 +362,11 @@ OMNICOLORED (SEEN IN EVERY INPUT FILE) SIMPLITIGS ARE WRITTEN IN THE SAME FILE (
 SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
 */
 fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool>>>, output_dir: &String){
-    println!("I will reconstruct omnicolored simplitigs from {} kmers", omni_kmer_map.len());
+    let mut nb_kmer = 0;
+    for i in 0..SHARD_AMOUNT{
+        nb_kmer += omni_kmer_map.get(i).unwrap().len();
+    }
+    println!("I will reconstruct omnicolored simplitigs from {} kmers", nb_kmer);
 
     let omni_simpli = Instant::now();
     //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("Unable to create file"), 0).unwrap();
@@ -446,7 +450,11 @@ MULTICOLORED SIMPLITIGS ARE WRITTEN IN ANOTHER FILE (multicolor.fa.zstd).
 SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
 */
 fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPAIR>>, output_dir: &String) -> HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>{//Arc<Mutex<HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>>>{
-    println!("I will reconstruct simplitigs from {} kmers", multi_kmer_map.len());
+    let mut nb_kmer = 0;
+    for i in 0..SHARD_AMOUNT{
+        nb_kmer += multi_kmer_map.get(i).unwrap().len();
+    }
+    println!("I will reconstruct omnicolored simplitigs from {} kmers", nb_kmer);
 
     let multi_simpli = Instant::now();
     let mut multi_f = BufWriter::new(File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file"));
