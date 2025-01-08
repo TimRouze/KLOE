@@ -5,7 +5,6 @@ fn build_constants() -> miette::Result<()>  {
     let out_dir: std::path::PathBuf = String::from("src/")
     .into();
     let mut code = Vec::new();
-    
     println!("cargo:rerun-if-env-changed=K");
     let k: usize = std::env::var("K")
         .unwrap_or_else(|_| "31".into())
@@ -35,7 +34,6 @@ fn build_constants() -> miette::Result<()>  {
             nb_files = (nb_files/8)+1
         }
         code.push(format!("pub const ARRAY_SIZE: usize = {nb_files};"));
-        code.push(format!("pub const INPUT_FOF: &str = \"{input}\";"));
     }
 
     std::fs::write(out_dir.join("constants.rs"), code.join("\n"))

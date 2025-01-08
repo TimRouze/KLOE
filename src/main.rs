@@ -53,83 +53,96 @@ struct Args {
     ///List of files to decompress
     #[arg(short = 'Q', long, default_value_t = String::from(""))]
     wanted_files: String,
+    ///Input file of file
+    #[arg(short, long)]
+    file_of_file: Option<String>,
 }
 pub mod constants {
     include!("constants.rs");
 }
-use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF, K, KT};
+use constants::{ARRAY_SIZE, NB_FILES, K, KT};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 fn main() {
     let args = Args::parse();
     let nb_elem = args.nb_elem;
-    println!("FILENAME: {}", INPUT_FOF);
+    
     let output_dir = args.out_dir;
     let input_dir = args.input_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
-    let file = File::open(INPUT_FOF).unwrap();
-    let reader = io::BufReader::new(file);
+     
     let kmer_map_mutex: Arc<Mutex<HashMap<KT, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
-    let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
+    
     let wanted_path = args.wanted_files;
     if let Some(do_decompress) = args.decompress{
-        if do_decompress == "decompress"{
-            let multi_file = args.multicolor_file;
-            let omni_file = args.omnicolor_file;
-            if multi_file != "" && omni_file != ""{
-                decompress::decompress(&omni_file, &multi_file, INPUT_FOF, PathBuf::from(output_dir), &wanted_path);
-            }else{
-                println!("Error, multicolor and/or omnicolor file(s) are mandatory");
-            }
-        }else if do_decompress == "compress"{
-            let mut filename_color = File::create("filename_to_color.txt").unwrap();
-            for i in 0..NB_FILES{
-                writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
-            }
-            let now = Instant::now();
-            (0..NB_FILES).into_par_iter().for_each(|file_number|{
-                let mut kmer_map_mutex = Arc::clone(&kmer_map_mutex);
-                println!("{}", filenames.get(file_number).unwrap());
-                read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
-            });
-            let elapsed = now.elapsed();
-            println!("Filling map took: {:.2?} seconds.", elapsed);
-            let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
-            println!("NB KMER = {}", kmer_map.len());
-            kmer_map.shrink_to_fit();
+        if let Some(fof) = args.file_of_file{
+            let file = File::open(fof.clone()).unwrap();
+            let reader = io::BufReader::new(file);
+            let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
+            println!("FILENAME: {}", fof);
+            if do_decompress == "decompress"{
+                let multi_file = args.multicolor_file;
+                let omni_file = args.omnicolor_file;
+                if multi_file != "" && omni_file != ""{
+                    decompress::decompress(&omni_file, &multi_file, &fof, PathBuf::from(output_dir), &wanted_path);
+                }else{
+                    println!("Error, multicolor and/or omnicolor file(s) are mandatory");
+                }
+            }else if do_decompress == "compress"{
+                let mut filename_color = File::create("filename_to_color.txt").unwrap();
+                for i in 0..NB_FILES{
+                    writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
+                }
+                let now = Instant::now();
+                (0..NB_FILES).into_par_iter().for_each(|file_number|{
+                    let mut kmer_map_mutex = Arc::clone(&kmer_map_mutex);
+                    println!("{}", filenames.get(file_number).unwrap());
+                    read_fasta(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
+                });
+                let elapsed = now.elapsed();
+                println!("Filling map took: {:.2?} seconds.", elapsed);
+                let mut kmer_map = Arc::try_unwrap(kmer_map_mutex).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
+                println!("NB KMER = {}", kmer_map.len());
+                kmer_map.shrink_to_fit();
 
-            let now = Instant::now();
-            let mut color_simplitig = compute_colored_simplitigs(&mut kmer_map, &output_dir);
-            let elapsed = now.elapsed();
-            println!("Construction of simplitigs took: {:.2?} seconds.", elapsed);
-            let now = Instant::now();
-            sort_simplitigs(&mut color_simplitig, &output_dir);
-            let elapsed = now.elapsed();
-            println!("Sorting Simplitigs took: {:.2?} seconds.", elapsed);
-        }else if do_decompress == "stats"{
-            let multi_file = args.multicolor_file;
-            let omni_file = args.omnicolor_file;
-            let k = K;
-            if multi_file != "" && omni_file != ""{
-                compute_stats(&omni_file, &multi_file, &output_dir, &k);
-            }else{
-                println!("Error, multicolor and/or omnicolor file(s) are mandatory");
+                let now = Instant::now();
+                let mut color_simplitig = compute_colored_simplitigs(&mut kmer_map, &output_dir);
+                let elapsed = now.elapsed();
+                println!("Construction of simplitigs took: {:.2?} seconds.", elapsed);
+                let now = Instant::now();
+                sort_simplitigs(&mut color_simplitig, &output_dir);
+                let elapsed = now.elapsed();
+                println!("Sorting Simplitigs took: {:.2?} seconds.", elapsed);
+            }else if do_decompress == "stats"{
+                let multi_file = args.multicolor_file;
+                let omni_file = args.omnicolor_file;
+                let k = K;
+                if multi_file != "" && omni_file != ""{
+                    compute_stats(&omni_file, &multi_file, &output_dir, &k);
+                }else{
+                    println!("Error, multicolor and/or omnicolor file(s) are mandatory");
+                }
+            }else if do_decompress == "test"{
+                let kmer_map_test_mutex: Arc<Mutex<HashMap<KT, u32>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
+                let now = Instant::now();
+                (0..NB_FILES).into_par_iter().for_each(|file_number|{
+                    let mut kmer_map_mutex = Arc::clone(&kmer_map_test_mutex);
+                    println!("{}", filenames.get(file_number).unwrap());
+                    test_fill_map(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
+                });
+                let elapsed = now.elapsed();
+                println!("Filling map took: {:.2?} seconds.", elapsed);
             }
-        }else if do_decompress == "test"{
-            let kmer_map_test_mutex: Arc<Mutex<HashMap<KT, u32>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
-            let now = Instant::now();
-            (0..NB_FILES).into_par_iter().for_each(|file_number|{
-                let mut kmer_map_mutex = Arc::clone(&kmer_map_test_mutex);
-                println!("{}", filenames.get(file_number).unwrap());
-                test_fill_map(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
-            });
-            let elapsed = now.elapsed();
-            println!("Filling map took: {:.2?} seconds.", elapsed);
+        }else {
+            println!("Please provide an input file of file (-f option)");
+            println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
+            println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
+    
         }
     }else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
-        println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -o out_dir/ -t 12");
-        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
+        println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
+        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
     }
 }
 
