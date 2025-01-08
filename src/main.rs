@@ -80,6 +80,8 @@ fn main() {
             let reader = io::BufReader::new(file);
             let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
             println!("FILENAME: {}", fof);
+            println!("NB_FILES: {}", NB_FILES);
+            println!("ARRAY_SIZE: {}", ARRAY_SIZE);
             if do_decompress == "decompress"{
                 let multi_file = args.multicolor_file;
                 let omni_file = args.omnicolor_file;
