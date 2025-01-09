@@ -5,6 +5,7 @@ fn build_constants() -> miette::Result<()>  {
     let out_dir: std::path::PathBuf = String::from("src/")
     .into();
     let mut code = Vec::new();
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=K");
     let k: usize = std::env::var("K")
         .unwrap_or_else(|_| "31".into())
@@ -19,7 +20,6 @@ fn build_constants() -> miette::Result<()>  {
     let kt = select_type(kmer_bits);
     code.push(format!("pub type KT = {kt};"));
 
-    println!("cargo:rerun-if-env-changed=I");
     let input = std::env::var("I")
         .unwrap();
     println!("\nFOF READ IN BUILD: {}\n", input);
