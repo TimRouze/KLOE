@@ -60,7 +60,7 @@ struct Args {
 pub mod constants {
     include!("constants.rs");
 }
-use constants::{ARRAY_SIZE, NB_FILES, K, KT};
+use constants::{ARRAY_SIZE, NB_FILES, INPUT_FILE, K, KT};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 fn main() {
@@ -79,7 +79,8 @@ fn main() {
             let file = File::open(fof.clone()).unwrap();
             let reader = io::BufReader::new(file);
             let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
-            println!("FILENAME: {}", fof);
+            println!("GIVEN FILENAME: {}", fof);
+            println!("CONST FILENAME: {}", fof);
             println!("NB_FILES: {}", NB_FILES);
             println!("ARRAY_SIZE: {}", ARRAY_SIZE);
             if do_decompress == "decompress"{
