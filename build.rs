@@ -35,7 +35,7 @@ fn build_constants() -> miette::Result<()>  {
             nb_files = (nb_files/8)+1
         }
         code.push(format!("pub const ARRAY_SIZE: usize = {nb_files};"));
-        code.push(format!("pub const INPUT_FILE: String = {input};"));
+        code.push(format!("pub const INPUT_FOF: &str = \"{input}\";"));
     }
 
     std::fs::write(out_dir.join("constants.rs"), code.join("\n"))
