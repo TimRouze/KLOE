@@ -22,6 +22,7 @@ fn build_constants() -> miette::Result<()>  {
     println!("cargo:rerun-if-env-changed=I");
     let input = std::env::var("I")
         .unwrap();
+    println!("\nFOF READ IN BUILD: {}\n", input);
     if let Ok(lines_temp) = read_lines(&input){
         let mut nb_files = lines_temp.count();
         code.push(format!("pub const NB_FILES: usize = {nb_files};"));
