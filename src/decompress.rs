@@ -1,7 +1,7 @@
 use clap::error::Result;
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, Write, BufWriter};
+use std::io::{BufRead, BufReader, Read, Seek, Write, BufWriter, Stdin};
 use zstd::stream::read::Decoder;
 use crate::utils::vec2str;
 
@@ -74,11 +74,22 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
             //println!("SIZE: {}", size_simplitig);
             let mut simplitig = vec![0; size_to_read as usize];
             //println!("Reading {} Bytes", simplitig.len());
-            if cursor > 900000{
+            /*if cursor > 900000{
+                println!("SIZE: {}", size_simplitig);
+                println!("Reading {} Bytes", simplitig.len());
+                let to_write = vec2str(&simplitig, &(size_simplitig as usize));
+                //println!("simplitig = {}", to_write);
                 println!("Cursor = {}", cursor);
-            }
+                println!("SIZE READ: {}", size_to_read);
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
+            }*/
             omni_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
             let to_write = vec2str(&simplitig, &(size_simplitig as usize));
+            //println!("SIMPLITIG: {}", to_write);
+            //let mut input = String::new();
+            //std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
+            //println!("simplitig = {}", to_write);
             let content = to_write;
             //println!("CURR PATH: {}", filename);
             write_out_omni(&content, &filenames, &out_dir);
@@ -177,6 +188,7 @@ fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut 
 fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &PathBuf, filenames: &Vec<String>, positions_in_color: &Vec<usize>){
     let mut prev_cursor: u64 = 0;
     let color_to_sizes = organise_interface_data(color_to_pos);
+    println!("NB FILES {}", filenames.len());
     //OPEN MULTICOLOR FILE
     let multicolor_file = File::open(multicolor).unwrap();
     let mut multicolor_reader = BufReader::new(multicolor_file);
@@ -192,19 +204,23 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
             for size in sizes.iter(){
                 let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
                 for elem in positions_in_color{
+                    /*println!("ELEM: {}", elem);
+                    if *elem == 0{
+                        println!("COLOR: {}", color)
+                    }*/
                     if color.chars().nth(*elem).unwrap() == '1'{
-                        println!("{}", color);
-                        if *elem == 1{
+                        //println!("{}", color);
+                        /*if *elem == 0{
                             println!("POS IN COLOR: {}", elem);
                             println!("IS AT POS: {}", positions_in_color.iter().position(|pos| pos == elem).unwrap());
                             let mut input = String::new();
                             std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                        }
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                    
+                        }*/
                         write_output(&content, filenames.get(positions_in_color.iter().position(|pos| pos == elem).unwrap()).unwrap(), out_dir);
                     }
+                    //let mut input = String::new();
+                    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                    
                 }
             }
         }

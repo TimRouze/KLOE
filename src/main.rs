@@ -237,12 +237,14 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
     let kmer_counter_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_insert_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_modify_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-
+    let kmer_counter_omni_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    println!("FILE NUMBER: {}", file_number);
     // Process each record in parallel
     records.par_iter().for_each(|record| {
         let mut counter : u64 = 0;
         let mut counter_insert : u64 = 0;
         let mut counter_modify : u64 = 0;
+        let mut counter_omni: u64 = 0;
         let mut curr_kmer = RawKmer::<K, KT>::new();
 
         for (i, nuc) in record.seq.iter().filter_map(KT::from_nuc).enumerate() {
@@ -256,17 +258,25 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
                                 .width(23)
                                 .iter(canon);
                 for (minimizer, position) in min_iter{
-
+                
                 }*/
+                //let str_kmer: String = num2str(curr_kmer.canonical().to_int());
                 //let mini = find_min(curr_kmer.canonical());
                 //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
                 let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
                 counter += 1;
                 let mut omni_kmer_map_lock = omni_kmer_map.get(pos).unwrap().lock().unwrap();
-                if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
-                    elem.set(true);
-                }else if file_number == 1{
+                if file_number == 0{
                     omni_kmer_map_lock.insert(canon, Cell::new(false));
+                    counter_insert += 1;
+                    counter_omni += 1;
+                }else if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
+                    //println!("a{}a", elem.get());
+                    elem.set(true);
+                    //println!("b{}b", elem.get());
+                    //let mut input = String::new();
+                    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                    counter_omni += 1;
                 }else{
                     let mut multi_kmer_map_lock = multi_kmer_map.get(pos).unwrap().lock().unwrap();
                     multi_kmer_map_lock.entry(canon).and_modify(|pair|{
@@ -282,11 +292,15 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
                 drop(omni_kmer_map_lock);
             }
         }
+
         *kmer_counter_mutex.lock().unwrap() += counter;
         *kmer_counter_insert_mutex.lock().unwrap() += counter_insert;
         *kmer_counter_modify_mutex.lock().unwrap() += counter_modify;
+        *kmer_counter_omni_mutex.lock().unwrap() += counter_omni;
     });
-    check_omni(omni_kmer_map, multi_kmer_map, file_number);
+    if file_number != 0{
+        check_omni(omni_kmer_map, multi_kmer_map, file_number);
+    }
     //let mut to_add = HashSet::new();
     /*while let Some(record) = fa_reader.next(){
         let seqrec = record.expect("Error reading record");
@@ -326,32 +340,48 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
     println!("I have inserted {} k-mers", kmer_counter_insert_mutex.lock().unwrap());
     println!("I have seen {} already inserted k-mers", kmer_counter_modify_mutex.lock().unwrap());
     println!("I have seen {} k-mers", kmer_counter_mutex.lock().unwrap());
+    println!("I have seen {} omnicolored kmers", kmer_counter_omni_mutex.lock().unwrap());
+    println!("I should remove {} k-mers from the omnicolor", *kmer_counter_mutex.lock().unwrap()-*kmer_counter_omni_mutex.lock().unwrap());
     kmer_counter_insert_mutex
 }
 
 fn check_omni(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>>, file_number: usize){
-
+    let kmer_to_remove_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let kmer_counter_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     (0..SHARD_AMOUNT).into_par_iter().for_each(|i|{
+        let mut counter: u64 = 0;
+        let mut to_remove: u64 = 0;
         let mut omni_kmer_map_lock = omni_kmer_map.get(i).unwrap().lock().unwrap();
         let mut omni_iterator = omni_kmer_map_lock.iter();
         while let Some(entry) = omni_iterator.next(){
-            if !entry.1.get(){
+            let curr_k = num2str(*entry.0);
+            counter+=1;
+            if !(entry.1.get()){
+                to_remove += 1;
                 let mut multi_kmer_map_lock = multi_kmer_map.get(i).unwrap().lock().unwrap();
                 multi_kmer_map_lock.entry(*entry.0).and_modify(|pair|{
                     pair.0.set(file_number, false);
                 }).or_insert_with(|| {
                     let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-                    bv.reverse();
-                    bv.set(file_number, false);
+                    let mut i = 0;
+                    while i < file_number{
+                        bv.set(i, true);
+                        i += 1;
+                    }
                     (bv, Cell::new(false))
                 });
                 drop(multi_kmer_map_lock);
-            }else{
-                entry.1.set(false);
             }
         }
+        *kmer_counter_mutex.lock().unwrap() += counter;
+        *kmer_to_remove_mutex.lock().unwrap() += to_remove;
         omni_kmer_map_lock.retain(|_k,v| v.get());
+        for elem in omni_kmer_map_lock.iter(){
+            elem.1.set(false);
+        }
     });
+    println!("I have seen {} k-mers total", kmer_counter_mutex.lock().unwrap());
+    println!("I have seen {} k-mers to be removed from omnicolor", kmer_to_remove_mutex.lock().unwrap());
     
 }
 
@@ -365,12 +395,20 @@ fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool
     let mut nb_kmer = 0;
     for i in 0..SHARD_AMOUNT{
         nb_kmer += omni_kmer_map.get(i).unwrap().len();
+        let kmer_map = omni_kmer_map.get(i).unwrap();
+        let mut kmer_iterator = kmer_map.iter();
+        while let Some(entry) = kmer_iterator.next(){
+            if entry.1.get(){
+                entry.1.set(false);
+            }
+        }
     }
     println!("I will reconstruct omnicolored simplitigs from {} kmers", nb_kmer);
 
     let omni_simpli = Instant::now();
     //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("Unable to create file"), 0).unwrap();
     let mut omni_f = BufWriter::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("unable to create file"));
+    let mut cpt = 0;
     for i in 0..SHARD_AMOUNT{
         let kmer_map = omni_kmer_map.get(i).unwrap();
         let mut kmer_iterator = kmer_map.iter();
@@ -388,12 +426,24 @@ fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool
                     let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
                     backward = extend_omnicolor_backward(&curr_kmer, omni_kmer_map, &mut simplitig);
                 }
-                let simplitig_size = simplitig.len();
+                let simplitig_size:u32 = simplitig.len().to_u32().unwrap();
+                //println!("CURR KMER = {}", num2str(*entry.0));
+                /*println!("SIMPLITIG SIZE = {}", simplitig_size);
+                if usize::BITS == 64{
+                    println!("OUI");
+                }else {
+                    println!("NON");
+                }
+                //println!("SIMPLITIG = {}", &simplitig);
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).expect("error: unable to read user input"); */
+                cpt += simplitig.len() - K + 1;
                 omni_f.write_all(&simplitig_size.to_le_bytes()).expect("Unable to write simplitig size");  
                 omni_f.write_all(&str2num(&simplitig)).expect("Unable to write data");
             }
         }
-    }                
+    }             
+    println!("NB KMERS: {}", cpt);
     let fin_omni_simpli = omni_simpli.elapsed();
     println!("Construction of omnicolored simplitigs took: {:.2?} seconds.", fin_omni_simpli);
 }
@@ -406,9 +456,10 @@ fn extend_omnicolor_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<
     for succs in curr_kmer.successors(){
         //let mini = find_min(succs.canonical());
         //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-        let pos = succs.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
+        //let canon_succs = succs.clone().canonical();
+        let pos = succs.to_int().to_usize().unwrap()%SHARD_AMOUNT;
         let kmer_map = kmer_map.get(pos).unwrap();
-        if kmer_map.contains_key(&succs.canonical().to_int()){
+        if kmer_map.contains_key(&succs.to_int()){
             if !kmer_map.get(&succs.to_int()).unwrap().get() {
                 simplitig.push(*succs.to_nucs().last().unwrap() as char);
                 kmer_map.get(&succs.to_int()).unwrap().set(true);
@@ -428,9 +479,9 @@ fn extend_omnicolor_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap
     for preds in curr_kmer.predecessors(){
         //let mini = find_min(preds.canonical());
         //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-        let pos = preds.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
+        let pos = preds.to_int().to_usize().unwrap()%SHARD_AMOUNT;
         let kmer_map = kmer_map.get(pos).unwrap();
-        if kmer_map.contains_key(&preds.canonical().to_int()){
+        if kmer_map.contains_key(&preds.to_int()){
             if !kmer_map.get(&preds.to_int()).unwrap().get() {
                 simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
                 kmer_map.get(&preds.to_int()).unwrap().set(true);
@@ -454,7 +505,7 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
     for i in 0..SHARD_AMOUNT{
         nb_kmer += multi_kmer_map.get(i).unwrap().len();
     }
-    println!("I will reconstruct omnicolored simplitigs from {} kmers", nb_kmer);
+    println!("I will reconstruct multicolored simplitigs from {} kmers", nb_kmer);
 
     let multi_simpli = Instant::now();
     let mut multi_f = BufWriter::new(File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file"));
@@ -515,7 +566,7 @@ fn extend_forward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, CO
         }else{
             //let mini = find_min(succs.canonical());
             //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-            let pos = succs.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
+            let pos = succs.to_int().to_usize().unwrap()%SHARD_AMOUNT;
             let kmer_map = vec_kmer_map.get(pos).unwrap();
             if let Some(succ_pair) = kmer_map.get(&succs.to_int()){
                 if succ_pair.0.eq(color) & !succ_pair.1.get() {
@@ -545,7 +596,7 @@ fn extend_backward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, C
         }else{
             //let mini = find_min(preds.canonical());
             //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-            let pos = preds.canonical().to_int().to_usize().unwrap()%SHARD_AMOUNT;
+            let pos = preds.to_int().to_usize().unwrap()%SHARD_AMOUNT;
             let kmer_map = vec_kmer_map.get(pos).unwrap();
             if let Some(pred_pair) = kmer_map.get(&preds.to_int()){
                 if pred_pair.0.eq(color) & !pred_pair.1.get() {
@@ -590,7 +641,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
     let mut cursor: usize = 0;
     let metadata = temp_multicolor_file.metadata().unwrap();
     let file_size: usize = metadata.len() as usize;
-    //println!("FILE SIZE = {}", file_size);
+    println!("FILE SIZE = {}", file_size);
     while cursor < file_size{
         cursor+= COLOR_SIZE;
         let mut id = [0; ARRAY_SIZE];
@@ -632,13 +683,19 @@ fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cur
     //let mut encoder = Compressor::new(12).unwrap();
     //let compressed = encoder.compress(content.as_bytes()).unwrap();
     let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
+    let mut str_color= String::new();
     for i in 0..NB_FILES{
         let part = i/8;
         let bit = (color.get(part).unwrap() >> i) & 1;
         if bit == 1{
             color_vec.set(i,true);
+            str_color.push('1');
+        }else {
+            str_color.push('0');
         }
     }
+    //println!("COLOR = {}", str_color);
+    
     let position = color_cursor_pos.get(&color_vec).unwrap();
     out_mult_file.seek(SeekFrom::Start(*position))?;
     //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
