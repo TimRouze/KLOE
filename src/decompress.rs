@@ -76,9 +76,9 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
             //println!("SIZE: {}", size_simplitig);
             let mut simplitig = vec![0; size_to_read as usize];
             //println!("Reading {} Bytes", simplitig.len());
-            if cursor > 900000{
+            /*if cursor > 900000{
                 println!("Cursor = {}", cursor);
-            }
+            }*/
             omni_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
             let to_write = vec2str(&simplitig, &(size_simplitig as usize));
             let content = to_write;
