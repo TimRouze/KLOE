@@ -93,10 +93,6 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         //println!("simplitig = {}", to_write);
         let content = to_write;
         counter_kmer += content.len()-30;
-        if content.contains("AAAAAAATATTTGAATCTCAGACGCCCGCCG"){
-            println!("Present dans l'omni");
-            println!("{}", content);
-        }
         //println!("CURR PATH: {}", filename);
         write_out_omni(&content, &filenames, &out_dir);
     }
@@ -224,10 +220,6 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                             let mut input = String::new();
                             std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
                         }*/
-                        if content.contains("AAAAAAATATTTGAATCTCAGACGCCCGCCG"){
-                            println!("Bonjour, on decommpresse et c'est pas sense etre la.");
-                            println!("{}", content);
-                        }
                         counter_kmer += content.len()-30;
                         write_output(&content, filenames.get(positions_in_color.iter().position(|pos| pos == elem).unwrap()).unwrap(), out_dir);
                     }
