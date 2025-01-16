@@ -56,44 +56,51 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     //(0..filenames.len()).into_par_iter().for_each(|file_number|{
         //let filename = filenames.get(file_number).unwrap();
         //println!("{}", filename);
-        let omni_file = File::open(omnicolor).unwrap();
-        let mut omni_reader = BufReader::new(&omni_file);
-        //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
-        let mut cursor = 0;
-        let metadata = omni_file.metadata().unwrap();
-        let file_size: usize = metadata.len() as usize;
-        println!("FILE SIZE = {}", file_size);
-        while cursor < file_size{
-            let mut size_buf = [0; 4];
-            cursor += 4;
-            omni_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
-            let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
-            let size_simplitig: u32 = u32::from_le_bytes(size_buf);
-            //println!("READING CURSOR = {}", cursor);
-            cursor += size_to_read as usize;
-            //println!("SIZE: {}", size_simplitig);
-            let mut simplitig = vec![0; size_to_read as usize];
-            //println!("Reading {} Bytes", simplitig.len());
-            /*if cursor > 900000{
-                println!("SIZE: {}", size_simplitig);
-                println!("Reading {} Bytes", simplitig.len());
-                let to_write = vec2str(&simplitig, &(size_simplitig as usize));
-                //println!("simplitig = {}", to_write);
-                println!("Cursor = {}", cursor);
-                println!("SIZE READ: {}", size_to_read);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
-            }*/
-            omni_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
+    let omni_file = File::open(omnicolor).unwrap();
+    let mut omni_reader = BufReader::new(&omni_file);
+    //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
+    let mut cursor = 0;
+    let metadata = omni_file.metadata().unwrap();
+    let file_size: usize = metadata.len() as usize;
+    let mut counter_kmer = 0;
+    println!("FILE SIZE = {}", file_size);
+    while cursor < file_size{
+        let mut size_buf = [0; 4];
+        cursor += 4;
+        omni_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
+        let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
+        let size_simplitig: u32 = u32::from_le_bytes(size_buf);
+        //println!("READING CURSOR = {}", cursor);
+        cursor += size_to_read as usize;
+        //println!("SIZE: {}", size_simplitig);
+        let mut simplitig = vec![0; size_to_read as usize];
+        //println!("Reading {} Bytes", simplitig.len());
+        /*if cursor > 900000{
+            println!("SIZE: {}", size_simplitig);
+            println!("Reading {} Bytes", simplitig.len());
             let to_write = vec2str(&simplitig, &(size_simplitig as usize));
-            //println!("SIMPLITIG: {}", to_write);
-            //let mut input = String::new();
-            //std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
             //println!("simplitig = {}", to_write);
-            let content = to_write;
-            //println!("CURR PATH: {}", filename);
-            write_out_omni(&content, &filenames, &out_dir);
+            println!("Cursor = {}", cursor);
+            println!("SIZE READ: {}", size_to_read);
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
+        }*/
+        omni_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
+        let to_write = vec2str(&simplitig, &(size_simplitig as usize));
+        //println!("SIMPLITIG: {}", to_write);
+        //let mut input = String::new();
+        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
+        //println!("simplitig = {}", to_write);
+        let content = to_write;
+        counter_kmer += content.len()-30;
+        if content.contains("AAAAAAATATTTGAATCTCAGACGCCCGCCG"){
+            println!("Present dans l'omni");
+            println!("{}", content);
         }
+        //println!("CURR PATH: {}", filename);
+        write_out_omni(&content, &filenames, &out_dir);
+    }
+    println!("NB KMER SEEN IN OMNI {}", counter_kmer);
         //dump_file.finish().expect("Error writing decompressed data");
     //}); 
 }
@@ -193,6 +200,7 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
     let multicolor_file = File::open(multicolor).unwrap();
     let mut multicolor_reader = BufReader::new(multicolor_file);
     let mut to_read = false;
+    let mut counter_kmer = 0;
     for (color, sizes, end_cursor_pos) in color_to_sizes.iter(){
         for i in positions_in_color.iter(){
             if color.chars().nth(*i).unwrap() == '1'{
@@ -216,6 +224,11 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                             let mut input = String::new();
                             std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
                         }*/
+                        if content.contains("AAAAAAATATTTGAATCTCAGACGCCCGCCG"){
+                            println!("Bonjour, on decommpresse et c'est pas sense etre la.");
+                            println!("{}", content);
+                        }
+                        counter_kmer += content.len()-30;
                         write_output(&content, filenames.get(positions_in_color.iter().position(|pos| pos == elem).unwrap()).unwrap(), out_dir);
                     }
                     //let mut input = String::new();
@@ -231,6 +244,8 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
         //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
         to_read = false;
     }
+
+    println!("IN MULT, I HAVE READ {} KMERS", counter_kmer);
 }
 
 //TRAITE LES DONNES DU FICHIER D'INTERFACE ET LES ORGANISE POUR LES RENDRE UTILISABLE EFFICACEMENT.
@@ -265,6 +280,7 @@ fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
     /*else{
         let mut file = File::options().write(true).read(true).create_new(true).open(path);
     }*/
+    //println!("BONJOURENT");
     let mut out_file = BufWriter::new(File::options().write(true).read(true).create(true).open(&path).expect("Unable to create file"));
     //println!("OUTFILENAME: {}", path.display());
     out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");

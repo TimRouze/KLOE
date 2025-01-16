@@ -218,7 +218,7 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
     let extension = get_extension_from_filename(filename).unwrap();
 
     let file = File::open(filename).unwrap();
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let records: Vec<_>;
     println!("{}", extension);
     if extension == "zst"{
@@ -233,11 +233,11 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
         println!("Error, file extension not handled.");
         std::process::exit(1);
     }
-
     let kmer_counter_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_insert_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_modify_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let kmer_counter_omni_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let kmer_counter_weird_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     println!("FILE NUMBER: {}", file_number);
     // Process each record in parallel
     records.par_iter().for_each(|record| {
@@ -245,104 +245,95 @@ fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COL
         let mut counter_insert : u64 = 0;
         let mut counter_modify : u64 = 0;
         let mut counter_omni: u64 = 0;
-        let mut curr_kmer = RawKmer::<K, KT>::new();
-
-        for (i, nuc) in record.seq.iter().filter_map(KT::from_nuc).enumerate() {
-            if i < K - 1{
-                curr_kmer = curr_kmer.extend(nuc);
-            }else{
-                curr_kmer = curr_kmer.append(nuc);
-                let canon = curr_kmer.canonical().to_int();
-                /*let min_iter = MinimizerBuilder::<u64>::new_mod().canonical()
-                                .minimizer_size(9)
-                                .width(23)
-                                .iter(canon);
-                for (minimizer, position) in min_iter{
-                
-                }*/
-                //let str_kmer: String = num2str(curr_kmer.canonical().to_int());
-                //let mini = find_min(curr_kmer.canonical());
-                //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-                let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
-                counter += 1;
-                let mut omni_kmer_map_lock = omni_kmer_map.get(pos).unwrap().lock().unwrap();
-                if file_number == 0{
-                    omni_kmer_map_lock.insert(canon, Cell::new(false));
-                    counter_insert += 1;
-                    counter_omni += 1;
-                }else if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
-                    //println!("a{}a", elem.get());
-                    elem.set(true);
-                    //println!("b{}b", elem.get());
-                    //let mut input = String::new();
-                    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                    counter_omni += 1;
-                }else{
-                    let mut multi_kmer_map_lock = multi_kmer_map.get(pos).unwrap().lock().unwrap();
-                    multi_kmer_map_lock.entry(canon).and_modify(|pair|{
-                        counter_modify += 1;
-                        pair.0.set(file_number, true);
-                    }).or_insert_with(|| {
-                        let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-                        bv.set(file_number, true);
-                        counter_insert += 1;
-                        (bv, Cell::new(false))
-                    });
-                }
-                drop(omni_kmer_map_lock);
-            }
+        let mut counter_weird_kmer = 0;
+        let mut curr_kmer= RawKmer::<K, KT>::from_nucs(&record.seq[..K]);
+        let mut canon = curr_kmer.canonical().to_int();
+        if num2str(canon) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+            println!("Bonjour FIRST KMER");
+        }
+        handle_kmer(omni_kmer_map, multi_kmer_map, file_number, canon);
+        for (_i, nuc) in record.seq[K..].iter().filter_map(KT::from_nuc).enumerate() {
+            curr_kmer = curr_kmer.append(nuc);
+            canon = curr_kmer.canonical().to_int();
+            //println!("CURR KMER = {}", num2str(canon));
+            //let mut input = String::new();
+            //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+            /*let min_iter = MinimizerBuilder::<u64>::new_mod().canonical()
+                            .minimizer_size(9)
+                            .width(23)
+                            .iter(canon);
+            for (minimizer, position) in min_iter{
+            
+            }*/
+            //let str_kmer: String = num2str(curr_kmer.canonical().to_int());
+            //let mini = find_min(curr_kmer.canonical());
+            //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
+            handle_kmer(omni_kmer_map, multi_kmer_map, file_number, canon);
         }
 
         *kmer_counter_mutex.lock().unwrap() += counter;
         *kmer_counter_insert_mutex.lock().unwrap() += counter_insert;
         *kmer_counter_modify_mutex.lock().unwrap() += counter_modify;
         *kmer_counter_omni_mutex.lock().unwrap() += counter_omni;
+        *kmer_counter_weird_mutex.lock().unwrap() += counter_weird_kmer;
     });
     if file_number != 0{
         check_omni(omni_kmer_map, multi_kmer_map, file_number);
     }
-    //let mut to_add = HashSet::new();
-    /*while let Some(record) = fa_reader.next(){
-        let seqrec = record.expect("Error reading record");
-        let norm_seq = seqrec.normalize(false);
-        let norm_rc = norm_seq.reverse_complement();
-        let canon_kmers = norm_seq.canonical_kmers(K as u8, &norm_rc);
-        canon_kmers.for_each(|kmer|{
-            //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
-            
-            let curr_kmer: RawKmer<K, KT> = RawKmer::from_nucs(kmer.1);
-            counter += 1;
-            kmer_buffer.push(curr_kmer);
-            if kmer_buffer.len() >= 10000{
-                let mut kmer_map = kmer_map_mutex.lock().unwrap();
-
-                for elem in kmer_buffer.iter(){
-                //let file_nb = *file_number.read();
-                    kmer_map.entry(elem.to_int()).and_modify(|pair|{
-                        counter_modify += 1;
-                        pair.0.set(file_number, true);
-                    }).or_insert_with(|| {
-                        let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-                        bv.set(file_number, true);
-                        counter_insert += 1;
-                        (bv, Cell::new(false))
-                    });
-                }
-                kmer_buffer.clear();
-                drop(kmer_map);
-            }
-            //TODO FIND A WAY TO RESIZE WITH DASHMAP
-            /*if kmer_map.capacity() <= (20/100)*nb_elem{
-                kmer_map.try_reserve((30/100)*nb_elem);
-            }*/
-        });
-    }*/
-    println!("I have inserted {} k-mers", kmer_counter_insert_mutex.lock().unwrap());
-    println!("I have seen {} already inserted k-mers", kmer_counter_modify_mutex.lock().unwrap());
-    println!("I have seen {} k-mers", kmer_counter_mutex.lock().unwrap());
+    println!("I have inserted {} k-mers in the multicolor", kmer_counter_insert_mutex.lock().unwrap());
+    println!("I have seen {} already inserted k-mers in the multicolor", kmer_counter_modify_mutex.lock().unwrap());
+    println!("I have seen {} total k-mers", kmer_counter_mutex.lock().unwrap());
     println!("I have seen {} omnicolored kmers", kmer_counter_omni_mutex.lock().unwrap());
     println!("I should remove {} k-mers from the omnicolor", *kmer_counter_mutex.lock().unwrap()-*kmer_counter_omni_mutex.lock().unwrap());
-    kmer_counter_insert_mutex
+    println!("WEIRD KMER {}", kmer_counter_weird_mutex.lock().unwrap());
+    kmer_counter_mutex
+}
+
+fn handle_kmer(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_kmer_map: &Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>>, file_number: usize, canon: KT){
+    let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
+    //counter += 1;
+    let mut omni_kmer_map_lock = omni_kmer_map.get(pos).unwrap().lock().unwrap();
+    if file_number == 0{
+        if num2str(canon) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+            println!("Bonjour first file");
+        }
+        omni_kmer_map_lock.insert(canon, Cell::new(false));
+        //counter_omni += 1;
+    }else if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
+        //println!("a{}a", elem.get());
+        elem.set(true);
+        if num2str(canon) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+            println!("RE - Bonjour");
+        }
+        //println!("b{}b", elem.get());
+        //let mut input = String::new();
+        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        //counter_omni += 1;
+    }else{
+        if num2str(canon) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+            println!("bonjour multi");
+            //counter_weird_kmer += 1;
+            println!("POS {}", pos);
+        }
+        let mut multi_kmer_map_lock = multi_kmer_map.get(pos).unwrap().lock().unwrap();
+        multi_kmer_map_lock.entry(canon).and_modify(|pair|{
+            //counter_modify += 1;
+            if num2str(canon) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                println!("NOT THE FIRST TIME SEEING YOU");
+            }
+            pair.0.set(file_number, true);
+        }).or_insert_with(|| {
+            let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
+            bv.set(file_number, true);
+            //counter_insert += 1;
+            if num2str(canon) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                println!("FIRST TIME SEEING YOU");
+            }
+            (bv, Cell::new(false))
+        });
+        drop(multi_kmer_map_lock);
+    }
+    drop(omni_kmer_map_lock);
 }
 
 fn check_omni(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>>, file_number: usize){
@@ -355,13 +346,22 @@ fn check_omni(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_km
         let mut omni_iterator = omni_kmer_map_lock.iter();
         while let Some(entry) = omni_iterator.next(){
             let curr_k = num2str(*entry.0);
+            if curr_k == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                println!("oui, je regarde tous les kmers, on sait jamais");
+            }
             counter+=1;
             if !(entry.1.get()){
                 to_remove += 1;
                 let mut multi_kmer_map_lock = multi_kmer_map.get(i).unwrap().lock().unwrap();
                 multi_kmer_map_lock.entry(*entry.0).and_modify(|pair|{
+                    if curr_k == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                        println!("Ce kmer n'existait pas dans le multi");
+                    }
                     pair.0.set(file_number, false);
                 }).or_insert_with(|| {
+                    if curr_k == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                        println!("Ce kmer existait, mise a jour de la couleur");
+                    }
                     let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
                     let mut i = 0;
                     while i < file_number{
@@ -380,7 +380,7 @@ fn check_omni(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_km
             elem.1.set(false);
         }
     });
-    println!("I have seen {} k-mers total", kmer_counter_mutex.lock().unwrap());
+    println!("I have seen {} k-mers total in the omnicolor", kmer_counter_mutex.lock().unwrap());
     println!("I have seen {} k-mers to be removed from omnicolor", kmer_to_remove_mutex.lock().unwrap());
     
 }
@@ -418,6 +418,9 @@ fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool
                 let mut forward = true;
                 let mut backward = true;
                 let mut simplitig = num2str(entry.0.clone());
+                if simplitig == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                    println!("Tiens donc, ce kmer est dans l'omnicolor");
+                }
                 while forward{
                     let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
                     forward = extend_omnicolor_forward(&curr_kmer, omni_kmer_map, &mut simplitig);
@@ -454,15 +457,16 @@ CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 */
 fn extend_omnicolor_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<KT, Cell<bool>>>, simplitig: &mut String) -> bool{
     for succs in curr_kmer.successors(){
+        let canon = succs.canonical();
         //let mini = find_min(succs.canonical());
         //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
         //let canon_succs = succs.clone().canonical();
-        let pos = succs.to_int().to_usize().unwrap()%SHARD_AMOUNT;
+        let pos = canon.to_int().to_usize().unwrap()%SHARD_AMOUNT;
         let kmer_map = kmer_map.get(pos).unwrap();
-        if kmer_map.contains_key(&succs.to_int()){
-            if !kmer_map.get(&succs.to_int()).unwrap().get() {
+        if kmer_map.contains_key(&canon.to_int()){
+            if !kmer_map.get(&canon.to_int()).unwrap().get() {
                 simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                kmer_map.get(&succs.to_int()).unwrap().set(true);
+                kmer_map.get(&canon.to_int()).unwrap().set(true);
                 return true;
             }
         }
@@ -477,14 +481,15 @@ INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
 */
 fn extend_omnicolor_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<KT, Cell<bool>>>, simplitig: &mut String) -> bool{
     for preds in curr_kmer.predecessors(){
+        let canon = preds.canonical();
         //let mini = find_min(preds.canonical());
         //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-        let pos = preds.to_int().to_usize().unwrap()%SHARD_AMOUNT;
+        let pos = canon.to_int().to_usize().unwrap()%SHARD_AMOUNT;
         let kmer_map = kmer_map.get(pos).unwrap();
-        if kmer_map.contains_key(&preds.to_int()){
-            if !kmer_map.get(&preds.to_int()).unwrap().get() {
+        if kmer_map.contains_key(&canon.to_int()){
+            if !kmer_map.get(&canon.to_int()).unwrap().get() {
                 simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
-                kmer_map.get(&preds.to_int()).unwrap().set(true);
+                kmer_map.get(&canon.to_int()).unwrap().set(true);
                 return true;
             }
         }
@@ -520,6 +525,9 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
                 let mut forward = true;
                 let mut backward = true;
                 let mut simplitig = num2str(*key);
+                if simplitig == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                    println!("Ce kmer est dans le multicolor en debut de simplitig");
+                }
                 while forward{
                     let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
                     forward = extend_forward(&curr_kmer, &multi_kmer_map, &mut simplitig, &curr_cell.0, i);
@@ -557,21 +565,56 @@ CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 */
 fn extend_forward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>, pos_curr_kmer: usize) -> bool{
     for succs in curr_kmer.successors(){
-        if let Some(succ_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&succs.to_int()){
+        let canon = succs.canonical().to_int();
+        if let Some(succ_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&canon){
             if succ_pair.0.eq(color) & !succ_pair.1.get() {
                 simplitig.push(*succs.to_nucs().last().unwrap() as char);
+                if num2str(succs.to_int()) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                    println!("{}", succ_pair.1.get());
+                    println!("{}", !succ_pair.1.get());
+                    println!("POS IN MAP: {}", pos_curr_kmer);
+                    for elem in succ_pair.0.iter(){
+                        print!("{}", elem);
+                    }
+                    print!("\n");
+                    for elem in color.iter(){
+                        print!("{}", elem);
+                    }
+                    print!("\n");
+                    println!("Ce kmer est dans le multicolor dans un simplitig en frward");
+                }
                 succ_pair.1.set(true);
+                if num2str(succs.to_int()) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                    println!("should be true {}", succ_pair.1.get());
+                }
                 return true;
             }
         }else{
             //let mini = find_min(succs.canonical());
             //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-            let pos = succs.to_int().to_usize().unwrap()%SHARD_AMOUNT;
+            let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
             let kmer_map = vec_kmer_map.get(pos).unwrap();
-            if let Some(succ_pair) = kmer_map.get(&succs.to_int()){
+            if let Some(succ_pair) = kmer_map.get(&canon){
                 if succ_pair.0.eq(color) & !succ_pair.1.get() {
                     simplitig.push(*succs.to_nucs().last().unwrap() as char);
+                    if num2str(succs.to_int()) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                        println!("{}", succ_pair.1.get());
+                        println!("{}", !succ_pair.1.get());  
+                        println!("POS IN MAP: {}", pos);
+                        for elem in succ_pair.0.iter(){
+                            print!("{}", elem);
+                        }
+                        print!("\n");
+                        for elem in color.iter(){
+                            print!("{}", elem);
+                        }
+                        print!("\n");
+                        println!("Ce kmer est dans le multicolor dans un simplitig en frward pas dans le meme bucket");
+                    }
                     succ_pair.1.set(true);
+                    if num2str(succs.to_int()) == "AAAAAAATATTTGAATCTCAGACGCCCGCCG"{
+                        println!("should be true {}", succ_pair.1.get());
+                    }
                     return true;
                 }
             }
@@ -587,20 +630,27 @@ INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
 */
 fn extend_backward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>, pos_curr_kmer: usize) -> bool{
     for preds in curr_kmer.predecessors(){
-        if let Some(pred_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&preds.to_int()){
+        let canon = preds.canonical().to_int();
+        if let Some(pred_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&canon){
             if pred_pair.0.eq(color) & !pred_pair.1.get() {
-                simplitig.push(*preds.to_nucs().last().unwrap() as char);
+                simplitig.insert(0, *preds.to_nucs().first().unwrap() as char);
+                if simplitig.contains("AAAAAAATATTTGAATCTCAGACGCCCGCCG"){
+                    println!("Ce kmer est dans le multicolor en backward");
+                }
                 pred_pair.1.set(true);
                 return true;
             }
         }else{
             //let mini = find_min(preds.canonical());
             //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-            let pos = preds.to_int().to_usize().unwrap()%SHARD_AMOUNT;
+            let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
             let kmer_map = vec_kmer_map.get(pos).unwrap();
-            if let Some(pred_pair) = kmer_map.get(&preds.to_int()){
+            if let Some(pred_pair) = kmer_map.get(&canon){
                 if pred_pair.0.eq(color) & !pred_pair.1.get() {
                     simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
+                    if simplitig.contains("AAAAAAATATTTGAATCTCAGACGCCCGCCG"){
+                        println!("Ce kmer est dans le multicolor en backward");
+                    }
                     pred_pair.1.set(true);
                     return true;
                 }
