@@ -29,14 +29,16 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     let reader = BufReader::new(input_fof);
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     //let filename_to_nb_kmer = HashMap::new();
-
+    let mut files = Vec::new();
     for filename in filenames.iter(){
         let stem_filename = Path::new(filename).file_stem().unwrap();
         let path = out_dir.join(String::from("Dump_")+ stem_filename.to_str().unwrap());
         println!("{}", path.to_str().unwrap());
         if path.is_file(){
-            std::fs::remove_file(path).expect("Unable to remove file");
+            std::fs::remove_file(path.clone()).expect("Unable to remove file");
         }
+        let mut out_file = BufWriter::new(File::options().append(true).create(true).open(path).expect("Unable to create file"));
+        files.push(out_file);
     }
     let full_path = Path::new(omnicolor);
 
@@ -53,7 +55,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         println!("{}", filename_color_path);
     }
     let now = Instant::now();
-    decompress_multicolor(&color_size_path, &filename_color_path, wanted_files_path, multicolor, &out_dir);
+    decompress_multicolor(&color_size_path, &filename_color_path, wanted_files_path, multicolor, &out_dir, &mut files);
     let elapsed = now.elapsed();
     println!("Multicolored decompression process took: {:.2?} seconds.", elapsed);
     //(0..filenames.len()).into_par_iter().for_each(|file_number|{
@@ -99,16 +101,19 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
         let content = to_write;
         counter_kmer += content.len()-30;
         //println!("CURR PATH: {}", filename);
-        write_out_omni(&content, &filenames, &out_dir);
+        write_out_omni(&content, &mut files, &out_dir);
     }
     let elapsed = now.elapsed();
     println!("Decompressing omnicolored simplitigs took: {:.2?} seconds.", elapsed);
     println!("NB KMER SEEN IN OMNI {}", counter_kmer);
         //dump_file.finish().expect("Error writing decompressed data");
     //}); 
+    for file in files.iter_mut(){
+        file.flush();
+    }
 }
 
-fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wanted_files_path: &str, multicolor: &str, out_dir: &PathBuf){
+fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wanted_files_path: &str, multicolor: &str, out_dir: &PathBuf, files: &mut Vec<BufWriter<File>>){
     let now = Instant::now();
     //Filename to color: PATH/TO/FILE.fa:0
     //Number = position of file in color array (e.g. 011001).
@@ -137,7 +142,7 @@ fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wante
     let elapsed = now.elapsed();
     println!("Reading interface files took: {:.2?} seconds.", elapsed);
     let now = Instant::now();
-    decompress_needed(&color_to_pos, multicolor, out_dir, &filenames, &positions_in_color);
+    decompress_needed(&color_to_pos, multicolor, out_dir, files, &positions_in_color);
     let elapsed = now.elapsed();
     println!("Decompression of multicolored + organising interface data took: {:.2?} seconds.", elapsed);
     
@@ -201,13 +206,13 @@ fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut 
     (filenames, positions_in_color)
 }
 
-fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &PathBuf, filenames: &Vec<String>, positions_in_color: &Vec<usize>){
+fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &PathBuf, files: &mut Vec<BufWriter<File>>, positions_in_color: &Vec<usize>){
     let mut prev_cursor: u64 = 0;
     let now = Instant::now();
     let color_to_sizes = organise_interface_data(color_to_pos);
     let elapsed = now.elapsed();
     println!("Organising interface data took: {:.2?} seconds.", elapsed);
-    println!("NB FILES {}", filenames.len());
+    println!("NB FILES {}", files.len());
     //OPEN MULTICOLOR FILE
     let multicolor_file = File::open(multicolor).unwrap();
     let mut multicolor_reader = BufReader::new(multicolor_file);
@@ -224,6 +229,7 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
         if to_read{
             for size in sizes.iter(){
                 let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
+                let mut i:usize = 0;
                 for elem in positions_in_color{
                     /*println!("ELEM: {}", elem);
                     if *elem == 0{
@@ -238,8 +244,10 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                             std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
                         }*/
                         counter_kmer += content.len()-30;
-                        write_output(&content, filenames.get(positions_in_color.iter().position(|pos| pos == elem).unwrap()).unwrap(), out_dir);
+                        write_output(&content, files.get_mut(i).unwrap(), out_dir);
+                        //positions_in_color.iter().position(|pos| pos == elem).unwrap()
                     }
+                    i+=1;
                     //let mut input = String::new();
                     //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
                     
@@ -280,22 +288,22 @@ fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(String, Vec<&str>
     color_to_sizes
 }
 
-fn write_out_omni(content: &String, filenames: &Vec<String>, out_dir: &PathBuf){
-    for filename in filenames{
-        write_output(content, filename, out_dir);
+fn write_out_omni(content: &String, files: &mut Vec<BufWriter<File>>, out_dir: &PathBuf){
+    for file in files.iter_mut(){
+        write_output(content, file, out_dir);
     }
 }
 
-fn write_output(content: &String, filename: &str, out_dir: &PathBuf){
-    let path = out_dir.join(String::from("Dump_")+ Path::new(filename).file_stem().unwrap().to_str().unwrap());
+fn write_output(content: &String, out_file: &mut BufWriter<File>, out_dir: &PathBuf){
     /*else{
         let mut file = File::options().write(true).read(true).create_new(true).open(path);
     }*/
     //println!("BONJOURENT");
-    let mut out_file = BufWriter::new(File::options().write(true).read(true).create(true).open(&path).expect("Unable to create file"));
+    
     //println!("OUTFILENAME: {}", path.display());
-    out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");
+    //out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");
     out_file.write_all(&">\n".as_bytes()).unwrap();
     out_file.write_all(content.as_bytes()).unwrap();
     out_file.write_all(&"\n".as_bytes()).unwrap(); 
 }
+

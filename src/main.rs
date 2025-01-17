@@ -376,7 +376,8 @@ fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool
                 omni_f.write_all(&str2num(&simplitig)).expect("Unable to write data");
             }
         }
-    }             
+    }    
+    omni_f.flush();         
     println!("NB KMERS: {}", cpt);
     let fin_omni_simpli = omni_simpli.elapsed();
     println!("Construction of omnicolored simplitigs took: {:.2?} seconds.", fin_omni_simpli);
@@ -475,6 +476,7 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
             }
         }
     }
+    multi_f.flush();
     let fin_multi_simpli = multi_simpli.elapsed();
     println!("Construction of multicolored simplitigs took: {:.2?} seconds.", fin_multi_simpli);
     color_simplitig_size
@@ -593,6 +595,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; 
         //let mut input = String::new();
         //io::stdin().read_line(&mut input).expect("error: unable to read user input");
     }
+    out_mult_file.flush();
     let _ = remove_file(output_dir.clone()+"temp_multicolor.fa");
     //zstd_compress_file(&out_mult_file, compressed_path);
     write_interface_file(color_simplitig, color_cursor_pos, output_dir);
@@ -661,10 +664,12 @@ fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8;
             bucket_sizes.pop();
             let buf : String = String::from(color + "," + &(cursor_end.to_string()) + ":" + &bucket_sizes + "\n");
             let _ = color_file.write_all(buf.as_bytes());
+            
             //writeln!(file, "{},{}:{}", color, cursor_end, bucket_sizes).unwrap();
         }
         nb_seen = 0;
     }
+    color_file.flush();
     let _ = color_file.finish();
 }
 
@@ -704,6 +709,7 @@ fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<Fil
     multi_f.write_all(&id).expect("Unable to write color");
     multi_f.write_all(&size.to_le_bytes()).expect("Unable to write simplitig size");  
     multi_f.write_all(&simplitig).expect("Unable to write data");
+    
 }
 
 #[test]
