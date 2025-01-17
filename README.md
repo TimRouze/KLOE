@@ -11,6 +11,8 @@ I=../../fof_6_salmonellas.txt K=31 cargo r -r -- decompress --omnicolor-file omn
 ```
 
 ## TODO
+- Change bitvec par vec<u8> (liste d'entier)
+- taille simplitigs -> taille -K + 1
 - FIX K > 31
 - DELETE UTILITY FILES AFTER DECOMPRESSION?
 - STORE ABUNDANCES
