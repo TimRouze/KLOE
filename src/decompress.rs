@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write, BufWriter, Stdin};
 use std::time::Instant;
 use zstd::stream::read::Decoder;
+use crate::constants::NB_FILES;
 use crate::utils::vec2str;
 
 /// DECOMPRESS
@@ -162,13 +163,15 @@ fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor
 }
 
 fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool){
-    //println!("CURSOR BEFORE INCREMENT: {}", cursor);
+    println!("CURSOR BEFORE INCREMENT: {}", cursor);
     if !to_read{
         *cursor = end_pos.parse::<u64>().unwrap();
+        println!("ADDING: {}", end_pos.parse::<u64>().unwrap());
     }else{
         *cursor += end_pos.parse::<u64>().unwrap() - *cursor;
+        println!("ADDING: {} - {}", end_pos.parse::<u64>().unwrap(), cursor);
     }
-    //println!("cursor after increment: {}", cursor);
+    println!("cursor after increment: {}", cursor);
 }
 
 fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut Vec<String>) -> (Vec<String>, Vec<usize>){
@@ -220,12 +223,26 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
     let mut counter_kmer = 0;
     let now = Instant::now();
     for (color, sizes, end_cursor_pos) in color_to_sizes.iter(){
-        for i in positions_in_color.iter(){
+        let mut i = 0;
+        for e in positions_in_color.iter(){
+            if let Some(curr_color) = color.get(i){
+                println!("CURR POS: {}", e);
+                println!("CURR COLOR: {}", curr_color);
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                if &e.to_string() == *curr_color{
+                    to_read = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        /*for i in positions_in_color.iter(){
             if color.chars().nth(*i).unwrap() == '1'{
                 to_read = true;
                 break;
             }
-        }
+        }*/
         if to_read{
             for size in sizes.iter(){
                 let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
@@ -235,7 +252,18 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                     if *elem == 0{
                         println!("COLOR: {}", color)
                     }*/
-                    if color.chars().nth(*elem).unwrap() == '1'{
+                    if let Some(curr_color) = color.get(i){
+                        if &elem.to_string() == *curr_color{
+                            counter_kmer += content.len()-30;
+                            if content.contains("AAAAAAAAACCATCCGATTATGGATGGTTTT"){
+                                println!("VU");
+                                let mut input = String::new();
+                                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                            }
+                            write_output(&content, files.get_mut(i).unwrap(), out_dir);
+                        }
+                    }
+                    /*if color.chars().nth(*elem).unwrap() == '1'{
                         if color == "00100000" || color == "01000000"{
                             if content == "TTTTTGTTTTTGCAAAGAGTAATTTCAAACTCCCTGTAAAAAGAGGCTTATTCGGTAAGGCTAAACATTTTGTGCGTTTTTTACTAAA" || content.contains("CGTCATCCATACCACGACCTCAAAGGCCGACAGCAGGCCCAGAAGACGCTCCAGCGTGGCCAACGTGCGTTACCTAAAACCTGTTTAAATATCCAGATAAAAACATTCAATCTGGGTCAAATGAGTGATACAGTTTCACCCATAAGACCCAATG"){
                                 println!("SIMPLITIG = {}", content);
@@ -253,7 +281,7 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                         counter_kmer += content.len()-30;
                         write_output(&content, files.get_mut(i).unwrap(), out_dir);
                         //positions_in_color.iter().position(|pos| pos == elem).unwrap()
-                    }
+                    }*/
                     i+=1;
                     //let mut input = String::new();
                     //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
@@ -264,8 +292,8 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
         //println!("filename: {}", filenames.get(pos).unwrap());
         //println!("NB KMER = {}", counter);
         increment_cursor(&mut prev_cursor, end_cursor_pos, to_read);
-        //let mut input = String::new();
-        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
         to_read = false;
     }
     let elapsed = now.elapsed();
@@ -275,22 +303,27 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
 }
 
 //TRAITE LES DONNES DU FICHIER D'INTERFACE ET LES ORGANISE POUR LES RENDRE UTILISABLE EFFICACEMENT.
-fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(String, Vec<&str>, String)>{
-    let mut color_to_sizes: Vec<(String, Vec<&str>, String)> = Vec::new();
+fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(Vec<&str>, Vec<&str>, String)>{
+    let mut color_to_sizes: Vec<(Vec<&str>, Vec<&str>, String)> = Vec::new();
     for color_size in color_to_pos{
         let first_part = color_size.split(':').collect::<Vec<_>>()[0];
         let sizes = color_size.split(':').collect::<Vec<_>>()[1];
         let color = first_part.split(',').collect::<Vec<_>>()[0];
         let end_cursor_pos = first_part.split(',').collect::<Vec<_>>()[1];
         //println!("COLOR: {}", color);
+        let mut sizes_vec = Vec::new();
+        let mut colors_vec = Vec::new();
         if sizes.contains(','){
-            let sizes_vec = sizes.split(',').collect::<Vec<_>>();
-            color_to_sizes.push((String::from(color), sizes_vec, String::from(end_cursor_pos)));
+            sizes_vec = sizes.split(',').collect::<Vec<_>>();
         }else{
-            let mut vec = Vec::new();
-            vec.push(sizes);
-            color_to_sizes.push((String::from(color), vec, String::from(end_cursor_pos)));
+            sizes_vec.push(sizes);
         }
+        if color.contains(','){
+            colors_vec = color.split(',').collect::<Vec<_>>();
+        }else {
+            colors_vec.push(color);
+        }
+        color_to_sizes.push((colors_vec, sizes_vec, String::from(end_cursor_pos)));
     }
     color_to_sizes
 }
