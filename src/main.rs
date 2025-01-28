@@ -7,7 +7,7 @@ mod kmer;
 mod decompress;
 mod stats;
 use clap::Parser;
-use num_traits::ToPrimitive;
+use num_traits::{ToBytes, ToPrimitive};
 use stats::compute_stats;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ use indexmap::IndexMap;
 use zstd::stream::write::Encoder;
 use zstd::stream::read::Decoder;
 
-use crate::utils::{num2str, str2num, find_min};
+use crate::utils::{num2str, str2num, find_min, vec2str};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -438,6 +438,7 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
     let mut multi_f = BufWriter::new(File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file"));
     //let mut color_simplitig_size: Arc<Mutex<HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut color_simplitig_size: HashMap<Vec<u16>, (usize, Vec<usize>)> = HashMap::new();
+    let mut cpt: u32 = 0;
     for i in 0..SHARD_AMOUNT{
         let kmer_map = multi_kmer_map.get(i).unwrap();
         let mut kmer_iterator = kmer_map.iter();
@@ -456,13 +457,14 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
                     backward = extend_backward(&curr_kmer, &multi_kmer_map, &mut simplitig, &curr_cell.0, i);
                 }
                 let simplitig_size = simplitig.len();
+                cpt += 1;
                 color_simplitig_size.entry(curr_cell.0.clone())
                             .and_modify(|total_size| {
                                 total_size.0 += simplitig_size.div_ceil(4);
                                 total_size.1.push(simplitig_size);
                             })
                             .or_insert((simplitig_size.div_ceil(4), vec![simplitig_size]));
-                write_multicolored_simplitig(&str2num(&simplitig), &mut multi_f,&curr_cell.0, &simplitig.len());
+                write_multicolored_simplitig(&str2num(&simplitig), &mut multi_f,&curr_cell.0, &simplitig.len(), cpt);
             }
         }
     }
@@ -566,21 +568,40 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<Vec<u16>, (usize, Vec<usize>)>,
     println!("FILE SIZE = {}", file_size);
     while cursor < file_size{
         cursor+= COLOR_SIZE;
-        let mut id = [0; ARRAY_SIZE];
-        temp_multicolor_reader.read_exact(&mut id).expect("Error reading color in temp file");
+        let mut ones = [0; 2];
+        cursor += 2;
+        temp_multicolor_reader.read_exact(&mut ones).expect("Error reading color size in temp file");
+        let nb_elem = u16::from_le_bytes(ones);
+        //println!("NB ONES: {}", nb_elem);
+        let mut positions = Vec::new();
+        for i in 0..nb_elem{
+            let mut id: [u8; 2] = [0; 2];
+            cursor += 2;
+            temp_multicolor_reader.read_exact(&mut id).expect("Error reading color in temp file");
+            positions.push(u16::from_le_bytes(id));
+            //println!("FILE N°:{}", u16::from_le_bytes(id));
+            //let mut input = String::new();
+            //io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        }
         let mut size_buf = [0; 4];
         cursor += 4;
         temp_multicolor_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
         let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
-        //let size_simplitig: u32 = u32::from_le_bytes(size_buf);
+        //println!("SIZE TO READ: {}\nSIZE SIMPLITIG: {}", size_to_read, u32::from_le_bytes(size_buf));
+        let size_simplitig: u32 = u32::from_le_bytes(size_buf);
         //println!("READING CURSOR = {}", cursor);
         cursor += size_to_read as usize;
         //println!("COLOR: {}\nSIZE: {}", &id.to_vec()[0], size_simplitig);
         let mut simplitig = vec![0; size_to_read as usize];
+
         //println!("Reading {} Bytes", simplitig.len());
         temp_multicolor_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
         //println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
-        let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &id.to_vec());
+        let str_simplitig = vec2str(&simplitig.to_vec(), &(size_simplitig as usize));
+        //println!("SIMPLITIG: {}", str_simplitig);
+        //let mut input = String::new();
+        //io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &positions);
         //println!("READING CURSOR = {}", cursor);
         //let mut input = String::new();
         //io::stdin().read_line(&mut input).expect("error: unable to read user input");
@@ -602,7 +623,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<Vec<u16>, (usize, Vec<usize>)>,
     Ok(())
 } */
 
-fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cursor_pos: &mut IndexMap<Vec<u16>, u64>, color: &Vec<u8>) -> io::Result<()> {
+fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cursor_pos: &mut IndexMap<Vec<u16>, u64>, color: &Vec<u16>) -> io::Result<()> {
     //let mut encoder = Compressor::new(12).unwrap();
     //let compressed = encoder.compress(content.as_bytes()).unwrap();
     //let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
@@ -622,12 +643,8 @@ fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cur
     //     }
     // }
 
-
-
-
-
-    let mut color_vec: Vec<u16> = Vec::new();
-    let mut str_color= String::new();
+    let mut color_vec = color.clone();
+    /* let mut str_color= String::new();
     for i in 0..NB_FILES{
         let part = i/8;
         let bit = (color.get(part).unwrap() >> i) & 1;
@@ -643,7 +660,7 @@ fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cur
     for e in &color_vec{
         print!("{}", e);
     }
-    print!("\n");
+    print!("\n"); */
     let position = color_cursor_pos.get(&color_vec).unwrap();
     out_mult_file.seek(SeekFrom::Start(*position))?;
     //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
@@ -687,9 +704,8 @@ fn write_interface_file(color_simplitig: &HashMap<Vec<u16>, (usize, Vec<usize>)>
 
 
 
-fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<File>, color: &Vec<u16>, size_str : &usize){
-    let size:u32 = *size_str as u32;
-    let mut id = Vec::new();
+fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<File>, color: &Vec<u16>, size_str : &usize, cpt: u32){
+    /*let mut id = Vec::new();
     let mut cpt = 0;
     let mut curr_int: u8 = 0;
     let mut str_color = String::new();
@@ -707,6 +723,7 @@ fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<Fil
     }
     //println!("");
     println!("str color: {}", str_color);
+    */
     // println!("color size = {}", id.len());
     //println!("simplitig size = {}", simplitig.len());
     //println!("Simplitig after convert: {}", vec2str(&simplitig, size_str));
@@ -714,8 +731,23 @@ fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<Fil
     //println!("Color size {}", id.len());
     // let mut input = String::new();
     // io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    multi_f.write_all(&id).expect("Unable to write color");
-    multi_f.write_all(&size.to_le_bytes()).expect("Unable to write simplitig size");  
+    let size: u16 = color.len().try_into().unwrap();
+    if cpt <= 2{
+        println!("SIZE: {}", size);
+    }
+    multi_f.write_all(&size.to_le_bytes());
+    for elem in color{
+        multi_f.write_all(&elem.to_le_bytes()).expect("Unable to write color");
+        if cpt <= 2{
+            println!("ELEM: {}", elem);
+        }
+    }
+    if cpt <= 2{
+        println!("SIMPLITIG SIZE: {}", simplitig.len());
+        println!("{}", vec2str(simplitig, &(simplitig.len()*4).to_usize().unwrap()));
+    }
+    let mut simplitig_size:u32 = *size_str as u32;
+    multi_f.write_all(&simplitig_size.to_le_bytes()).expect("Unable to write simplitig size");  
     multi_f.write_all(&simplitig).expect("Unable to write data");
     
 }

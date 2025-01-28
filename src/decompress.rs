@@ -236,6 +236,13 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
                         println!("COLOR: {}", color)
                     }*/
                     if color.chars().nth(*elem).unwrap() == '1'{
+                        if color == "00100000" || color == "01000000"{
+                            if content == "TTTTTGTTTTTGCAAAGAGTAATTTCAAACTCCCTGTAAAAAGAGGCTTATTCGGTAAGGCTAAACATTTTGTGCGTTTTTTACTAAA" || content.contains("CGTCATCCATACCACGACCTCAAAGGCCGACAGCAGGCCCAGAAGACGCTCCAGCGTGGCCAACGTGCGTTACCTAAAACCTGTTTAAATATCCAGATAAAAACATTCAATCTGGGTCAAATGAGTGATACAGTTTCACCCATAAGACCCAATG"){
+                                println!("SIMPLITIG = {}", content);
+                                let mut input = String::new();
+                                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                            }
+                        }
                         //println!("{}", color);
                         /*if *elem == 0{
                             println!("POS IN COLOR: {}", elem);
