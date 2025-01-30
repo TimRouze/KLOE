@@ -259,11 +259,6 @@ fn handle_kmer(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_k
     let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
     //counter += 1;
     let mut omni_kmer_map_lock = omni_kmer_map.get(pos).unwrap().lock().unwrap();
-    if num2str(canon) == "AAAAAAAAACCATCCGATTATGGATGGTTTT"{
-        println!("VU");
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    }
     if file_number == 0{
         omni_kmer_map_lock.insert(canon, Cell::new(false));
     }else if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
@@ -271,7 +266,9 @@ fn handle_kmer(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_k
     }else{
         let mut multi_kmer_map_lock = multi_kmer_map.get(pos).unwrap().lock().unwrap();
         multi_kmer_map_lock.entry(canon).and_modify(|pair|{
-            pair.0.push(file_number.to_u16().unwrap());
+            if *pair.0.last().unwrap() != file_number.to_u16().unwrap(){
+                pair.0.push(file_number.to_u16().unwrap());
+            }
         }).or_insert_with(|| {
             (vec![file_number.to_u16().unwrap()], Cell::new(false))
         });
@@ -295,7 +292,9 @@ fn check_omni(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_km
                 to_remove += 1;
                 let mut multi_kmer_map_lock = multi_kmer_map.get(i).unwrap().lock().unwrap();
                 multi_kmer_map_lock.entry(*entry.0).and_modify(|pair|{
-                    pair.0.push(file_number.to_u16().unwrap());
+                    if *pair.0.last().unwrap() != file_number.to_u16().unwrap(){
+                        pair.0.push(file_number.to_u16().unwrap());
+                    }
                 }).or_insert_with(|| {
                     ((0..file_number.to_u16().unwrap()).collect(), Cell::new(false))
                 });
@@ -449,11 +448,6 @@ fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPA
         let mut kmer_iterator = kmer_map.iter();
         while let Some((key, curr_cell)) = kmer_iterator.next(){
             if !curr_cell.1.get(){
-                if num2str(*key) == "AAAAAAAAACCATCCGATTATGGATGGTTTT"{
-                    println!("VU MULTICOLOR");
-                    let mut input = String::new();
-                    io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                }
                 curr_cell.1.set(true);
                 let mut forward = true;
                 let mut backward = true;
@@ -490,11 +484,6 @@ CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
 fn extend_forward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &Vec<u16>, pos_curr_kmer: usize) -> bool{
     for succs in curr_kmer.successors(){
         let canon = succs.canonical().to_int();
-        if num2str(canon) == "AAAAAAAAACCATCCGATTATGGATGGTTTT"{
-            println!("VU EXTEND FORWARD MULTI");
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        }
         if let Some(succ_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&canon){
             if succ_pair.0.eq(color) & !succ_pair.1.get() {
                 simplitig.push(*succs.to_nucs().last().unwrap() as char);
@@ -526,11 +515,6 @@ INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
 fn extend_backward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &Vec<u16>, pos_curr_kmer: usize) -> bool{
     for preds in curr_kmer.predecessors(){
         let canon = preds.canonical().to_int();
-        if num2str(canon) == "AAAAAAAAACCATCCGATTATGGATGGTTTT"{
-            println!("VU EXTEND BACK MULTI");
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        }
         if let Some(pred_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&canon){
             if pred_pair.0.eq(color) & !pred_pair.1.get() {
                 simplitig.insert(0, *preds.to_nucs().first().unwrap() as char);
@@ -570,7 +554,7 @@ fn compute_cursor_start_pos(color_simplitig: &HashMap<Vec<u16>, (usize, Vec<usiz
 }
 // save simplitig as vec of u8, save taille reelle, pour obtenir la taille u8: taille reelle/4 arrondi sup.
 // COMME SUIT: 00110001 taille_a_lire U8U8U8U8U8
-// THEN ON LES LIT UN A UN POUR LES TRIER, LA TAILLE DOIT ETRE STOCKEE QQPART (COLOR_SIMPLITIG_SIZE ?)
+// THEN ON LES LIT UN A UN POUR LES TRIER, LA TAILLE DOIT ETRE STOCKEE QQPART (COLOR_SIMPLITIG_SIZE ?) 
 // ADDITION DES TAILLES/4 ARRONDI SUP POUR AVOIR LA TAILLE DU BUCKET ET AINSI CALCULER LES CURSEURS
 // REECRITURE TRIÉ PUIS COMPRESSION
 fn sort_simplitigs(color_simplitig: &mut HashMap<Vec<u16>, (usize, Vec<usize>)>, output_dir: &String ) {
@@ -587,9 +571,8 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<Vec<u16>, (usize, Vec<usize>)>,
     let file_size: usize = metadata.len() as usize;
     println!("FILE SIZE = {}", file_size);
     while cursor < file_size{
-        cursor+= COLOR_SIZE;
+        cursor+= 2;
         let mut ones = [0; 2];
-        cursor += 2;
         temp_multicolor_reader.read_exact(&mut ones).expect("Error reading color size in temp file");
         let nb_elem = u16::from_le_bytes(ones);
         //println!("NB ONES: {}", nb_elem);
@@ -599,6 +582,7 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<Vec<u16>, (usize, Vec<usize>)>,
             cursor += 2;
             temp_multicolor_reader.read_exact(&mut id).expect("Error reading color in temp file");
             positions.push(u16::from_le_bytes(id));
+
             //println!("FILE N°:{}", u16::from_le_bytes(id));
             //let mut input = String::new();
             //io::stdin().read_line(&mut input).expect("error: unable to read user input");
@@ -618,11 +602,6 @@ fn sort_simplitigs(color_simplitig: &mut HashMap<Vec<u16>, (usize, Vec<usize>)>,
         temp_multicolor_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
         //println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
         let str_simplitig = vec2str(&simplitig.to_vec(), &(size_simplitig as usize));
-        if str_simplitig.contains("AAAAAAAAACCATCCGATTATGGATGGTTTT"){
-            println!("VU SORT");
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        }
         //println!("SIMPLITIG: {}", str_simplitig);
         let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &positions);
         //println!("READING CURSOR = {}", cursor);
@@ -680,18 +659,28 @@ fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cur
         }
     }
     println!("COLOR = {}", str_color);
-    for e in &color_vec{
-        print!("{}", e);
+    */
+    /*if color_vec.contains(&101_u16){
+        for e in &color_vec{
+            print!("{}, ", e);
+        }
+        print!("\n");
+        print!("\n");
+    }*/
+    if let Some(position) = color_cursor_pos.get(&color_vec){
+        out_mult_file.seek(SeekFrom::Start(*position))?;
+        //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
+        out_mult_file.write_all(&content)?;
+        //*position += compressed.len() as u64;
+        //encoder.finish()?;
+        color_cursor_pos.entry(color_vec).and_modify(|cursor| {*cursor += content.len() as u64});
+        
+        Ok(())
+    }else{
+        panic!("ERROR WITH COLORS")
     }
-    print!("\n"); */
-    let position = color_cursor_pos.get(&color_vec).unwrap();
-    out_mult_file.seek(SeekFrom::Start(*position))?;
-    //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
-    out_mult_file.write_all(&content)?;
-    //*position += compressed.len() as u64;
-    //encoder.finish()?;
-    color_cursor_pos.entry(color_vec).and_modify(|cursor| {*cursor += content.len() as u64});
-    Ok(())
+    //let position = color_cursor_pos.get(&color_vec).unwrap();
+    
 }
 
 
@@ -702,8 +691,14 @@ fn write_interface_file(color_simplitig: &HashMap<Vec<u16>, (usize, Vec<usize>)>
     let mut color_file = Encoder::new(File::create(output_dir.clone()+"multicolor_bucket_size.txt.zst").expect("Unable to create file"), 12).unwrap();
     for (key, cursor_end) in color_cursor_pos{
         let mut color: String = String::new();
+        let mut i = 0;
         for e in key.iter(){
-            color.push_str(&e.to_string());
+            if i > 0{
+                color.push_str(&(String::from(";") + &e.to_string()));
+            }else {
+                color.push_str(&e.to_string());
+            }
+            i += 1;
         }
         let mut bucket_sizes = String::new();
         let curr_values = color_simplitig.get(&key).unwrap();
@@ -755,19 +750,10 @@ fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<Fil
     // let mut input = String::new();
     // io::stdin().read_line(&mut input).expect("error: unable to read user input");
     let size: u16 = color.len().try_into().unwrap();
-    if cpt <= 2{
-        println!("SIZE: {}", size);
-    }
+    
     multi_f.write_all(&size.to_le_bytes());
     for elem in color{
         multi_f.write_all(&elem.to_le_bytes()).expect("Unable to write color");
-        if cpt <= 2{
-            println!("ELEM: {}", elem);
-        }
-    }
-    if cpt <= 2{
-        println!("SIMPLITIG SIZE: {}", simplitig.len());
-        println!("{}", vec2str(simplitig, &(simplitig.len()*4).to_usize().unwrap()));
     }
     let mut simplitig_size:u32 = *size_str as u32;
     multi_f.write_all(&simplitig_size.to_le_bytes()).expect("Unable to write simplitig size");  

@@ -163,15 +163,15 @@ fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor
 }
 
 fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool){
-    println!("CURSOR BEFORE INCREMENT: {}", cursor);
+    //println!("CURSOR BEFORE INCREMENT: {}", cursor);
     if !to_read{
         *cursor = end_pos.parse::<u64>().unwrap();
-        println!("ADDING: {}", end_pos.parse::<u64>().unwrap());
+        //println!("ADDING: {}", end_pos.parse::<u64>().unwrap());
     }else{
         *cursor += end_pos.parse::<u64>().unwrap() - *cursor;
-        println!("ADDING: {} - {}", end_pos.parse::<u64>().unwrap(), cursor);
+        //println!("ADDING: {} - {}", end_pos.parse::<u64>().unwrap(), cursor);
     }
-    println!("cursor after increment: {}", cursor);
+    //println!("cursor after increment: {}", cursor);
 }
 
 fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut Vec<String>) -> (Vec<String>, Vec<usize>){
@@ -223,68 +223,23 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
     let mut counter_kmer = 0;
     let now = Instant::now();
     for (color, sizes, end_cursor_pos) in color_to_sizes.iter(){
-        let mut i = 0;
         for e in positions_in_color.iter(){
-            if let Some(curr_color) = color.get(i){
-                println!("CURR POS: {}", e);
-                println!("CURR COLOR: {}", curr_color);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                if &e.to_string() == *curr_color{
-                    to_read = true;
-                    break;
-                }
-            }
-            i += 1;
-        }
-        /*for i in positions_in_color.iter(){
-            if color.chars().nth(*i).unwrap() == '1'{
+            if color.contains(&e.to_string().as_str()){
                 to_read = true;
                 break;
             }
-        }*/
+        }
         if to_read{
             for size in sizes.iter(){
                 let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
                 let mut i:usize = 0;
                 for elem in positions_in_color{
-                    /*println!("ELEM: {}", elem);
-                    if *elem == 0{
-                        println!("COLOR: {}", color)
-                    }*/
-                    if let Some(curr_color) = color.get(i){
-                        if &elem.to_string() == *curr_color{
-                            counter_kmer += content.len()-30;
-                            if content.contains("AAAAAAAAACCATCCGATTATGGATGGTTTT"){
-                                println!("VU");
-                                let mut input = String::new();
-                                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                            }
-                            write_output(&content, files.get_mut(i).unwrap(), out_dir);
-                        }
-                    }
-                    /*if color.chars().nth(*elem).unwrap() == '1'{
-                        if color == "00100000" || color == "01000000"{
-                            if content == "TTTTTGTTTTTGCAAAGAGTAATTTCAAACTCCCTGTAAAAAGAGGCTTATTCGGTAAGGCTAAACATTTTGTGCGTTTTTTACTAAA" || content.contains("CGTCATCCATACCACGACCTCAAAGGCCGACAGCAGGCCCAGAAGACGCTCCAGCGTGGCCAACGTGCGTTACCTAAAACCTGTTTAAATATCCAGATAAAAACATTCAATCTGGGTCAAATGAGTGATACAGTTTCACCCATAAGACCCAATG"){
-                                println!("SIMPLITIG = {}", content);
-                                let mut input = String::new();
-                                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                            }
-                        }
-                        //println!("{}", color);
-                        /*if *elem == 0{
-                            println!("POS IN COLOR: {}", elem);
-                            println!("IS AT POS: {}", positions_in_color.iter().position(|pos| pos == elem).unwrap());
-                            let mut input = String::new();
-                            std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                        }*/
+                    if color.contains(&elem.to_string().as_str()){
                         counter_kmer += content.len()-30;
                         write_output(&content, files.get_mut(i).unwrap(), out_dir);
-                        //positions_in_color.iter().position(|pos| pos == elem).unwrap()
-                    }*/
+                    }
                     i+=1;
-                    //let mut input = String::new();
-                    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+                    
                     
                 }
             }
@@ -292,9 +247,7 @@ fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, out_dir: &Pat
         //println!("filename: {}", filenames.get(pos).unwrap());
         //println!("NB KMER = {}", counter);
         increment_cursor(&mut prev_cursor, end_cursor_pos, to_read);
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        to_read = false;
+       to_read = false;
     }
     let elapsed = now.elapsed();
     println!("Actual multicolor decompression took: {:.2?} seconds.", elapsed);
@@ -318,8 +271,8 @@ fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(Vec<&str>, Vec<&s
         }else{
             sizes_vec.push(sizes);
         }
-        if color.contains(','){
-            colors_vec = color.split(',').collect::<Vec<_>>();
+        if color.contains(';'){
+            colors_vec = color.split(';').collect::<Vec<_>>();
         }else {
             colors_vec.push(color);
         }
