@@ -1,5 +1,5 @@
 [package]
-name = "simple_compressor"
+name = "kloe"
 version = "0.1.0"
 edition = "2021"
 
@@ -18,7 +18,6 @@ bit-set = "0.5.3"
 bit-vec = "0.6.3"
 num-traits = "0.2.18"
 bitvec = "1.0.1"
-hashbrown = "0.14.3"
 miette = "5"
 zstd = "0.13.1"
 parking_lot = "0.12.3"

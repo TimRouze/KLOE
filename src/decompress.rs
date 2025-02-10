@@ -46,7 +46,7 @@ pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir:
     let mut filename_color_path = String::from("filename_to_color.txt");
     println!("{}", full_path.display());
     if let Some(parent_path) = full_path.parent() {
-        println!("a{}a", parent_path.display());
+        //println!("a{}a", parent_path.display());
         if parent_path.to_str().unwrap() != ""{
             color_size_path = String::from(parent_path.to_str().unwrap())+"/multicolor_bucket_size.txt.zst";
             filename_color_path = String::from(parent_path.to_str().unwrap())+"/filename_to_color.txt";
@@ -123,7 +123,7 @@ fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wante
     let mut filename_to_color: Vec<_> = filename_color_reader.lines().collect::<Result<_, _>>().unwrap();
     //Color to encoded size of bucket for this color.
     //Color is the array (e.g. 011001) The size is the size in bytes to be read for this specific bucket.
-    let color_size_file = File::open(out_dir.clone().join(color_size_path)).unwrap();
+    let color_size_file = File::open(color_size_path).unwrap();
     let color_size_reader = BufReader::new(color_size_file);
     let color_size_decoder = Decoder::new(color_size_reader).unwrap();
     let decoder_reader = BufReader::new(color_size_decoder);

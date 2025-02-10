@@ -46,12 +46,18 @@ struct Args {
     ///Output directory
     #[arg(short, long, default_value_t = String::from(""))]
     out_dir: String,
+    ///input directory for decompression
+    #[arg(short, long, default_value_t = String::from(""))]
+    input_dir: String,
     ///Number of expected k-mers
     #[arg(short = 'N', long, default_value_t = 1_000_000)]
     nb_elem: usize,
     ///List of files to decompress
     #[arg(short = 'Q', long, default_value_t = String::from(""))]
     wanted_files: String,
+    ///Input file of file
+    #[arg(short, long)]
+    file_of_file: Option<String>,
 }
 pub mod constants {
     include!("constants.rs");
@@ -65,8 +71,9 @@ const M: u8 = 7;
 fn main() {
     let args = Args::parse();
     let nb_elem = args.nb_elem;
-    println!("FILENAME: {}", INPUT_FOF);
+    
     let output_dir = args.out_dir;
+    let input_dir = args.input_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let file = File::open(INPUT_FOF).unwrap();
     let reader = io::BufReader::new(file);
@@ -157,8 +164,8 @@ fn main() {
         }*/
     }else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
-        println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -o out_dir/ -t 12");
-        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
+        println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
+        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
     }
 }
 
