@@ -23,7 +23,9 @@ zstd = "0.13.1"
 parking_lot = "0.12.3"
 crossbeam = "0.8.4"
 indexmap = "2.5.0"
-needletail = "0.6.1"
+needletail = {git = "https://github.com/onecodex/needletail.git", rev = "a4c203ef9a3d311e6e9daa8b8a0b5ccaa18e4ff7"}
+dashmap = "6.1.0"
+minimizer-iter = "1.2.1"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
@@ -31,3 +33,4 @@ miette = { version = "5", features = ["fancy"] }
 [profile.release]
 debug = true
 strip = false
+opt-level = 3

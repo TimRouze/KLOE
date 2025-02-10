@@ -1,14 +1,21 @@
 use bitvec::prelude::BitArray;
+use num_traits::ToPrimitive;
 use std::path::Path;
-use std::io;
+use std::{io, u64};
 use std::io::BufRead;
 use std::fs::File;
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use minimizer_iter::MinimizerBuilder;
 
 pub mod constants {
     include!("constants.rs");
 }
 use constants::{ARRAY_SIZE, K, KT};
+
+use crate::kmer::{Kmer, RawKmer};
 pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
 
 
@@ -143,4 +150,18 @@ pub fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where P: AsRef<Path>, {
     let file = File::open(filename)?;
     Ok(io::BufReader::new(file).lines())
+}
+pub fn find_min(kmer: RawKmer<K, KT>) -> u64{
+    let tampon = kmer.to_nucs();
+    let min_iter = MinimizerBuilder::<u64, _>::new_mod()
+    .minimizer_size(7)
+    .width(24)
+    .iter(&tampon);
+    let mut min = u64::MAX;
+    for (minimizer, position) in min_iter {
+        if minimizer < min{
+            min = minimizer;
+        }
+    }
+    min
 }
