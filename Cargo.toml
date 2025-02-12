@@ -1,5 +1,5 @@
 [package]
-name = "simple_compressor"
+name = "kloe"
 version = "0.1.0"
 edition = "2021"
 
