@@ -1,11 +1,10 @@
 #![allow(dead_code)]
-// WHILE NEEDLETAIL DOES NOT HANDLE ZST.
-extern crate needletail;
 
 mod utils;
 mod kmer;
 mod decompress;
 mod stats;
+mod graph_build;
 use clap::Parser;
 use num_traits::ToPrimitive;
 use stats::compute_stats;
@@ -34,12 +33,9 @@ struct Args {
     ///output: Option<String>,
     /// Decompression "compress" to compress input, "decompress" to decompress input, "stats" to get kmer stats
     decompress: Option<String>,
-    ///multicolor file (only for decompression)
+    ///unitigs file (only for decompression)
     #[arg(long, default_value_t=String::from(""))]
-    multicolor_file: String,
-    /// Omnicolor file (only for decompression)
-    #[arg(long, default_value_t=String::from(""))]
-    omnicolor_file: String,
+    unitigs_file: String,
     /// Number of threads (defaults to all available threads)
     #[arg(short, long, default_value_t = 1)]
     threads: usize,
@@ -89,20 +85,24 @@ fn main() {
     let wanted_path = args.wanted_files;
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
-            let multi_file = args.multicolor_file;
-            let omni_file = args.omnicolor_file;
-            if multi_file != "" && omni_file != ""{
+            let unitigs_file = args.unitigs_file;
+            graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, "".into(), &wanted_path);
+
+            /*if multi_file != "" && omni_file != ""{
                 decompress::decompress(&omni_file, &multi_file, INPUT_FOF, PathBuf::from(output_dir), &wanted_path);
             }else{
                 println!("Error, multicolor and/or omnicolor file(s) are mandatory");
-            }
+            }*/
         }else if do_decompress == "compress"{
             let mut filename_color = File::create("filename_to_color.txt").unwrap();
             
             for i in 0..NB_FILES{
                 writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
             }
-            let now = Instant::now();
+            graph_build::build_graphs();
+            graph_build::sort_by_bucket(&output_dir);
+
+            /*let now = Instant::now();
             let mut tot_nb_kmer: u64 = 0;
             (0..NB_FILES).for_each(|file_number|{
                 println!("{}", filenames.get(file_number).unwrap());
@@ -141,13 +141,12 @@ fn main() {
             let now = Instant::now();
             sort_simplitigs(&mut color_simplitig, &output_dir);
             let elapsed = now.elapsed();
-            println!("Sorting Simplitigs took: {:.2?} seconds.", elapsed);
+            println!("Sorting Simplitigs took: {:.2?} seconds.", elapsed);*/
         }else if do_decompress == "stats"{
-            let multi_file = args.multicolor_file;
-            let omni_file = args.omnicolor_file;
+            let unitigs_file = args.unitigs_file;
             let k = K;
-            if multi_file != "" && omni_file != ""{
-                compute_stats(&omni_file, &multi_file, &output_dir, &k);
+            if unitigs_file != ""{
+                compute_stats( &unitigs_file, &output_dir, &k);
             }else{
                 println!("Error, multicolor and/or omnicolor file(s) are mandatory");
             }

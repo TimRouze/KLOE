@@ -12,7 +12,7 @@ COMPUTES STATS FROM COMPRESSED OMNICOLOR AND MULTICOLOR FILES.
 3) NB KMER PER POPCOUNT
 
 */
-pub fn compute_stats(omnicolor: &str, multicolor: &str, out_dir: &str, k: &usize){
+pub fn compute_stats(multicolor: &str, out_dir: &str, k: &usize){
     let mut name = String::from(out_dir)+"kmer_per_color.txt";
     let mut kmer_per_color_file = File::create(name).expect("Unable to create file");
     name = String::from(out_dir)+"simplitig_per_simplitig size.txt";
@@ -24,28 +24,6 @@ pub fn compute_stats(omnicolor: &str, multicolor: &str, out_dir: &str, k: &usize
     let mut color_nb_kmer_map: HashMap<String, usize> = HashMap::new();
     let mut size_nb_simplitig_map: HashMap<usize, usize> = HashMap::new();
     let mut popcount_nb_kmer_map: HashMap<u64, usize> = HashMap::new();
-    while let Some(data) = fa_reader.next(){
-        let line = data.unwrap();
-        let id = String::from(line.id().unwrap());
-        color_nb_kmer_map.entry(id.clone())
-                        .and_modify(|nb_kmer| *nb_kmer += line.seq().len()-k+1)
-                        .or_insert(line.seq().len()-k+1);
-        size_nb_simplitig_map.entry(line.seq().len())
-                        .and_modify(|nb_kmer| *nb_kmer += 1)
-                        .or_insert(1);
-        let mut popcount = 0;
-        for bit in id.chars(){
-            if bit == '1'{
-                popcount += 1;
-            }
-        }
-        popcount_nb_kmer_map.entry(popcount)
-                             .and_modify(|nb_kmer| *nb_kmer += line.seq().len()-k+1)
-                             .or_insert(line.seq().len()-k+1);
-    }
-    let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
-    let mut fa_reader = Reader::new(reader);
-    //let mut counter = 0;
     while let Some(data) = fa_reader.next(){
         let line = data.unwrap();
         let id = String::from(line.id().unwrap());
