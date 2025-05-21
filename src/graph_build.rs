@@ -13,13 +13,13 @@ use crate::constants::{NB_FILES, INPUT_FOF};
 use crate::decompress;
 use crate::utils::{str2num, vec2str};
 
-pub fn build_graphs(){
+pub fn build_graphs(output_dir: &String){
 
     println!("Building Fulgor index");
 
     let output = Command::new("sh")
         .arg("-c")
-        .arg("./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + INPUT_FOF + " -o fulgor_index_unitigs")
+        .arg("./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + INPUT_FOF + " -o " + output_dir + "fulgor_index_unitigs")
         .output()
         .expect("failed to execute process");
     println!("{}", String::from_utf8(output.stdout).unwrap());
@@ -28,7 +28,7 @@ pub fn build_graphs(){
 
     let mut input_fof = BufReader::new(File::open(INPUT_FOF).expect("unable to create file"));
     let mut input_list = String::new();
-    let mut fof_id = BufWriter::new(File::create("filenames_id.txt").expect("Failed to create fof file"));
+    let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
     input_fof.read_to_string(&mut input_list);
     let mut cpt: u32 = 0;
     for filename in input_list.lines(){
@@ -39,7 +39,7 @@ pub fn build_graphs(){
     fof_id.flush();
     let output = Command::new("sh")
         .arg("-c")
-        .arg("./../fulgor/build/fulgor dump -i fulgor_index_unitigs.fur")
+        .arg("./../fulgor/build/fulgor dump -i ".to_owned() + output_dir + "fulgor_index_unitigs.fur -o " + output_dir)
         .output()
         .expect("failed to execute process");
     println!("{}", String::from_utf8(output.stdout).unwrap());
@@ -56,9 +56,9 @@ pub fn sort_by_bucket(output_dir: &String){
 
     
     // GET COLORING INFORMATION FOR DECOMPRESSION PURPOSES
-    id_to_color_vec = get_colors(String::from("fulgor_index_unitigs.color_sets.txt"));
+    id_to_color_vec = get_colors(String::from(output_dir.clone()+"fulgor_index_unitigs.color_sets.txt"));
     // COMPRESS UNITIGS
-    let mut sizes = write_compressed(output_dir.clone()+"tigs_kloe.fa");
+    let mut sizes = write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir);
     // WRITE BUCKET SIZES
     for elem in sizes{
         zstd_sizes.write_all(&elem.to_le_bytes());
@@ -92,11 +92,11 @@ fn get_colors(color_file_path: String) -> Vec<Vec<usize>>{
     id_to_color_vec
 }
 
-fn write_compressed(unitigs_file_path: String) -> Vec<usize>{
+fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<usize>{
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path).expect("unable to create file"));
     let mut cpt = 0;
     let mut nb_kmer = 0;
-    let unitigs_file = File::open("fulgor_index_unitigs.unitigs.fa").unwrap();
+    let unitigs_file = File::open(output_dir.clone() + "fulgor_index_unitigs.unitigs.fa").unwrap();
     let mut reader = BufReader::new(unitigs_file);
     let mut line_iter = reader.lines().into_iter();
     let mut curr_id = 0;
@@ -167,23 +167,23 @@ fn write_sizes(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>){
     cid_encoder.finish();
 }
 
-pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_filename: String, out_dir: PathBuf, wanted_files_path: &str){
+pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_filename: String, out_dir: &String, wanted_files_path: &str){
     let mut input_file = File::open(INPUT_FOF).unwrap();
     let reader = BufReader::new(input_file);
     let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
     
     // ===================================== READ IDS TO COLOR IDS AND CREATE CID TO IDS MAP ============================================================== //
-    let mut cid_to_id_map = get_cid_to_id(out_dir.clone().join(&color_id_filename));
+    let mut cid_to_id_map = get_cid_to_id(&(out_dir.clone() + &color_id_filename));
     
     // =================================================== READ COLOR IDS TO COLOR BUCKET SIZES ============================================================= //
-    let mut sizes = get_cid_to_bucket_size(out_dir.clone().join(&size_filename), cid_to_id_map.len());
+    let mut sizes = get_cid_to_bucket_size(&(out_dir.clone() + &size_filename), cid_to_id_map.len());
 
     // ============================================================== FILTER NECESSARY IDS =================================================================== //
     
     let input_fof: File;
 
     if wanted_files_path != ""{
-        decompress_wanted(wanted_files_path, "filenames_id.txt", cid_to_id_map, tigs_filename, &sizes);
+        decompress_wanted(wanted_files_path, &(out_dir.clone() + "filenames_id.txt"), cid_to_id_map, tigs_filename, &sizes);
         
     }else{
         decompress_all(&sizes, cid_to_id_map, tigs_filename);
@@ -194,7 +194,7 @@ pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_fi
 
 }
 
-fn get_cid_to_id(color_id_filename: PathBuf) -> HashMap<String, Vec<u32>>{
+fn get_cid_to_id(color_id_filename: &String) -> HashMap<String, Vec<u32>>{
     let mut color_id_file = BufReader::new(File::open(color_id_filename).expect("Error opening color id file, are you sur you gave the right path ?"));
     let mut color_id_decoder = Decoder::new(color_id_file).expect("Failed to decode color file");
     let mut colors = String::new();
@@ -216,7 +216,7 @@ fn get_cid_to_id(color_id_filename: PathBuf) -> HashMap<String, Vec<u32>>{
     ids
 }
 
-fn get_cid_to_bucket_size(size_filename: PathBuf, nb_color: usize) -> Vec<usize>{
+fn get_cid_to_bucket_size(size_filename: &String, nb_color: usize) -> Vec<usize>{
     let mut size_file = BufReader::new(File::open(size_filename).expect("Error opening size file, are you sure path is good?"));
     let mut size_decoder = Decoder::new(size_file).expect("Failed to decode color file");
     let mut sizes = Vec::new();
@@ -229,7 +229,7 @@ fn get_cid_to_bucket_size(size_filename: PathBuf, nb_color: usize) -> Vec<usize>
 }
 
 fn decompress_wanted(wanted_files_path: &str, filename_to_id: &str, cid_to_id_map: HashMap<String, Vec<u32>>, tigs_filename: String, sizes: &Vec<usize>){
-    let mut wanted_ids = get_to_decompress(wanted_files_path, "filenames_id.txt", &cid_to_id_map);
+    let mut wanted_ids = get_to_decompress(wanted_files_path, filename_to_id, &cid_to_id_map);
     //let mut tigs_decoder = Decoder::new(tigs_file).expect("Failed to decode tigs file");
 
     // CREATE/OPEN FILENAMES

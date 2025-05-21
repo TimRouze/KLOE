@@ -86,7 +86,7 @@ fn main() {
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
             let unitigs_file = args.unitigs_file;
-            graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, "".into(), &wanted_path);
+            graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path);
 
             /*if multi_file != "" && omni_file != ""{
                 decompress::decompress(&omni_file, &multi_file, INPUT_FOF, PathBuf::from(output_dir), &wanted_path);
@@ -99,7 +99,7 @@ fn main() {
             for i in 0..NB_FILES{
                 writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
             }
-            graph_build::build_graphs();
+            graph_build::build_graphs(&output_dir);
             graph_build::sort_by_bucket(&output_dir);
 
             /*let now = Instant::now();
