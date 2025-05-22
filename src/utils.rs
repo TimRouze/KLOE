@@ -1,23 +1,17 @@
 use bitvec::prelude::BitArray;
-use num_traits::ToPrimitive;
 use std::path::Path;
 use std::{io, u64};
 use std::io::BufRead;
 use std::fs::File;
-use std::cell::Cell;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 use minimizer_iter::MinimizerBuilder;
 
 pub mod constants {
     include!("constants.rs");
 }
-use constants::{ARRAY_SIZE, K, KT};
+use constants::{K, KT};
 
 use crate::kmer::{Kmer, RawKmer};
-pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
-
 
 pub fn extract_filename(path: &str) -> Option<&str> {
     // Split the path by '/'
@@ -35,7 +29,7 @@ pub fn extract_filename(path: &str) -> Option<&str> {
     }
 }
 
-pub fn char_array_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>{
+/*pub fn char_array_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>{
     let mut bit_array = BitArray::<[u8; ARRAY_SIZE]>::ZERO;
     let mut cpt = 0;
     let seq_str = std::str::from_utf8(seq).unwrap();
@@ -49,7 +43,7 @@ pub fn char_array_to_bitarray(seq: &[u8]) -> bitvec::prelude::BitArray<[u8; ARRA
         cpt += 1;
     });
     bit_array
-}
+}*/
 
 pub fn vec2str(seq: &Vec<u8>, size: &usize) -> String{
     let mut res = String::from("");

@@ -20,33 +20,9 @@ fn build_constants() -> miette::Result<()>  {
     let kt = select_type(kmer_bits);
     code.push(format!("pub type KT = {kt};"));
 
-    let input = std::env::var("I")
-        .unwrap();
-    println!("\nFOF READ IN BUILD: {}\n", input);
-    if let Ok(lines_temp) = read_lines(&input){
-        let mut nb_files = lines_temp.count();
-        code.push(format!("pub const NB_FILES: usize = {nb_files};"));
-        if nb_files == 1{
-            nb_files = 1;
-        }
-        else if nb_files%8 == 0{
-            nb_files = ((nb_files-1)/8)+1;
-        }else{
-            nb_files = (nb_files/8)+1
-        }
-        code.push(format!("pub const ARRAY_SIZE: usize = {nb_files};"));
-        code.push(format!("pub const INPUT_FOF: &str = \"{input}\";"));
-    }
-
     std::fs::write(out_dir.join("constants.rs"), code.join("\n"))
         .expect("Failed to write const file");
     Ok(())
-}
-
-fn read_lines<P>(filename: P) -> std::io::Result<std::io::Lines<std::io::BufReader<std::fs::File>>>
-where P: AsRef<std::path::Path>, {
-    let file = std::fs::File::open(filename)?;
-    Ok(std::io::BufReader::new(file).lines())
 }
 
 fn select_type(n_bits: usize) -> &'static str {
