@@ -47,7 +47,7 @@ struct Args {
     out_dir: String,
     ///input directory for decompression
     #[arg(short, long, default_value_t = String::from(""))]
-    input_dir: String,
+    compressed_dir: String,
     ///Number of expected k-mers
     #[arg(short = 'N', long, default_value_t = 1_000_000)]
     nb_elem: usize,
@@ -72,7 +72,7 @@ fn main() {
     let nb_elem = args.nb_elem;
     
     let output_dir = args.out_dir;
-    let input_dir = args.input_dir;
+    let input_dir = args.compressed_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
@@ -88,7 +88,7 @@ fn main() {
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
             let unitigs_file = args.unitigs_file;
-            graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_fof);
+            graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
 
             /*if multi_file != "" && omni_file != ""{
                 decompress::decompress(&omni_file, &multi_file, INPUT_FOF, PathBuf::from(output_dir), &wanted_path);

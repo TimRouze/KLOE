@@ -2,9 +2,10 @@
 use std::collections::HashMap;
 use std::process::Command;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write, Result};
 use std::path::Path;
 
+use rayon::prelude::*;
 use zstd::{Decoder, Encoder};
 
 
@@ -68,7 +69,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32){
 fn get_colors(color_file_path: String, nb_files: u32) -> Vec<Vec<usize>>{
     let color_file = File::open(color_file_path).unwrap();
     let color_reader = BufReader::new(color_file);
-    let color_list: Vec<_> = color_reader.lines().collect::<Result<_, _>>().unwrap();
+    let color_list: Vec<_> = color_reader.lines().collect::<Result<_>>().unwrap();
     let mut id_to_color_vec: Vec<Vec<_>> = vec![Vec::new(); nb_files as usize];
 
     println!("GATHERING COLORS");
@@ -96,7 +97,6 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<usize
     let mut curr_id = 0;
     let mut to_write = String::new();
     let mut sizes = Vec::new();
-
     while let Some(line) = line_iter.next(){
         let line = line.expect("Error reading record").clone();
         if line.starts_with(">"){
@@ -161,11 +161,22 @@ fn write_sizes(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>){
     cid_encoder.finish();
 }
 
-pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_filename: String, out_dir: &String, wanted_files_path: &str, input_fof: &String){
-    let input_file = File::open(input_fof).unwrap();
+pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_filename: String, out_dir: &String, wanted_files_path: &str, input_dir: &String) -> std::io::Result<()>{
+    //INPUT DIR + LES FILENAMES NECESSAIRES
+    //FIRST: FILENAME_ID
+    //SECOND: ID_COLOR_ID
+    //THIRD: BUCKET_SIZES
+    //FOURTH: TIGS_KLOE
+    let input_file = File::open(input_dir.to_owned()+"filenames_id.txt").unwrap();
     let reader = BufReader::new(input_file);
-    let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
-    
+    let mut filenames = Vec::new();
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if let Some((path, _useless)) = line.split_once(':') {
+            filenames.push(path.to_string());
+        }
+    }
+    println!("OUTDIR: {}", out_dir);
     // ===================================== READ IDS TO COLOR IDS AND CREATE CID TO IDS MAP ============================================================== //
     let cid_to_id_map = get_cid_to_id(&(out_dir.clone() + &color_id_filename));
     
@@ -175,12 +186,11 @@ pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_fi
     // ============================================================== FILTER NECESSARY IDS =================================================================== //
 
     if wanted_files_path != ""{
-        decompress_wanted(wanted_files_path, &(out_dir.clone() + "filenames_id.txt"), cid_to_id_map, tigs_filename, &sizes, out_dir);
-        
+        decompress_wanted(wanted_files_path, filenames, cid_to_id_map, tigs_filename, &sizes, out_dir);
     }else{
         decompress_all(&sizes, cid_to_id_map, tigs_filename, out_dir, filenames);
     }
-
+    Ok(())
     //TODO
     // build unitig graph for each output using ggcat
 
@@ -220,8 +230,8 @@ fn get_cid_to_bucket_size(size_filename: &String, nb_color: usize) -> Vec<usize>
     sizes
 }
 
-fn decompress_wanted(wanted_files_path: &str, filename_to_id: &str, cid_to_id_map: HashMap<String, Vec<u32>>, tigs_filename: String, sizes: &Vec<usize>, out_dir: &String){
-    let mut wanted_ids = get_to_decompress(wanted_files_path, filename_to_id, &cid_to_id_map);
+fn decompress_wanted(wanted_files_path: &str, input_filenames: Vec<String>, cid_to_id_map: HashMap<String, Vec<u32>>, tigs_filename: String, sizes: &Vec<usize>, out_dir: &String){
+    let mut wanted_ids = get_to_decompress(wanted_files_path, input_filenames, &cid_to_id_map);
     //let mut tigs_decoder = Decoder::new(tigs_file).expect("Failed to decode tigs file");
 
     // CREATE/OPEN FILENAMES
@@ -286,13 +296,7 @@ fn decompress_needed(sizes: &Vec<usize>, wanted_ids: HashMap<String, Vec<usize>>
     }
 }
 
-fn get_to_decompress(wanted_files_path: &str, filename_to_id: &str, cids_to_files: &HashMap<String, Vec<u32>>) -> HashMap<String, Vec<usize>>{
-    let filename_to_id_file = File::open(filename_to_id).unwrap();
-    let mut ftoi_reader = BufReader::new(filename_to_id_file);
-    let mut ftoi = String::new();
-    ftoi_reader.read_to_string(&mut ftoi);
-
-
+fn get_to_decompress(wanted_files_path: &str, input_filenames: Vec<String>, cids_to_files: &HashMap<String, Vec<u32>>) -> HashMap<String, Vec<usize>>{
     let input_fof = File::open(wanted_files_path).unwrap();
     let mut reader = BufReader::new(input_fof);
     let mut filenames = String::new();
@@ -301,7 +305,7 @@ fn get_to_decompress(wanted_files_path: &str, filename_to_id: &str, cids_to_file
     
     let mut wanted_ids = Vec::new();
     println!("{}", filenames);
-    for filename in ftoi.lines(){
+    for filename in input_filenames{
         println!("a{}a", filename);
         let curr_filename = filename.split(":").collect::<Vec<_>>()[0].parse::<String>().unwrap();
         if filenames.contains(&curr_filename){
@@ -328,10 +332,8 @@ fn get_to_decompress(wanted_files_path: &str, filename_to_id: &str, cids_to_file
 fn decompress_all(sizes: &Vec<usize>, cid_to_ids: HashMap<String, Vec<u32>>, tigs_filename: String, out_dir: &String, filenames: Vec<String>){
     let mut nb_kmers = 0;
     let mut concat_file = BufWriter::new(File::create(String::from("concat_all") + ".fa").expect("Unable to create file"));
-
     let mut tigs_file = BufReader::new(File::open(&tigs_filename).expect("Error opening tigs file, are you sure path is good?"));
     //let mut tigs_decoder = Decoder::new(tigs_file).expect("Failed to decode tigs file");
-    let mut prev_size: usize = 0; // ;-)
     let mut counter = 0;
     concat_file.write_all(b">\n");
     for size in sizes{
@@ -349,11 +351,12 @@ fn decompress_all(sizes: &Vec<usize>, cid_to_ids: HashMap<String, Vec<u32>>, tig
         for elem in curr_output{
             let curr_filename = filenames.get(*elem as usize).unwrap();
             println!("{}", curr_filename);
-            let mut out_file = BufWriter::new(File::options().append(true).create(true).open(out_dir.to_owned() + "Dump_" + curr_filename).expect("Unable to create file"));
+            let trunc_filename = Path::new(curr_filename).file_stem().unwrap();
+            let mut out_file = BufWriter::new(File::options().append(true).create(true).open(out_dir.to_owned() + "Dump_" + trunc_filename.to_str().unwrap()).expect("Unable to create file"));
             out_file.write_all(&clear_color_bucket);
             out_file.flush();
         }
-        let mut output = String::from_utf8(clear_color_bucket).unwrap();
+        let output = String::from_utf8(clear_color_bucket).unwrap();
         for line in output.lines(){
             nb_kmers += line.len() - 30;
             concat_file.write_all(&line.as_bytes());
