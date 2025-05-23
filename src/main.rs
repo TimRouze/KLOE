@@ -75,6 +75,7 @@ fn main() {
     let input_dir = args.input_dir;
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
+    let threads = args.threads;
     //let mut omni_kmer_map: Arc<Mutex<HashMap<KT, Cell<bool>>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/2)));
     //let mut multi_kmer_map: Arc<Mutex<HashMap<KT, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/2)));
     /*let mut omni_vec_o_maps: Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>> = Vec::new();
@@ -101,7 +102,7 @@ fn main() {
             // for i in 0..NB_FILES{
             //     writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
             // }
-            graph_build::build_graphs(&output_dir, &input_fof);
+            graph_build::build_graphs(&output_dir, &input_fof, &threads);
 
             /*let now = Instant::now();
             let mut tot_nb_kmer: u64 = 0;
