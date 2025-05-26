@@ -92,12 +92,36 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<usize
     let mut cpt = 0;
     let mut nb_kmer = 0;
     let unitigs_file = File::open(output_dir.clone() + "fulgor_index_unitigs.unitigs.fa").unwrap();
-    let reader = BufReader::new(unitigs_file);
-    let mut line_iter = reader.lines().into_iter();
+    let mut reader = BufReader::new(unitigs_file);
     let mut curr_id = 0;
     let mut to_write = String::new();
     let mut sizes = Vec::new();
-    while let Some(line) = line_iter.next(){
+    let mut line = String::new();
+    let mut size_read = reader.read_line(&mut line);
+    while size_read.unwrap() != 0{
+        line.pop();
+        if line.starts_with(">"){
+            let color_id: usize = line.split(" ").collect::<Vec<_>>()[2].split("=").collect::<Vec<_>>()[1].parse().unwrap();
+            if curr_id != color_id{
+                curr_id = color_id;
+                
+                sizes.push(write_in_file(&mut omni_file, to_write.clone()));
+                //omni_file.write_all(to_write.as_bytes());
+                to_write.clear();
+            }
+        }else{
+            cpt += 1;
+            nb_kmer += line.len()-30;
+            if to_write.is_empty(){
+                to_write.push_str(&line);
+            }else{
+                to_write.push_str(&("\n".to_owned() + &line));
+            }
+        }
+        line.clear();
+        size_read = reader.read_line(&mut line);
+    }
+    /*while let Some(line) = line_iter.next(){
         let line = line.expect("Error reading record").clone();
         if line.starts_with(">"){
             let color_id: usize = line.split(" ").collect::<Vec<_>>()[2].split("=").collect::<Vec<_>>()[1].parse().unwrap();
@@ -117,7 +141,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<usize
                 to_write.push_str(&("\n".to_owned() + &line));
             }
         }
-    }
+    }*/
     if !to_write.is_empty(){
         sizes.push(write_in_file(&mut omni_file, to_write.clone()));
         to_write.clear();
