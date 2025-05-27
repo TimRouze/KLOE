@@ -54,9 +54,10 @@ struct Args {
     ///List of files to decompress
     #[arg(short = 'Q', long, default_value_t = String::from(""))]
     wanted_files: String,
-    ///Input file of file
-    #[arg(short, long)]
-    file_of_file: Option<String>,
+    ///Temporary directory for graph construction
+    #[arg(short = 'd', long, default_value_t = String::from(""))]
+    temp_dir: String,
+
 }
 pub mod constants {
     include!("constants.rs");
@@ -76,6 +77,7 @@ fn main() {
     env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
+    let temp_dir = args.temp_dir;
     //let mut omni_kmer_map: Arc<Mutex<HashMap<KT, Cell<bool>>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/2)));
     //let mut multi_kmer_map: Arc<Mutex<HashMap<KT, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/2)));
     /*let mut omni_vec_o_maps: Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>> = Vec::new();
@@ -102,7 +104,7 @@ fn main() {
             // for i in 0..NB_FILES{
             //     writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
             // }
-            graph_build::build_graphs(&output_dir, &input_fof, &threads);
+            graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir);
 
             /*let now = Instant::now();
             let mut tot_nb_kmer: u64 = 0;

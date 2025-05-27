@@ -8,14 +8,13 @@ use std::path::Path;
 use rayon::prelude::*;
 use zstd::{Decoder, Encoder};
 
-
-pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize){
+pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize, tmp_dir: &String){
 
     println!("Building Fulgor index");
 
     let output = Command::new("sh")
         .arg("-c")
-        .arg("./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string())
+        .arg("./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir)
         .output()
         .expect("failed to execute process");
     println!("{}", String::from_utf8(output.stdout).unwrap());
