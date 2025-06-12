@@ -44,7 +44,7 @@ Then simply run:
 # TARGETED DECOMPRESSION
 ./target/release/kloe decompress --omnicolor-file omnicolor.kloe --multicolor-file multicolor.kloe --wanted-files TARGET/FILES/LIST
 ```
-### Compile time parameters
+## Compile time parameters
 There are two parameters that should be given during build.
 
 #### Input File of File I=
@@ -53,7 +53,7 @@ The input file of fasta files.
 #### K-mer size -k
 length of the k-mers used.
 
-### Compression parameters
+## Compression parameters
 When running kloe in compression mode, add "compress" before any other parameter.
 
 #### Threads used -t
@@ -64,7 +64,7 @@ The default value is 1 thread.
 The output directory where the compressed archive should be written.
 Default is current directory
 
-## Archive decompression
+## Decompression parameters
 When running kloe in compression mode, add "decompress" before any other parameter.
 
 #### Omnicolored file --omnicolor-file
