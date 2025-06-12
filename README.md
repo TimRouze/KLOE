@@ -3,13 +3,23 @@
 KLOE is a compressor for unitigs file such as those present on the [Logan](https://github.com/IndexThePlanet/Logan) database. It takes as input a file of file containing the unitigs filepaths to be compressed.
 The main interest of this tool is to allow efficient targeted decompression (decompressing a subpart of what is present in the compressed archive). The tool is a proof of concept aiming to show the interest of such decompression and how it can be used to compress immense databases while authorising the use of the data without needing the computing ressources to handle the entirety of it. 
 
+## Installation
 
-## Compilation
-Download source code from Github
+If you do not have rust installed on your computer, follow this [link](https://rustup.rs/) and follow the instructions.
+
+Then, clone this repository and go in the 'KLOE' folder created.:
 
 ```sh
 git clone  https://github.com/TimRouze/KLOE
 cd KLOE
+```
+With this version, it is necessary to build the project again each time you change the input file of file and the k-mer size typing this command (replacing the path by the one of your file of file): 
+```sh
+I="PATH/TO/FOF" K=31 cargo build -r
+```
+Then, the executable will be in the following folder:
+```sh
+target/release/
 ```
 
 ## Usage example
