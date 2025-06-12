@@ -1,4 +1,8 @@
 # kloe
+## Goal
+KLOE is a compressor for unitigs file such as those present on the [Logan](https://github.com/IndexThePlanet/Logan) database. It takes as input a file of file containing the unitigs filepaths to be compressed.
+The main interest of this tool is to allow efficient targeted decompression (decompressing a subpart of what is present in the compressed archive). The tool is a proof of concept aiming to show the interest of such decompression and how it can be used to compress immense databases while authorising the use of the data without needing the computing ressources to handle the entirety of it. 
+
 
 ## Compilation
 Download source code from Github
