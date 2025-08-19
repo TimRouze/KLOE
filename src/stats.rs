@@ -1,7 +1,6 @@
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use nuc2bit::popcount;
 use seq_io::fasta::{Reader, Record};
 
 /*
@@ -12,7 +11,7 @@ COMPUTES STATS FROM COMPRESSED OMNICOLOR AND MULTICOLOR FILES.
 3) NB KMER PER POPCOUNT
 
 */
-pub fn compute_stats(multicolor: &str, out_dir: &str, k: &usize){
+pub fn compute_stats(multicolor: &str, out_dir: &str, k: &usize) -> Result<(), Box<dyn std::error::Error>>{
     let mut name = String::from(out_dir)+"kmer_per_color.txt";
     let mut kmer_per_color_file = File::create(name).expect("Unable to create file");
     name = String::from(out_dir)+"simplitig_per_simplitig size.txt";
@@ -61,17 +60,18 @@ pub fn compute_stats(multicolor: &str, out_dir: &str, k: &usize){
         }*/
         counter += 1;
         //writeln!(file, "{}: {}", key_str, value)?;
-        writeln!(kmer_per_color_file, "{}", value);
+        writeln!(kmer_per_color_file, "{}", value)?;
     }
     for(key, value) in size_nb_simplitig_map{
         counter_2 += 1;
-        writeln!(simplitig_per_simplitig_size_file, "{}: {}", key, value);
+        writeln!(simplitig_per_simplitig_size_file, "{}: {}", key, value)?;
     }
     for(key, value) in popcount_nb_kmer_map{
         counter_3 += 1;
-        writeln!(kmer_per_popcount_file, "{}: {}", key, value);
+        writeln!(kmer_per_popcount_file, "{}: {}", key, value)?;
     }
     println!("Wrote {} lines in kmer per color file.", counter);
     println!("Wrote {} lines in kmer per simplitig size file.", counter_2);
     println!("Wrote {} lines in kmer per popcount file.", counter_3);
+    Ok(())
 }

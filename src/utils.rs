@@ -1,4 +1,3 @@
-use bitvec::prelude::BitArray;
 use std::path::Path;
 use std::{io, u64};
 use std::io::BufRead;
@@ -152,7 +151,7 @@ pub fn find_min(kmer: RawKmer<K, KT>) -> u64{
     .width(24)
     .iter(&tampon);
     let mut min = u64::MAX;
-    for (minimizer, position) in min_iter {
+    for (minimizer, _position) in min_iter {
         if minimizer < min{
             min = minimizer;
         }
