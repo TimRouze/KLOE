@@ -35,13 +35,13 @@ pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize, tm
     if tmp_dir == ""{
         output = Command::new("sh")
             .arg("-c")
-            .arg("./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -g " + &memory.to_string())
+            .arg("\\time ./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -g " + &memory.to_string())
             .output()
             .expect("failed to execute process");
     }else{
         output = Command::new("sh")
             .arg("-c")
-            .arg("./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir + " -g " + &memory.to_string())
+            .arg("\\time ./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir + " -g " + &memory.to_string())
             .output()
             .expect("failed to execute process");
     }
@@ -64,7 +64,7 @@ pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize, tm
     println!("./../fulgor/build/fulgor dump -i {} fulgor_index_unitigs.fur", output_dir);
     let output = Command::new("sh")
         .arg("-c")
-        .arg("./../fulgor/build/fulgor dump -i ".to_owned() + output_dir + "fulgor_index_unitigs.fur")
+        .arg("\\time ./../fulgor/build/fulgor dump -i ".to_owned() + output_dir + "fulgor_index_unitigs.fur")
         .output()
         .expect("failed to execute process");
     println!("{}", String::from_utf8(output.stdout).unwrap());
@@ -140,23 +140,22 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<(usiz
     let mut curr_id = 0;
     //let mut to_write = Vec::new();
     let mut line = String::new();
-    let mut size_read = reader.read_line(&mut line);
+    //let mut size_read = reader.read_line(&mut line);
 
     let mut pos_nb_unitig: Vec<(usize,usize)> = Vec::new();
     let mut unitigs_sizes_list: Vec<(Vec<u8>, usize)> = Vec::new();
-
-    //let mut prev = 0_usize;
-    while size_read.unwrap() != 0{
+    println!("READING FULGOR DUMP");
+    while reader.read_line(&mut line).unwrap() != 0{
+    //while size_read.unwrap() != 0{
         line.pop();
+        // println!("{}", line);
+        // let mut input = String::new();
+        // std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
         if line.starts_with(">"){
             let color_id: usize = line.split(" ").collect::<Vec<_>>()[2].split("=").collect::<Vec<_>>()[1].parse().unwrap();
             if curr_id != color_id{
-                if curr_id == 7{
-                    println!("coucou");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                }
                 //prev = 0;
+                println!("CHANGING COLOR, DUMPING CURRENT COLOR");
                 unitigs_sizes_list.sort_by(|a, b| a.1.cmp(&b.1));
                 // println!("================================ COLOR ID {} ================================================", curr_id);
                 // for e in &unitigs_list{ 
@@ -173,14 +172,6 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<(usiz
                     let delta_encoded: usize = pair.1 - prev;
                     sizes_encoder.write_all(&delta_encoded.to_le_bytes());
                     nb_unitig += 1;
-                    if vec2str(&pair.0,&pair.1).contains("TAAACCAACGTATTCGATAAGACCGTCAACA")  || vec2str(&pair.0,&pair.1).contains("TGTTGACGGTCTTATCGAATACGTTGGTTTA"){
-                        println!("TIG CLEAR: {}", vec2str(&pair.0, &pair.1));
-                        println!("Size: {}\nDelta encoded size: {}\nPrev: {}\n2Bit encoded size: {}", pair.1, (pair.1 - prev), prev, pair.0.len());
-                        println!("COLOR: {}", curr_id);
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                    }
-                    
                     prev = pair.1;
                     //println!("{curr_id}");
                 }
@@ -194,13 +185,6 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<(usiz
         }else{
             nb_lines_dna += 1;
             nb_kmer += line.len()-30;
-            if line.contains("TAAACCAACGTATTCGATAAGACCGTCAACA") || line.contains("TGTTGACGGTCTTATCGAATACGTTGGTTTA"){
-                println!("TIG: {}", line);
-                println!("Size: {}", line.len());
-                println!("VECTORIZED: {}", vec2str(&str2num(&line), &line.len()));
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-            }
             // TODO DELTA ENCODING MUST BE DONE AFTER SORTING, NOT HERE BUT WHEN CHANGING COLOR BUCKET. 
             //      FIND A WAY TO DO SO
             //sizes_encoder.write_all(&(line.len() - prev).to_le_bytes());
@@ -215,7 +199,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<(usiz
             unitigs_sizes_list.push((str2num(&line), line.len()));
         }
         line.clear();
-        size_read = reader.read_line(&mut line);
+        //size_read = reader.read_line(&mut line);
     }
     if !unitigs_sizes_list.is_empty(){
         let mut prev = 0;
@@ -228,13 +212,6 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Vec<(usiz
             sizes_encoder.write_all(&(pair.1 - prev).to_le_bytes());
             prev = pair.1;
             nb_unitig += 1;
-            if vec2str(&pair.0,&pair.1).contains("TAAACCAACGTATTCGATAAGACCGTCAACA")  || vec2str(&pair.0,&pair.1).contains("TGTTGACGGTCTTATCGAATACGTTGGTTTA"){
-                println!("TIG CLEAR: {}", vec2str(&pair.0, &pair.1));
-                println!("Size: {}\nDelta encoded size: {}\nPrev: {}\n2Bit encoded size: {}", pair.1, (pair.1 - prev), prev, pair.0.len());
-                println!("COLOR: {}", curr_id);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-            }
         }
         pos_nb_unitig.push((total_size, nb_unitig));
         unitigs_sizes_list.clear();
@@ -356,8 +333,8 @@ fn decompress_all(size_filename: &String, positions: &Vec<(usize, usize)>, tigs_
         println!("BUCKET SIZE: {}", positions.get(i+1).unwrap().0);
         println!("I = {}", i);
         println!("CURSOR: {}", bucket_cursor);
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        //let mut input = String::new();
+        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
         while bucket_cursor < positions.get(i+1).unwrap().0{
             size_decoder.read_exact(&mut size_buf);
             let size = usize::from_le_bytes(size_buf)+prev;
@@ -369,26 +346,20 @@ fn decompress_all(size_filename: &String, positions: &Vec<(usize, usize)>, tigs_
             tigs_file.read_exact(&mut bucket_buffer);
             let tig = vec2str(&bucket_buffer, &size);
             let curr_output_files = cid_to_id_map.get(&i.to_string()).unwrap();
-            if tig.contains("TAAACCAACGTATTCGATAAGACCGTCAACA")  || tig.contains("TGTTGACGGTCTTATCGAATACGTTGGTTTA"){
-                println!("SIZE READ: {}", usize::from_le_bytes(size_buf));
-                println!("UNITIG SIZE (STRING) {}", size);
-                println!("READING SIZE: {}", size.div_ceil(4));
-                println!("POS FIN CURR BUCKET: {}", positions.get(i+1).unwrap().0);
-                println!("CURR POS IN BUCKET: {}", bucket_cursor);
-                println!("I = {}", i);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                println!("TIG: {}", tig);
-                println!("NB FILE: {}", curr_output_files.len());
-            }
+            // if tig.contains("TAAACCAACGTATTCGATAAGACCGTCAACA")  || tig.contains("TGTTGACGGTCTTATCGAATACGTTGGTTTA"){
+            //     println!("SIZE READ: {}", usize::from_le_bytes(size_buf));
+            //     println!("UNITIG SIZE (STRING) {}", size);
+            //     println!("READING SIZE: {}", size.div_ceil(4));
+            //     println!("POS FIN CURR BUCKET: {}", positions.get(i+1).unwrap().0);
+            //     println!("CURR POS IN BUCKET: {}", bucket_cursor);
+            //     println!("I = {}", i);
+            //     let mut input = String::new();
+            //     std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+            //     println!("TIG: {}", tig);
+            //     println!("NB FILE: {}", curr_output_files.len());
+            // }
             // WRITE TIG IN EVERY FILE PRESENT IN CURRENT COLOR SET
             for elem in curr_output_files{
-                if tig.contains("TAAACCAACGTATTCGATAAGACCGTCAACA")  || tig.contains("TGTTGACGGTCTTATCGAATACGTTGGTTTA"){
-                    println!("FILE NB: {}", elem);
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                    println!("TIG: {}", tig);
-                }
                 let curr_filename = filenames.get(*elem as usize).unwrap();
                 //println!("FILE NUMBER: {}", elem);
                 //println!("a{}a", curr_filename);
@@ -402,40 +373,6 @@ fn decompress_all(size_filename: &String, positions: &Vec<(usize, usize)>, tigs_
         }
         bucket_cursor = 0;
     }
-    /*
-    size_decoder.read_exact(&mut size_buf);
-    size = usize::from_le_bytes(size_buf);
-    let mut bucket_buffer = vec![0; size];
-    let mut read_unitig_res = tigs_file.read_exact(&mut bucket_buffer);
-    while read_unitig_res.is_ok(){
-        while size != 0_usize{
-
-            println!("size = {}", size);
-            //tigs_file.seek(std::io::SeekFrom::Start(cursor.try_into().unwrap()));
-            tigs_file.read_exact(&mut bucket_buffer);
-            let mut tigs_decoder = Decoder::new(&bucket_buffer[..]).expect("Failed to create zstd decoder");
-            let mut clear_color_bucket = Vec::new();
-            tigs_decoder.read_to_end(&mut clear_color_bucket);
-            println!("TIG = {}", String::from_utf8(clear_color_bucket.clone()).unwrap());
-            //let output = String::from_utf8(clear_color_bucket).unwrap();
-            let curr_output = cid_to_ids.get(&counter.to_string()).unwrap();
-            for elem in curr_output{
-                let curr_filename = filenames.get(*elem as usize).unwrap();
-                println!("a{}a", curr_filename);
-                let trunc_filename = Path::new(curr_filename).file_stem().unwrap();
-                let mut out_file = BufWriter::new(File::options().append(true).create(true).open(out_dir.to_owned() + "Dump_" + trunc_filename.to_str().unwrap()).expect("Unable to create file"));
-                out_file.write_all(&clear_color_bucket);
-                out_file.flush();
-            }
-            //cursor += size;
-            size_decoder.read_exact(&mut size_buf);
-            size = usize::from_le_bytes(size_buf);
-            bucket_buffer = vec![0; size];
-            read_unitig_res = tigs_file.read_exact(&mut bucket_buffer);
-        }
-        println!("COUNTER = {}", counter);
-        counter += 1;
-    } */
 }
 
 fn get_cid_to_id(color_id_filename: &String) -> HashMap<String, Vec<u32>>{
@@ -464,6 +401,41 @@ fn get_cid_to_id(color_id_filename: &String) -> HashMap<String, Vec<u32>>{
     }
     ids
 }
+/*
+fn filter_cid_to_id(wanted_files_path: &String, cid_to_id_map: HashMap<String, Vec<u32>>, filenames: Vec<String>){
+    let wanted_file = File::open(wanted_files_path).unwrap();
+    let wanted_reader = BufReader::new(wanted_file);
+    let mut wanted_filenames = Vec::new();
+    let mut wanted_cids_map = HashMap::new();
+    for line_result in wanted_reader.lines(){
+        let line = line_result?;
+        if filenames.contains(&line){
+            let mut cpt: u32 = 0;
+            let wanted_id;
+            for file in filenames{
+                if file == line{
+                    wanted_id = cpt;
+                    cpt += 1;
+                }
+            }
+            for i in 0..cid_to_id_map.len(){
+                if cid_to_id_map.get(&i.to_string()).unwrap().contains(&wanted_id){
+                    wanted_cids_map.insert(i, cid_to_id_map.iter().get(&i.to_string()).unwrap());
+                }
+            }
+            wanted_filenames.push(line);
+            println!("File: {}", line);
+        }else{
+            println!("File: {} is not in the archive, are you sure accession is correct ?", line);
+        }
+        
+    }
+
+}
+
+fn decompress_wanted(wanted_files_path: &String, filenames: Vec<String>, cid_to_id_map: HashMap<String, Vec<u32>>, tigs_filename: &String, size_filename: &String, out_dir: &String){
+
+}*/
 /*
 pub fn init_decompress(size_filename: String, color_id_filename: String, tigs_filename: String, out_dir: &String, wanted_files_path: &str, input_dir: &String) -> std::io::Result<()>{
     //INPUT DIR + LES FILENAMES NECESSAIRES
