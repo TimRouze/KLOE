@@ -56,16 +56,16 @@ fn main() {
     let threads = args.threads;
     let temp_dir = args.temp_dir;
     let memory = args.memory;
-    
+    //TODO HANDLE ERRORS FOR COMP AND DECOMP
     let wanted_path = args.wanted_files;
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
-            let _ = graph_build::decompress(&String::from("bucket_sizes.txt.zst"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.txt.zst"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
+            let _ = graph_build::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.txt.zst"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
             //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
         }else if do_decompress == "compress"{
-            graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
+            let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }/*else if do_decompress == "stats"{
             let unitigs_file = args.unitigs_file;
             let k = K;
@@ -87,7 +87,7 @@ fn is_compressed_dir_complete(input_dir: String){
         panic!("file not found: {input_dir}/filenames_id.txt");
     }else if !Path::new(&format!("{input_dir}/positions_kloe.txt.zst")).exists(){
         panic!("Positions file not found");
-    }else if !Path::new(&format!("{input_dir}/bucket_sizes.txt.zst")).exists(){
+    }else if !Path::new(&format!("{input_dir}/bucket_sizes.txt")).exists(){
         panic!("Tigs sizes file not found");
     }else if !Path::new(&format!("{input_dir}/id_to_color_id.txt.zst")).exists(){
         panic!("id to color id file not found");
