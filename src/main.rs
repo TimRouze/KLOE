@@ -5,8 +5,8 @@ mod kmer;
 mod decompress;
 mod stats;
 mod graph_build;
-use clap::{Error, Parser};
-use stats::compute_stats;
+mod parser;
+use clap::Parser;
 use std::env;
 use std::path::Path;
 
@@ -35,8 +35,14 @@ struct Args {
     #[arg(short = 'd', long, default_value_t = String::from(""))]
     temp_dir: String,
     ///Max memory (RAM) for fulgor, default = 8GB
-    #[arg(short, long, default_value_t = 8)]
+    #[arg(short = 'r', long, default_value_t = 8)]
     memory: usize,
+    ///K value, default = 31
+    #[arg(short, long, default_value_t = 31)]
+    k_size: usize,
+    ///Minimizer size (< k), default = 7
+    #[arg(short, long, default_value_t = 7)]
+    minimizer_size: usize,
 
 }
 pub mod constants {
@@ -56,6 +62,8 @@ fn main() {
     let threads = args.threads;
     let temp_dir = args.temp_dir;
     let memory = args.memory;
+    let k = args.k_size;
+    let m = args.minimizer_size;
     //TODO HANDLE ERRORS FOR COMP AND DECOMP
     let wanted_path = args.wanted_files;
     if let Some(do_decompress) = args.decompress{
@@ -76,6 +84,7 @@ fn main() {
             }
         }*/
     }else {
+        parser::test_parser(&input_fof, &output_dir, k, m);
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
