@@ -1,4 +1,4 @@
-# Experiments for RECOMB-SEQ 2025 submission
+# Experiments
 
 ## File of files
 
