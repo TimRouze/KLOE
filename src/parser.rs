@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bio::io::fasta;
 use clap::Parser;
 use flate2::read::GzDecoder;
-use hashbrown::HashMap;
+use hashbrown::{hash_map::Entry, HashMap};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
@@ -19,6 +19,7 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 const BUFFER_TARGET: usize = 128 * 1024;
+const ZSTD_LEVEL_FAST4: i32 = -4; // zstd "fast=4" mode for lower memory and higher speed
 
 struct PartitionWriter {
     path: PathBuf,
@@ -68,32 +69,6 @@ fn ids_from_bitset(bits: &[u64]) -> Vec<usize> {
     }
     ids
 }
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Parse FASTA files into superkmers grouped by minimizer"
-)]
-struct Args {
-    #[arg(short = 'i', long = "input-fof")]
-    input_fof: PathBuf,
-    #[arg(short = 'o', long = "output-dir")]
-    output_dir: PathBuf,
-    #[arg(short = 'k', long = "kmer")]
-    k: usize,
-    #[arg(short = 'm', long = "minimizer")]
-    m: usize,
-    /// Number of partitions is 2^partition_power (default 1024 partitions)
-    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
-    partition_power: u32,
-    #[arg(short = 't', long = "threads", default_value_t = num_cpus::get())]
-    threads: usize,
-    /// Concurrency for the compaction phase (per-partition simplitigs)
-    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
-    compaction_threads: usize,
-}
-
 fn ensure_nofile_limit(required: u64) -> Result<()> {
     let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
     if soft >= required {
@@ -217,7 +192,7 @@ fn create_partition_encoders(output_dir: &Path, partitions: u64) -> Result<Share
         let file_path = output_dir.join(format!("{i}.fa.zst"));
         let file = File::create(&file_path)
             .with_context(|| format!("create partition file {}", file_path.display()))?;
-        let encoder = ZstdEncoder::new(file, -1)
+        let encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
             .with_context(|| format!("build zstd encoder for {}", file_path.display()))?;
         writers.push(PartitionWriter {
             path: file_path,
@@ -292,6 +267,194 @@ fn build_kmer_map_from_partition(
         }
     }
     Ok(map)
+}
+
+fn ids_to_bitset(ids: &[usize], dataset_count: usize) -> Result<Vec<u64>> {
+    let words = bitset_words(dataset_count);
+    let mut bits = vec![0u64; words];
+    for &id in ids {
+        if id == 0 || id > dataset_count {
+            bail!(
+                "dataset id {} invalid for dataset count {}",
+                id,
+                dataset_count
+            );
+        }
+        let idx = id - 1;
+        bits[idx / 64] |= 1u64 << (idx % 64);
+    }
+    Ok(bits)
+}
+
+fn merge_bitsets(into: &mut Vec<u64>, from: &[u64]) {
+    for (dst, src) in into.iter_mut().zip(from.iter()) {
+        *dst |= *src;
+    }
+}
+
+fn merge_kmer_maps(
+    target: &mut HashMap<u64, Vec<u64>>,
+    source: HashMap<u64, Vec<u64>>,
+) -> Result<()> {
+    for (kmer, ids_bits) in source {
+        match target.entry(kmer) {
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.len() != ids_bits.len() {
+                    bail!(
+                        "bitset length mismatch while merging k-mer maps ({} vs {})",
+                        existing.len(),
+                        ids_bits.len()
+                    );
+                }
+                merge_bitsets(existing, &ids_bits);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ids_bits);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_input_kmer_map(
+    partition_paths: &[PathBuf],
+    k: usize,
+    dataset_count: usize,
+) -> Result<HashMap<u64, Vec<u64>>> {
+    let mut global = HashMap::new();
+    for path in partition_paths {
+        let map = build_kmer_map_from_partition(path, k, dataset_count)
+            .with_context(|| format!("build k-mer map from {}", path.display()))?;
+        merge_kmer_maps(&mut global, map)?;
+    }
+    Ok(global)
+}
+
+fn parse_simplitig_ids(header: &str, dataset_count: usize) -> Result<Vec<u64>> {
+    let Some(rest) = header.strip_prefix("ids:") else {
+        bail!("simplitig header '{}' missing ids: prefix", header);
+    };
+    let mut parsed = Vec::new();
+    for part in rest.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        let id: usize = part
+            .parse()
+            .with_context(|| format!("parse dataset id '{part}' from header '{header}'"))?;
+        parsed.push(id);
+    }
+    if parsed.is_empty() {
+        bail!("no dataset ids found in simplitig header '{}'", header);
+    }
+    ids_to_bitset(&parsed, dataset_count)
+}
+
+fn build_output_kmer_map(
+    simplitig_path: &Path,
+    k: usize,
+    dataset_count: usize,
+) -> Result<HashMap<u64, Vec<u64>>> {
+    let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let reader = open_fasta_reader(simplitig_path)?;
+    for record in reader.records() {
+        let record = record.with_context(|| {
+            format!(
+                "read simplitig record from {}",
+                simplitig_path.display()
+            )
+        })?;
+        let ids_bits = parse_simplitig_ids(record.id(), dataset_count)?;
+        let seq = record.seq();
+        if seq.len() < k {
+            continue;
+        }
+        for i in 0..=seq.len() - k {
+            let slice = &seq[i..i + k];
+            if let Some(bits) = encode_kmer(slice) {
+                let canon = canonical_bits(bits, k);
+                match map.entry(canon) {
+                    Entry::Occupied(mut entry) => {
+                        if entry.get().len() != ids_bits.len() {
+                            bail!(
+                                "bitset length mismatch for k-mer {} in {}",
+                                String::from_utf8_lossy(&decode_kmer(canon, k)),
+                                simplitig_path.display()
+                            );
+                        }
+                        let existing = entry.get_mut();
+                        merge_bitsets(existing, &ids_bits);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ids_bits.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn verify_kmer_maps(
+    input_map: &HashMap<u64, Vec<u64>>,
+    output_map: &HashMap<u64, Vec<u64>>,
+    k: usize,
+) -> Result<()> {
+    let mut missing = 0usize;
+    let mut mismatched = 0usize;
+    let mut extra = 0usize;
+    let mut samples = Vec::new();
+
+    for (kmer, ids_in) in input_map.iter() {
+        match output_map.get(kmer) {
+            Some(ids_out) => {
+                if ids_in != ids_out {
+                    mismatched += 1;
+                    if samples.len() < 5 {
+                        samples.push(format!(
+                            "k-mer {} has ids {:?} in input but {:?} in output",
+                            String::from_utf8_lossy(&decode_kmer(*kmer, k)),
+                            ids_from_bitset(ids_in),
+                            ids_from_bitset(ids_out)
+                        ));
+                    }
+                }
+            }
+            None => {
+                missing += 1;
+                if samples.len() < 5 {
+                    samples.push(format!(
+                        "k-mer {} missing from output",
+                        String::from_utf8_lossy(&decode_kmer(*kmer, k))
+                    ));
+                }
+            }
+        }
+    }
+
+    for kmer in output_map.keys() {
+        if !input_map.contains_key(kmer) {
+            extra += 1;
+            if samples.len() < 5 {
+                samples.push(format!(
+                    "k-mer {} present in output but absent from input",
+                    String::from_utf8_lossy(&decode_kmer(*kmer, k))
+                ));
+            }
+        }
+    }
+
+    if missing + mismatched + extra > 0 {
+        bail!(
+            "k-mer verification failed (missing: {}, mismatched datasets: {}, extra: {}). Examples: {}",
+            missing,
+            mismatched,
+            extra,
+            samples.join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn assemble_simplitigs(
@@ -377,7 +540,7 @@ fn process_file(
     file_id: usize,
     encoders: &SharedEncoders,
     k: usize,
-    m: usize,
+    _m: usize,
     w: usize,
     partitions: u64,
     stats: &Arc<Stats>,
@@ -405,9 +568,8 @@ fn process_file(
         let packed_seq = PackedSeqVec::from_ascii(seq);
         let packed_slice = packed_seq.as_slice();
 
-        let mut minimizer_positions = Vec::new();
         let mut superkmer_starts = Vec::new();
-        minimizer_positions = simd_minimizers::minimizer_positions(packed_slice, k, w);
+        let mut minimizer_positions = simd_minimizers::minimizer_positions(packed_slice, k, w);
         if minimizer_positions.is_empty() {
             continue;
         }
@@ -484,7 +646,34 @@ fn partition_size_stats(encoders: &SharedEncoders) -> Result<(u64, u64, u64)> {
     Ok((total, min_size, max_size))
 }
 
-pub fn test_parser(k: usize, m: usize, partition_power: u32, output_dir:PathBuf, input_fof: PathBuf, threads: usize) -> Result<()> {
+pub fn test_parser(
+    k: usize,
+    m: usize,
+    partition_power: u32,
+    output_dir: PathBuf,
+    input_fof: PathBuf,
+    threads: usize,
+) -> Result<()> {
+    test_parser_with_verify(
+        k,
+        m,
+        partition_power,
+        output_dir,
+        input_fof,
+        threads,
+        false,
+    )
+}
+
+pub fn test_parser_with_verify(
+    k: usize,
+    m: usize,
+    partition_power: u32,
+    output_dir: PathBuf,
+    input_fof: PathBuf,
+    threads: usize,
+    verify_kmers: bool,
+) -> Result<()> {
     if k < m {
         bail!(
             "k-mer length ({}) must be >= minimizer length ({})",
@@ -575,7 +764,7 @@ pub fn test_parser(k: usize, m: usize, partition_power: u32, output_dir:PathBuf,
     let writer_handle = thread::spawn(move || -> Result<()> {
         let file = File::create(&writer_path)
             .with_context(|| format!("create simplitig output {}", writer_path.display()))?;
-        let mut encoder = ZstdEncoder::new(file, -1)
+        let mut encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
             .with_context(|| format!("build zstd encoder for {}", writer_path.display()))?;
         for (seq, ids_bits) in rx {
             let ids = ids_from_bitset(&ids_bits);
@@ -627,6 +816,185 @@ pub fn test_parser(k: usize, m: usize, partition_power: u32, output_dir:PathBuf,
     writer_handle
         .join()
         .map_err(|_| anyhow!("simplitig writer thread panicked"))??;
+
+    if verify_kmers {
+        println!("Verifying k-mer preservation...");
+        let partition_paths: Vec<PathBuf> = encoders.iter().map(|pw| pw.path.clone()).collect();
+        let input_map = build_input_kmer_map(&partition_paths, k, dataset_count)?;
+        let output_map = build_output_kmer_map(&output_simplitigs, k, dataset_count)?;
+        verify_kmer_maps(&input_map, &output_map, k)?;
+        println!(
+            "Verified {} canonical k-mers.",
+            input_map.len().to_formatted_string(&Locale::en)
+        );
+    }
+
+    println!(
+        "Simplitig compaction complete. Output: {}",
+        output_simplitigs.display()
+    );
+    println!("Partitioning complete.");
+    Ok(())
+}
+
+pub fn run_parser(k: usize, m: usize, partition_power: u32, output_dir: PathBuf, input_fof: PathBuf, threads: usize, compaction_threads: usize, verify_kmers: bool) -> Result<()> {
+    if k < m {
+        bail!(
+            "k-mer length ({}) must be >= minimizer length ({})",
+            k,
+            m
+        );
+    }
+    let partitions = 1u64
+        .checked_shl(partition_power)
+        .context("partition power too large")?;
+    let window = k
+        .checked_sub(m)
+        .map(|v| v + 1)
+        .context("failed to compute window size; ensure k >= m")?;
+    let required_limit = partitions + 64;
+
+    ensure_nofile_limit(required_limit)?;
+    fs::create_dir_all(&output_dir)?;
+    let encoders = create_partition_encoders(&output_dir, partitions)?;
+    let file_paths = read_fof(&input_fof)?;
+    let dataset_count = file_paths.len();
+    let stats = Arc::new(Stats::new());
+
+    println!(
+        "Starting superkmer partitioning for {} files (k={}, m={}, partitions={}, threads={})",
+        file_paths.len(),
+        k,
+        m,
+        partitions,
+        threads
+    );
+
+    let pool = ThreadPool::new(threads);
+    for (idx, file_path) in file_paths.into_iter().enumerate() {
+        let encoders = Arc::clone(&encoders);
+        let partitions = partitions;
+        let k = k;
+        let m = m;
+        let stats = Arc::clone(&stats);
+        let dataset_count = dataset_count;
+        pool.execute(move || {
+            if let Err(err) = process_file(
+                &file_path,
+                idx + 1,
+                &encoders,
+                k,
+                m,
+                window,
+                partitions,
+                &stats,
+                dataset_count,
+            ) {
+                eprintln!("Failed to process {}: {err}", file_path.display());
+            }
+        });
+    }
+    pool.join();
+    finalize_encoders(&encoders)?;
+    let (total_size, min_size, max_size) = partition_size_stats(&encoders)?;
+    let total_superkmers = stats.total_superkmers.load(Ordering::Relaxed);
+    let total_bases = stats.total_bases.load(Ordering::Relaxed);
+    let total_kmers =
+        total_bases.saturating_sub(total_superkmers.saturating_mul((k - 1) as u64));
+
+    let loc = Locale::en;
+    println!(
+        "Superkmer count: {}",
+        total_superkmers.to_formatted_string(&loc)
+    );
+    println!(
+        "Total superkmer length (bp): {}",
+        total_bases.to_formatted_string(&loc)
+    );
+    println!(
+        "Total kmers covered: {}",
+        total_kmers.to_formatted_string(&loc)
+    );
+    println!(
+        "Partition file sizes (bytes): total={}, min={}, max={}",
+        total_size.to_formatted_string(&loc),
+        min_size.to_formatted_string(&loc),
+        max_size.to_formatted_string(&loc)
+    );
+
+    // Second phase: per-partition compaction into simplitigs with identical ID sets.
+    println!("Starting per-partition simplitig compaction...");
+    let output_simplitigs = output_dir.join("simplitigs.fa.zst");
+    let (tx, rx): (SyncSender<(Vec<u8>, Vec<u64>)>, _) = mpsc::sync_channel(16);
+    let writer_path = output_simplitigs.clone();
+    let writer_handle = thread::spawn(move || -> Result<()> {
+        let file = File::create(&writer_path)
+            .with_context(|| format!("create simplitig output {}", writer_path.display()))?;
+        let mut encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
+            .with_context(|| format!("build zstd encoder for {}", writer_path.display()))?;
+        for (seq, ids_bits) in rx {
+            let ids = ids_from_bitset(&ids_bits);
+            let header = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                encoder,
+                ">ids:{}\n{}",
+                header,
+                String::from_utf8_lossy(&seq)
+            )?;
+        }
+        encoder
+            .finish()
+            .with_context(|| format!("finalize simplitig output {}", writer_path.display()))?;
+        Ok(())
+    });
+
+    let compaction_pool = ThreadPool::new(compaction_threads);
+    for pw in encoders.iter() {
+        let partition_path = pw.path.clone();
+        let tx = tx.clone();
+        compaction_pool.execute(move || {
+            match build_kmer_map_from_partition(&partition_path, k, dataset_count) {
+                Ok(map) => {
+                    if let Err(e) = assemble_simplitigs(map, k, &tx) {
+                        eprintln!(
+                            "Failed to assemble simplitigs for {}: {}",
+                            partition_path.display(),
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to build k-mer map for {}: {}",
+                        partition_path.display(),
+                        e
+                    );
+                }
+            }
+        });
+    }
+    drop(tx);
+    compaction_pool.join();
+    writer_handle
+        .join()
+        .map_err(|_| anyhow!("simplitig writer thread panicked"))??;
+
+    if verify_kmers {
+        println!("Verifying k-mer preservation...");
+        let partition_paths: Vec<PathBuf> = encoders.iter().map(|pw| pw.path.clone()).collect();
+        let input_map = build_input_kmer_map(&partition_paths, k, dataset_count)?;
+        let output_map = build_output_kmer_map(&output_simplitigs, k, dataset_count)?;
+        verify_kmer_maps(&input_map, &output_map, k)?;
+        println!(
+            "Verified {} canonical k-mers.",
+            input_map.len().to_formatted_string(&Locale::en)
+        );
+    }
+
     println!(
         "Simplitig compaction complete. Output: {}",
         output_simplitigs.display()

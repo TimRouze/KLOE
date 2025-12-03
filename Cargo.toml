@@ -44,3 +44,6 @@ miette = { version = "5", features = ["fancy"] }
 debug = true
 strip = false
 opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

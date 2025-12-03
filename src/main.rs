@@ -43,6 +43,14 @@ struct Args {
     ///Minimizer size (< k), default = 7
     #[arg(short, long, default_value_t = 7)]
     minimizer_size: usize,
+    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
+    compaction_threads: usize,
+    /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
+    #[arg(long = "verify-kmers", default_value_t = false)]
+    verify_kmers: bool,
+    /// Number of partitions is 2^partition_power (default 1024 partitions)
+    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
+    partition_power: u32,
 
 }
 pub mod constants {
@@ -84,8 +92,8 @@ fn main() {
             }
         }*/
     }else {
-        parser::test_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(&input_fof), threads);
-        
+        let compaction_threads = args.compaction_threads;
+        parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
