@@ -1,0 +1,2 @@
+/pasteur/appa/scratch/trouze/temp_decompressed_logan/decompressed_files/ERR3239276.unitigs.fa
+/pasteur/appa/scratch/trouze/temp_decompressed_logan/decompressed_files/ERR3239278.unitigs.fa
