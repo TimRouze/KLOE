@@ -8,7 +8,7 @@ mod graph_build;
 mod parser;
 use clap::Parser;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -84,7 +84,8 @@ fn main() {
             }
         }*/
     }else {
-        parser::test_parser(&input_fof, &output_dir, k, m);
+        parser::test_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(&input_fof), threads);
+        
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");

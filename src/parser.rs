@@ -1,167 +1,643 @@
+use anyhow::{anyhow, bail, Context, Result};
 use bio::io::fasta;
+use clap::Parser;
+use flate2::read::GzDecoder;
+use hashbrown::HashMap;
+use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
-use std::collections::HashMap;
-use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::thread;
+use threadpool::ThreadPool;
+use xz2::read::XzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
+
+const BUFFER_TARGET: usize = 128 * 1024;
+
+struct PartitionWriter {
+    path: PathBuf,
+    encoder: Mutex<Option<ZstdEncoder<'static, File>>>,
+}
+
+type SharedEncoders = Arc<Vec<PartitionWriter>>;
+
+struct Stats {
+    total_superkmers: AtomicU64,
+    total_bases: AtomicU64,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            total_superkmers: AtomicU64::new(0),
+            total_bases: AtomicU64::new(0),
+        }
+    }
+
+    fn add_batch(&self, superkmers: u64, bases: u64) {
+        if superkmers == 0 && bases == 0 {
+            return;
+        }
+        self.total_superkmers
+            .fetch_add(superkmers, Ordering::Relaxed);
+        self.total_bases.fetch_add(bases, Ordering::Relaxed);
+    }
+}
+
+fn bitset_words(dataset_count: usize) -> usize {
+    (dataset_count + 63) / 64
+}
+
+fn ids_from_bitset(bits: &[u64]) -> Vec<usize> {
+    let mut ids = Vec::new();
+    for (word_idx, &word) in bits.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        for bit in 0..64 {
+            if (word >> bit) & 1 == 1 {
+                ids.push(word_idx * 64 + bit + 1); // stored 0-based, output 1-based
+            }
+        }
+    }
+    ids
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Parse FASTA files into superkmers grouped by minimizer"
+)]
+struct Args {
+    #[arg(short = 'i', long = "input-fof")]
+    input_fof: PathBuf,
+    #[arg(short = 'o', long = "output-dir")]
+    output_dir: PathBuf,
+    #[arg(short = 'k', long = "kmer")]
+    k: usize,
+    #[arg(short = 'm', long = "minimizer")]
+    m: usize,
+    /// Number of partitions is 2^partition_power (default 1024 partitions)
+    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
+    partition_power: u32,
+    #[arg(short = 't', long = "threads", default_value_t = num_cpus::get())]
+    threads: usize,
+    /// Concurrency for the compaction phase (per-partition simplitigs)
+    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
+    compaction_threads: usize,
+}
+
+fn ensure_nofile_limit(required: u64) -> Result<()> {
+    let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+    if soft >= required {
+        return Ok(());
+    }
+
+    let new_soft = required.min(hard);
+    rlimit::setrlimit(rlimit::Resource::NOFILE, new_soft, hard).with_context(|| {
+        format!(
+            "failed to raise file limit to {} (soft) / {} (hard)",
+            new_soft, hard
+        )
+    })?;
+    let (soft_after, _) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+    if soft_after < required {
+        bail!(
+            "could not raise open file limit high enough (have {}, need {})",
+            soft_after,
+            required
+        );
+    }
+    Ok(())
+}
+
+fn read_fof(path: &Path) -> Result<Vec<PathBuf>> {
+    let file = File::open(path).with_context(|| format!("open input list {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut paths = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", idx + 1, path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        paths.push(PathBuf::from(trimmed));
+    }
+    Ok(paths)
+}
+
+fn open_fasta_reader(path: &Path) -> Result<fasta::Reader<Box<dyn BufRead>>> {
+    let file = File::open(path).with_context(|| format!("open input {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let reader: Box<dyn BufRead> = if name.ends_with(".gz") {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else if name.ends_with(".xz") {
+        Box::new(BufReader::new(XzDecoder::new(file)))
+    } else if name.ends_with(".zst") || name.ends_with(".zstd") {
+        let decoder = ZstdDecoder::new(file)
+            .with_context(|| format!("create zstd decoder for {}", path.display()))?;
+        Box::new(BufReader::new(decoder))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
+    Ok(fasta::Reader::from_bufread(reader))
+}
+
+fn base_to_bits(b: u8) -> Option<u8> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
+    }
+}
+
+fn encode_kmer(seq: &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for &b in seq {
+        let bits = base_to_bits(b)?;
+        v = (v << 2) | bits as u64;
+    }
+    Some(v)
+}
+
+fn revcomp_bits(kmer: u64, k: usize) -> u64 {
+    let mut rc = 0u64;
+    let mut val = kmer;
+    for _ in 0..k {
+        let b = (!val) & 0b11;
+        rc = (rc << 2) | b;
+        val >>= 2;
+    }
+    rc
+}
+
+fn canonical_bits(kmer: u64, k: usize) -> u64 {
+    let rc = revcomp_bits(kmer, k);
+    if rc < kmer {
+        rc
+    } else {
+        kmer
+    }
+}
+
+fn decode_kmer(kmer: u64, k: usize) -> Vec<u8> {
+    let mut seq = Vec::with_capacity(k);
+    for i in (0..k).rev() {
+        let bits = (kmer >> (2 * i)) & 0b11;
+        let b = match bits {
+            0 => b'A',
+            1 => b'C',
+            2 => b'G',
+            _ => b'T',
+        };
+        seq.push(b);
+    }
+    seq
+}
+
+fn create_partition_encoders(output_dir: &Path, partitions: u64) -> Result<SharedEncoders> {
+    let mut writers = Vec::with_capacity(partitions as usize);
+    for i in 0..partitions {
+        let file_path = output_dir.join(format!("{i}.fa.zst"));
+        let file = File::create(&file_path)
+            .with_context(|| format!("create partition file {}", file_path.display()))?;
+        let encoder = ZstdEncoder::new(file, -1)
+            .with_context(|| format!("build zstd encoder for {}", file_path.display()))?;
+        writers.push(PartitionWriter {
+            path: file_path,
+            encoder: Mutex::new(Some(encoder)),
+        });
+    }
+    Ok(Arc::new(writers))
+}
+
+fn flush_buffer(
+    partition_id: usize,
+    buffer: &mut Vec<u8>,
+    encoders: &SharedEncoders,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let mut guard = encoders[partition_id].encoder.lock();
+    if let Some(writer) = guard.as_mut() {
+        writer.write_all(buffer)?;
+    }
+    buffer.clear();
+    Ok(())
+}
+
+fn flush_all_buffers(
+    local_buffers: &mut HashMap<usize, Vec<u8>>,
+    encoders: &SharedEncoders,
+) -> Result<()> {
+    for (partition_id, buffer) in local_buffers.iter_mut() {
+        flush_buffer(*partition_id, buffer, encoders)?;
+    }
+    Ok(())
+}
+
+fn build_kmer_map_from_partition(
+    partition_path: &Path,
+    k: usize,
+    dataset_count: usize,
+) -> Result<HashMap<u64, Vec<u64>>> {
+    let words = bitset_words(dataset_count);
+    let mut map: HashMap<u64, Vec<u64>> = HashMap::with_capacity(1024);
+    let reader = open_fasta_reader(partition_path)?;
+    for record in reader.records() {
+        let record = record
+            .with_context(|| format!("read partition record in {}", partition_path.display()))?;
+        let seq = record.seq();
+        if seq.len() < k {
+            continue;
+        }
+        let dataset_id: usize = record
+            .id()
+            .parse()
+            .with_context(|| format!("parse dataset id in {}", partition_path.display()))?;
+        if dataset_id == 0 || dataset_id > dataset_count {
+            bail!(
+                "dataset id {} invalid for dataset count {}",
+                dataset_id,
+                dataset_count
+            );
+        }
+        let id_idx = dataset_id - 1;
+        let word_idx = id_idx / 64;
+        let bit_mask = 1u64 << (id_idx % 64);
+        for i in 0..=seq.len() - k {
+            let kmer_slice = &seq[i..i + k];
+            if let Some(bits) = encode_kmer(kmer_slice) {
+                let canon = canonical_bits(bits, k);
+                let entry = map.entry(canon).or_insert_with(|| vec![0u64; words]);
+                entry[word_idx] |= bit_mask;
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn assemble_simplitigs(
+    mut kmer_map: HashMap<u64, Vec<u64>>,
+    k: usize,
+    tx: &SyncSender<(Vec<u8>, Vec<u64>)>,
+) -> Result<()> {
+    let mask: u64 = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+
+    while let Some((&seed_canon, ids)) = kmer_map.iter().next() {
+        let ids = ids.clone();
+        kmer_map.remove(&seed_canon);
+
+        let mut forward_bits = seed_canon;
+        let mut seq = decode_kmer(forward_bits, k);
+
+        // Extend forward
+        loop {
+            let mut extended = false;
+            for base_bits in [0u64, 1, 2, 3] {
+                let next_forward = ((forward_bits << 2) & mask) | base_bits;
+                let next_canon = canonical_bits(next_forward, k);
+                if let Some(entry) = kmer_map.get(&next_canon) {
+                    if entry == &ids {
+                        forward_bits = next_forward;
+                        let next_base = match base_bits {
+                            0 => b'A',
+                            1 => b'C',
+                            2 => b'G',
+                            _ => b'T',
+                        };
+                        seq.push(next_base);
+                        kmer_map.remove(&next_canon);
+                        extended = true;
+                        break;
+                    }
+                }
+            }
+            if !extended {
+                break;
+            }
+        }
+
+        // Extend backward
+        let mut left_bits = seed_canon;
+        loop {
+            let mut extended = false;
+            for base_bits in [0u64, 1, 2, 3] {
+                let prev_forward = ((base_bits << (2 * (k - 1))) | (left_bits >> 2)) & mask;
+                let prev_canon = canonical_bits(prev_forward, k);
+                if let Some(entry) = kmer_map.get(&prev_canon) {
+                    if entry == &ids {
+                        left_bits = prev_forward;
+                        let prev_base = match base_bits {
+                            0 => b'A',
+                            1 => b'C',
+                            2 => b'G',
+                            _ => b'T',
+                        };
+                        seq.insert(0, prev_base);
+                        kmer_map.remove(&prev_canon);
+                        extended = true;
+                        break;
+                    }
+                }
+            }
+            if !extended {
+                break;
+            }
+        }
+
+        let _ = tx.send((seq, ids));
+    }
+    Ok(())
+}
 
 fn process_file(
     file_path: &Path,
     file_id: usize,
-    partition_files: &Arc<Mutex<HashMap<u64, ZstdEncoder<File>>>>,
+    encoders: &SharedEncoders,
     k: usize,
     m: usize,
-) -> io::Result<()> {
-    println!("[Thread {:?}] Processing file {} (Path: \"{}\")", thread::current().id(), file_id, file_path.display());
-    
-    let k_super = k;
-    let k_mini = m as u8;
-    let w = (k_super - k_mini as usize + 1) as u8;
-    let k_minus_m = k_super - k_mini as usize;
+    w: usize,
+    partitions: u64,
+    stats: &Arc<Stats>,
+    dataset_count: usize,
+) -> Result<()> {
+    let reader = open_fasta_reader(file_path)?;
+    let mut local_buffers: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut local_superkmers = 0u64;
+    let mut local_bases = 0u64;
+    if file_id > dataset_count {
+        bail!(
+            "file id {} exceeds dataset count {}",
+            file_id,
+            dataset_count
+        );
+    }
 
-    let file = File::open(file_path)?;
-    let reader = fasta::Reader::new(file);
-    let mut local_buffers: HashMap<u64, Vec<u8>> = HashMap::new();
-    let num_partitions = 4u64.pow(m as u32);
-
-    for result in reader.records() {
-        let record = result.expect("Failed to parse FASTA record");
+    for record in reader.records() {
+        let record = record.with_context(|| format!("parse record in {}", file_path.display()))?;
         let seq = record.seq();
-
-        let seq_preview = if seq.len() > 100 { &seq[..100] } else { seq };
-        // println!("\n[DEBUG] Input Sequence ID: {} (len={}), Preview: {}...", record.id(), seq.len(), String::from_utf8_lossy(seq_preview));
-
-        if seq.len() < k_super {
+        if seq.len() < k {
             continue;
         }
 
         let packed_seq = PackedSeqVec::from_ascii(seq);
-        let mut minimizer_pos = Vec::new();
-        minimizer_pos = simd_minimizers::canonical_minimizer_positions(packed_seq.as_slice(), k_mini as usize, w as usize);//, &mut minimizer_pos);
-        
-        if minimizer_pos.is_empty() {
+        let packed_slice = packed_seq.as_slice();
+
+        let mut minimizer_positions = Vec::new();
+        let mut superkmer_starts = Vec::new();
+        minimizer_positions = simd_minimizers::minimizer_positions(packed_slice, k, w);
+        if minimizer_positions.is_empty() {
             continue;
         }
 
-        //simd_minimizers::iter_canonical_minimizer_values(packed_seq.as_slice(), k_mini as usize, &minimizer_pos).collect();
-        let minimizer_values: Vec<_> = simd_minimizers::canonical_minimizers(k_mini as usize, w as usize).run_once(packed_seq.as_slice());
-        //let minimizer_values: Vec<_> = simd_minimizers::canonical_minimizers(k_mini as usize, w as usize).;//, &minimizer_pos).collect();
-        let minimizers: Vec<_> = minimizer_pos.into_iter().zip(minimizer_values.into_iter()).collect();
+        let minimizer_values: Vec<u64> =
+            simd_minimizers::minimizers(k, w).super_kmers(&mut superkmer_starts).run(packed_seq.as_slice(), &mut minimizer_positions).values_u64().collect();
 
-        if minimizers.is_empty() {
-            continue;
-        }
-        
-        // println!("[DEBUG] Found {} minimizers: {:?}", minimizers.len(), minimizers);
-        
-        for (current_pos, current_hash) in minimizers.iter() {
-            let start_pos = (*current_pos as usize).saturating_sub(k_minus_m);
-            let end_pos = std::cmp::min(seq.len(), (*current_pos as usize) + k_super);
-            
-            if end_pos > start_pos {
-                let superkmer_slice = &seq[start_pos..end_pos];
-                let partition_id = (*current_hash as u64 % num_partitions) as u64;
+        for (idx, (&start, &min_val)) in superkmer_starts
+            .iter()
+            .zip(minimizer_values.iter())
+            .enumerate()
+        {
+            let start = start as usize;
+            let end = if idx + 1 < superkmer_starts.len() {
+                let limit = superkmer_starts[idx + 1] as usize + k - 1;
+                limit.min(seq.len())
+            } else {
+                seq.len()
+            };
 
-                let sk_preview = if superkmer_slice.len() > 60 { &superkmer_slice[..60] } else { superkmer_slice };
-                // println!("[DEBUG]   > Minimizer at pos {}: Spawning Super-k-mer for partition {}, len={}, seq[{}..{}], Preview={}...", current_pos, partition_id, superkmer_slice.len(), start_pos, end_pos, String::from_utf8_lossy(sk_preview));
+            if end <= start {
+                continue;
+            }
 
-                let buffer = local_buffers.entry(partition_id).or_insert_with(Vec::new);
-                write!(buffer, ">{}\n", file_id).unwrap();
-                buffer.extend_from_slice(superkmer_slice);
-                buffer.extend_from_slice(b"\n");
+            let superkmer_slice = &seq[start..end];
+            let partition_id = (min_val.wrapping_mul(0x9e3779b97f4a7c15) % partitions) as usize;
+            let buffer = local_buffers
+                .entry(partition_id)
+                .or_insert_with(|| Vec::with_capacity(BUFFER_TARGET));
+            buffer.extend_from_slice(format!(">{}\n", file_id).as_bytes());
+            buffer.extend_from_slice(superkmer_slice);
+            buffer.push(b'\n');
+
+            local_superkmers += 1;
+            local_bases += superkmer_slice.len() as u64;
+
+            if buffer.len() >= BUFFER_TARGET {
+                flush_buffer(partition_id, buffer, encoders)?;
             }
         }
     }
-    println!("[Thread {:?}] Flushing final buffers for file {}", thread::current().id(), file_id);
-    let mut locked_files = partition_files.lock();
-    for (partition_id, buffer) in local_buffers.iter_mut().filter(|(_, b)| !b.is_empty()) {
-        if let Some(encoder) = locked_files.get_mut(partition_id) {
-            if encoder.write_all(buffer).is_err() {
-                 eprintln!("Error during final flush to partition {}", partition_id);
-            }
+
+    flush_all_buffers(&mut local_buffers, encoders)?;
+    stats.add_batch(local_superkmers, local_bases);
+    Ok(())
+}
+
+fn finalize_encoders(encoders: &SharedEncoders) -> Result<()> {
+    for pw in encoders.iter() {
+        let encoder = pw.encoder.lock().take();
+        if let Some(enc) = encoder {
+            enc.finish()
+                .with_context(|| format!("finish partition writer {}", pw.path.display()))?;
         }
-        buffer.clear();
     }
     Ok(())
 }
 
-
-pub fn test_parser(input_fof: &String, output_dir: &String, k: usize, m: usize) -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let threads = num_cpus::get();
-    
-    let num_partitions = 4u64.pow(m as u32);
-    let required_limit = num_partitions + 50;
-
-    let (soft_limit, hard_limit) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
-    if soft_limit < required_limit {
-        println!("Current open file limit (soft={}, hard={}) is less than required ({})", soft_limit, hard_limit, required_limit);
-        let new_soft_limit = std::cmp::min(required_limit, hard_limit);
-        println!("Attempting to raise soft limit to {}...", new_soft_limit);
-        if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, new_soft_limit, hard_limit) {
-            eprintln!("Failed to raise file limit: {}. Please run `ulimit -n {}` manually before running this program.", e, required_limit);
-            return Err(e.into());
-        }
-        let (new_soft, _) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
-        if new_soft < required_limit {
-             eprintln!("FATAL: Could not raise open file limit high enough. Current limit is {}, but {} is required.", new_soft, required_limit);
-             eprintln!("Try running `sudo sysctl -w fs.file-max=100000` or raising the hard limit in /etc/security/limits.conf");
-             return Err(io::Error::new(io::ErrorKind::Other, "Failed to set rlimit"));
-        }
-        println!("Successfully raised open file limit to {}", new_soft);
+fn partition_size_stats(encoders: &SharedEncoders) -> Result<(u64, u64, u64)> {
+    let mut total = 0u64;
+    let mut min_size = u64::MAX;
+    let mut max_size = 0u64;
+    for writer in encoders.iter() {
+        let meta = fs::metadata(&writer.path)
+            .with_context(|| format!("stat partition file {}", writer.path.display()))?;
+        let len = meta.len();
+        total += len;
+        min_size = min_size.min(len);
+        max_size = max_size.max(len);
     }
-
-    println!("Starting super-k-mer partitioning with k={}, m={}, threads={}", k, m, threads);
-    fs::create_dir_all(output_dir)?;
-
-    println!("Pre-creating {} partition files...", num_partitions);
-    let mut partition_files = HashMap::new();
-    for i in 0..num_partitions {
-        let file_path = PathBuf::from(output_dir).join(format!("{}.fa.zst", i));
-        let file = match File::create(&file_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("FATAL: Could not create partition file {:?}: {}", file_path, e);
-                return Err(e);
-            }
-        };
-        let encoder = ZstdEncoder::new(file, 3)?;
-        partition_files.insert(i, encoder);
+    if encoders.is_empty() {
+        min_size = 0;
     }
-    println!("All {} partition files pre-created successfully.", num_partitions);
-    let partition_files_arc = Arc::new(Mutex::new(partition_files));
-    let file = File::open(input_fof)?;
-    let reader = BufReader::new(file);
-    let file_paths: Vec<PathBuf> = reader
-        .lines()
-        .filter_map(Result::ok)
-        .filter(|line| !line.trim().is_empty())
-        .map(PathBuf::from)
-        .collect();
-    println!("Found {} files to process.", file_paths.len());
-    let pool = threadpool::ThreadPool::new(threads);
-    for (i, file_path) in file_paths.into_iter().enumerate() {
-        let partition_files_clone = Arc::clone(&partition_files_arc);
-        let file_id = i + 1;
+    Ok((total, min_size, max_size))
+}
+
+pub fn test_parser(k: usize, m: usize, partition_power: u32, output_dir:PathBuf, input_fof: PathBuf, threads: usize) -> Result<()> {
+    if k < m {
+        bail!(
+            "k-mer length ({}) must be >= minimizer length ({})",
+            k,
+            m
+        );
+    }
+    let partitions = 1u64
+        .checked_shl(partition_power)
+        .context("partition power too large")?;
+    let window = k
+        .checked_sub(m)
+        .map(|v| v + 1)
+        .context("failed to compute window size; ensure k >= m")?;
+    let required_limit = partitions + 64;
+
+    ensure_nofile_limit(required_limit)?;
+    fs::create_dir_all(&output_dir)?;
+    let encoders = create_partition_encoders(&output_dir, partitions)?;
+    let file_paths = read_fof(&input_fof)?;
+    let dataset_count = file_paths.len();
+    let stats = Arc::new(Stats::new());
+
+    println!(
+        "Starting superkmer partitioning for {} files (k={}, m={}, partitions={}, threads={})",
+        file_paths.len(),
+        k,
+        m,
+        partitions,
+        threads
+    );
+
+    let pool = ThreadPool::new(threads);
+    for (idx, file_path) in file_paths.into_iter().enumerate() {
+        let encoders = Arc::clone(&encoders);
+        let partitions = partitions;
+        let stats = Arc::clone(&stats);
+        let dataset_count = dataset_count;
         pool.execute(move || {
-            if let Err(e) = process_file(&file_path, file_id, &partition_files_clone, k, m) {
-                eprintln!("Failed to process file {}: {}", file_path.display(), e);
+            if let Err(err) = process_file(
+                &file_path,
+                idx + 1,
+                &encoders,
+                k,
+                m,
+                window,
+                partitions,
+                &stats,
+                dataset_count,
+            ) {
+                eprintln!("Failed to process {}: {err}", file_path.display());
             }
         });
     }
     pool.join();
-    println!("Finalizing all partition files...");
-    let mut final_files = partition_files_arc.lock();
-    for (id, encoder) in final_files.drain() {
-        if let Err(e) = encoder.finish() {
-            eprintln!("Error finalizing partition file {}: {}", id, e);
+    finalize_encoders(&encoders)?;
+    let (total_size, min_size, max_size) = partition_size_stats(&encoders)?;
+    let total_superkmers = stats.total_superkmers.load(Ordering::Relaxed);
+    let total_bases = stats.total_bases.load(Ordering::Relaxed);
+    let total_kmers =
+        total_bases.saturating_sub(total_superkmers.saturating_mul((k - 1) as u64));
+
+    let loc = Locale::en;
+    println!(
+        "Superkmer count: {}",
+        total_superkmers.to_formatted_string(&loc)
+    );
+    println!(
+        "Total superkmer length (bp): {}",
+        total_bases.to_formatted_string(&loc)
+    );
+    println!(
+        "Total kmers covered: {}",
+        total_kmers.to_formatted_string(&loc)
+    );
+    println!(
+        "Partition file sizes (bytes): total={}, min={}, max={}",
+        total_size.to_formatted_string(&loc),
+        min_size.to_formatted_string(&loc),
+        max_size.to_formatted_string(&loc)
+    );
+
+    // Second phase: per-partition compaction into simplitigs with identical ID sets.
+    println!("Starting per-partition simplitig compaction...");
+    let output_simplitigs = output_dir.join("simplitigs.fa.zst");
+    let (tx, rx): (SyncSender<(Vec<u8>, Vec<u64>)>, _) = mpsc::sync_channel(16);
+    let writer_path = output_simplitigs.clone();
+    let writer_handle = thread::spawn(move || -> Result<()> {
+        let file = File::create(&writer_path)
+            .with_context(|| format!("create simplitig output {}", writer_path.display()))?;
+        let mut encoder = ZstdEncoder::new(file, -1)
+            .with_context(|| format!("build zstd encoder for {}", writer_path.display()))?;
+        for (seq, ids_bits) in rx {
+            let ids = ids_from_bitset(&ids_bits);
+            let header = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                encoder,
+                ">ids:{}\n{}",
+                header,
+                String::from_utf8_lossy(&seq)
+            )?;
         }
+        encoder
+            .finish()
+            .with_context(|| format!("finalize simplitig output {}", writer_path.display()))?;
+        Ok(())
+    });
+
+    let compaction_pool = ThreadPool::new(threads);
+    for pw in encoders.iter() {
+        let partition_path = pw.path.clone();
+        let tx = tx.clone();
+        compaction_pool.execute(move || {
+            match build_kmer_map_from_partition(&partition_path, k, dataset_count) {
+                Ok(map) => {
+                    if let Err(e) = assemble_simplitigs(map, k, &tx) {
+                        eprintln!(
+                            "Failed to assemble simplitigs for {}: {}",
+                            partition_path.display(),
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to build k-mer map for {}: {}",
+                        partition_path.display(),
+                        e
+                    );
+                }
+            }
+        });
     }
+    drop(tx);
+    compaction_pool.join();
+    writer_handle
+        .join()
+        .map_err(|_| anyhow!("simplitig writer thread panicked"))??;
+    println!(
+        "Simplitig compaction complete. Output: {}",
+        output_simplitigs.display()
+    );
     println!("Partitioning complete.");
     Ok(())
 }
+
+/*
+fn main() -> Result<()> {
+    let args = Args::parse();
+    run(args)
+}
+*/
