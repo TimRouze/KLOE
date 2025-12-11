@@ -36,6 +36,7 @@ num-format = "0.4"
 anyhow = "1.0"
 hashbrown = { version = "0.14", default-features = false, features = ["ahash"] }
 xz2 = "0.1"
+tempfile = "3.23.0"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
