@@ -6,6 +6,7 @@ mod decompress;
 mod stats;
 mod graph_build;
 mod parser;
+//mod compress;
 use clap::Parser;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -65,7 +66,7 @@ fn main() {
     
     let output_dir = args.out_dir;
     let input_dir = args.compressed_dir;
-    env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
+    //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
     let temp_dir = args.temp_dir;
@@ -81,6 +82,17 @@ fn main() {
             let _ = graph_build::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.txt.zst"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
             //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
         }else if do_decompress == "compress"{
+            /*let _ = compress::compress(
+                &output_dir, 
+                &input_fof, 
+                threads, 
+                &temp_dir, 
+                k, 
+                m, 
+                partition_power, 
+                compaction_threads
+            );*/
+            //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
             let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }/*else if do_decompress == "stats"{
             let unitigs_file = args.unitigs_file;
@@ -93,7 +105,8 @@ fn main() {
         }*/
     }else {
         let compaction_threads = args.compaction_threads;
-        parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
+        parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false);
+
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
