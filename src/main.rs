@@ -1,12 +1,9 @@
 #![allow(dead_code)]
 
 mod utils;
-mod kmer;
 mod decompress;
-mod stats;
-mod graph_build;
 mod parser;
-//mod compress;
+mod compress;
 use clap::Parser;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -20,7 +17,7 @@ struct Args {
     ///Input file list (Compression)
     #[arg(short, long, default_value_t=String::from(""))]
     input_list: String,
-    /// Number of threads (defaults to all available threads)
+    /// Number of threads (defaults to 1)
     #[arg(short, long, default_value_t = 1)]
     threads: usize,
     ///Output directory
@@ -32,7 +29,7 @@ struct Args {
     ///List of files to decompress
     #[arg(short = 'Q', long, default_value_t = String::from(""))]
     wanted_files: String,
-    ///Temporary directory for graph construction
+    ///Temporary directory for unitigs parsing
     #[arg(short = 'd', long, default_value_t = String::from(""))]
     temp_dir: String,
     ///Max memory (RAM) for fulgor, default = 8GB
@@ -52,10 +49,10 @@ struct Args {
     /// Number of partitions is 2^partition_power (default 1024 partitions)
     #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
     partition_power: u32,
+    /// Skip sorting within partitions and during final merge (output will not be globally sorted)
+    #[arg(long = "skip-sort", default_value_t = false)]
+    skip_sort: bool,
 
-}
-pub mod constants {
-    include!("constants.rs");
 }
 const BLOCK_SIZE: usize = 1 << (12 - 3);
 const SHARD_AMOUNT: usize = 1024;
@@ -79,7 +76,7 @@ fn main() {
         if do_decompress == "decompress"{
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
-            let _ = graph_build::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.txt.zst"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
+            let _ = decompress::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.txt.zst"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
             //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
         }else if do_decompress == "compress"{
             /*let _ = compress::compress(
@@ -93,19 +90,12 @@ fn main() {
                 compaction_threads
             );*/
             //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
-            let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
-        }/*else if do_decompress == "stats"{
-            let unitigs_file = args.unitigs_file;
-            let k = K;
-            if unitigs_file != ""{
-                let _ = compute_stats( &unitigs_file, &output_dir, &k);
-            }else{
-                println!("Error, multicolor and/or omnicolor file(s) are mandatory");
-            }
-        }*/
+            let _ = compress::compress(&output_dir, &input_fof, threads, &temp_dir, k, m, args.partition_power, args.compaction_threads);
+            //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
+        }
     }else {
         let compaction_threads = args.compaction_threads;
-        parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false);
+        parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
 
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");

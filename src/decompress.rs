@@ -1,309 +1,527 @@
-use clap::error::Result;
-use std::path::{Path, PathBuf};
+use core::panic;
+use std::collections::HashMap;
+use std::process::Command;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, Write, BufWriter};
-use std::time::Instant;
-use zstd::stream::read::Decoder;
-use crate::utils::vec2str;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
+use std::path::Path;
+use std::u32;
 
-/// DECOMPRESS
-/// Omnicolor: file containing omnicolored kmers
-/// Multicolor: file containing multicolored kmers
-/// Input names: fof containing genomes to extract. SAME ORDER AS FOF USED TO CREATE COMPRESSED FILES
-/// 
-/// DECOMPRESS will dump simplitigs from the requested files. 
-/// Creating one output file per genome requested.
-/// Omnicolored kmers are dumped in every out file.
-/// Multicolored kmers are split according to their colors
-pub fn decompress(omnicolor: &str, multicolor: &str, input_names: &str, out_dir: PathBuf, wanted_files_path: &str){
-    //TODO DELETE OUTFILES IF THEY ALREADY EXISTS BEFORE DECOMPRESSING.
-    //TODO CLEAN CODE
+use num_traits::ToPrimitive;
+use zstd::{Decoder, Encoder};
+
+use crate::utils::{Converter, Convert, vec2str};
+
+const SIZE_PAIR_POS: usize = 17;
+
+//   =========================================================================================== DECOMPRESSION ==============================================================================
+
+/// High-level decompression entry point.
+///
+/// Depending on whether `wanted_files_path` is provided, the function either
+/// decompresses the entire archive or only the subset of files listed in the
+/// `wanted_files_path`. It reads auxiliary files (positions, id->cid mapping,
+/// tigs and sizes) and invokes the corresponding decompression routine.
+///
+/// PARAM
+/// - `size_filename`: name of the sizes file in the input directory.
+/// - `color_id_filename`: name of the id->color mapping file.
+/// - `tigs_filename`: name of the tigs (encoded unitigs) file.
+/// - `positions_filename`: name of the positions file.
+/// - `filename_id`: filename that maps original file paths to ids (created at build time).
+/// - `out_dir`: output directory where decompressed FASTA shards will be written.
+/// - `wanted_files_path`: optional path to a file listing input files to extract (one per line).
+/// - `input_dir`: directory where compressed inputs reside (contains sizes/tigs/positions).
+///
+/// RETURNS
+/// - Result<()> indicating success or IO error.
+pub fn decompress(size_filename: &String, color_id_filename: &String, tigs_filename: &String, positions_filename: &String, filename_id: &String, out_dir: &String, wanted_files_path: &String, input_dir: String) -> std::io::Result<()>{
+    println!("Writting decompressed data in {out_dir}");
+
     
-    let input_fof: File;   
+
     if wanted_files_path != ""{
-        input_fof = File::open(wanted_files_path).unwrap();
+        let input_file = File::open(input_dir.clone() + filename_id).unwrap();
+        let input_reader = BufReader::new(input_file);
+        let mut filenames_id_map = HashMap::new();
+        let mut file_id: u32 = 0;
+        for line_result in input_reader.lines(){
+            let line = line_result?;
+            if let Some((path, size)) = line.split_once(':'){
+                filenames_id_map.insert(path.to_string(), (file_id, size.parse::<u64>().unwrap()));
+                println!("File: {}, ID: {}, LINE SIZE IN ID TO CIDS FILE: {}, LINE SIZE IN ID TO CIDS FILE AS U64: {}", path.to_string(), file_id, size, size.parse::<u64>().unwrap());
+            }
+            file_id += 1;
+        }
+
+        let cid_map_out_filenames = match get_cid_to_id_targeted(&(input_dir.clone() + &color_id_filename), &filenames_id_map, &wanted_files_path){
+            Ok(map) => map,
+            Err(e) => panic!("error gathering color set ids: {e:?}"),
+        };
+        let cid_to_id_map = cid_map_out_filenames.0;
+        let wanted_filenames = cid_map_out_filenames.1;
+        
+        println!("Query file given, decompressing only subpart of archive....");
+        decompress_wanted(&wanted_filenames, &(input_dir.clone()+positions_filename), cid_to_id_map, &(input_dir.to_owned()+tigs_filename), &(input_dir.to_owned()+size_filename), out_dir);
     }else{
-        //TODO ASK CONFIRMATION TO DECOMPRESS EVERYTHING.
-        input_fof = File::open(input_names).unwrap();
-    }
-    let reader = BufReader::new(input_fof);
-    let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
-    //let filename_to_nb_kmer = HashMap::new();
-    let mut files = Vec::new();
-    for filename in filenames.iter(){
-        let stem_filename = Path::new(filename).file_stem().unwrap();
-        let path = out_dir.join(String::from("Dump_")+ stem_filename.to_str().unwrap());
-        println!("{}", path.to_str().unwrap());
-        if path.is_file(){
-            std::fs::remove_file(path.clone()).expect("Unable to remove file");
+        println!("No query file given, decompressing entire archive....");
+        let cid_to_id_map = match get_cid_to_id(&(input_dir.clone() + &color_id_filename)){
+            Ok(map) => map,
+            Err(e) => panic!("Error getting cid to id map {e:?}"),
+        };
+        for elem in &cid_to_id_map{
+            println!("CID: {}", elem.0);
         }
-        let out_file = BufWriter::new(File::options().append(true).create(true).open(path).expect("Unable to create file"));
-        files.push(out_file);
-    }
-    let full_path = Path::new(omnicolor);
-
-    let mut color_size_path = String::from("multicolor_bucket_size.txt.zst");
-    let mut filename_color_path = String::from("filename_to_color.txt");
-    println!("{}", full_path.display());
-    if let Some(parent_path) = full_path.parent() {
-        //println!("a{}a", parent_path.display());
-        if parent_path.to_str().unwrap() != ""{
-            color_size_path = String::from(parent_path.to_str().unwrap())+"/multicolor_bucket_size.txt.zst";
-            filename_color_path = String::from(parent_path.to_str().unwrap())+"/filename_to_color.txt";
+        let input_file = File::open(input_dir.clone() + filename_id).unwrap();
+        let input_reader = BufReader::new(input_file);
+        let mut filenames_id = Vec::new();
+        let mut file_id: u32 = 0;
+        //ID IS POS IN ID TO CID FILE
+        for line_result in input_reader.lines(){
+            let line = line_result?;
+            if let Some((path, _)) = line.split_once(":"){
+                ("File: {}, ID: {}", path, file_id);
+                filenames_id.push((path.to_owned(), file_id));
+            }
+            file_id += 1;
         }
-        println!("{}", color_size_path);
-        println!("{}", filename_color_path);
+        println!("{}", input_dir.to_owned()+size_filename);
+        decompress_all(&(input_dir.to_owned()+size_filename), &(input_dir.clone()+positions_filename), &(input_dir.to_owned()+tigs_filename), out_dir, filenames_id, cid_to_id_map);
     }
-    let now = Instant::now();
-    decompress_multicolor(&color_size_path, &filename_color_path, wanted_files_path, multicolor, &out_dir, &mut files);
-    let elapsed = now.elapsed();
-    println!("Multicolored decompression process took: {:.2?} seconds.", elapsed);
-    //(0..filenames.len()).into_par_iter().for_each(|file_number|{
-        //let filename = filenames.get(file_number).unwrap();
-        //println!("{}", filename);
-    let omni_file = File::open(omnicolor).unwrap();
-    let mut omni_reader = BufReader::new(&omni_file);
-    //let ( reader, _compression) = niffler::get_reader(Box::new(File::open(omnicolor).unwrap())).unwrap();
-    let mut cursor: usize = 0;
-    let metadata = omni_file.metadata().unwrap();
-    let file_size: usize = metadata.len() as usize;
-    let mut counter_kmer = 0;
-    println!("FILE SIZE = {}", file_size);
-
-    let now = Instant::now();
-    while cursor < file_size{
-        let mut size_buf = [0; 4];
-        cursor += 4;
-        omni_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
-        let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
-        let size_simplitig: u32 = u32::from_le_bytes(size_buf);
-        //println!("READING CURSOR = {}", cursor);
-        cursor += size_to_read as usize;
-        //println!("SIZE: {}", size_simplitig);
-        let mut simplitig = vec![0; size_to_read as usize];
-        //println!("Reading {} Bytes", simplitig.len());
-        /*if cursor > 900000{
-            println!("SIZE: {}", size_simplitig);
-            println!("Reading {} Bytes", simplitig.len());
-            let to_write = vec2str(&simplitig, &(size_simplitig as usize));
-            //println!("simplitig = {}", to_write);
-            println!("Cursor = {}", cursor);
-            println!("SIZE READ: {}", size_to_read);
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
-        }*/
-        omni_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
-        let to_write = vec2str(&simplitig, &(size_simplitig as usize));
-        //println!("SIMPLITIG: {}", to_write);
-        //let mut input = String::new();
-        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input"); 
-        //println!("simplitig = {}", to_write);
-        let content = to_write;
-        counter_kmer += content.len()-30;
-        //println!("CURR PATH: {}", filename);
-        write_out_omni(&content, &mut files);
-    }
-    let elapsed = now.elapsed();
-    println!("Decompressing omnicolored simplitigs took: {:.2?} seconds.", elapsed);
-    println!("NB KMER SEEN IN OMNI {}", counter_kmer);
-        //dump_file.finish().expect("Error writing decompressed data");
-    //}); 
-    for file in files.iter_mut(){
-        let _ = file.flush();
-    }
+    Ok(())
 }
 
-fn decompress_multicolor(color_size_path: &str, filename_color_path: &str, wanted_files_path: &str, multicolor: &str, out_dir: &PathBuf, files: &mut Vec<BufWriter<File>>){
-    let now = Instant::now();
-    //Filename to color: PATH/TO/FILE.fa:0
-    //Number = position of file in color array (e.g. 011001).
+/// Read and return all position pairs from the positions file.
+///
+/// The positions file stores many individually zstd-compressed records.
+/// This function reads and decompresses `cid_to_id_map.len()` records and
+/// returns a vector of (tigs_cursor, sizes_cursor) pairs.
+///
+/// PARAM
+/// - `position_filename`: path to the positions file (zstd records).
+/// - `cid_to_id_map`: used only to know how many records to read.
+///
+/// RETURNS
+/// - Vec<(u32,u32)> list of (tigs_byte_offset, sizes_byte_offset).
+fn get_positions(position_filename: &String, cid_to_id_map: &HashMap<usize, Vec<u32>>) -> Result<Vec<(u32, u32)>>{
+    let position_file = File::open(position_filename)?;
+    let mut positions_reader = BufReader::new(position_file);
+    let mut positions: Vec<(u32, u32)> = Vec::new();
+    for _i in 0..cid_to_id_map.len(){
 
-    let filename_color_file = File::open(out_dir.clone().join(filename_color_path)).unwrap();
-    let filename_color_reader = BufReader::new(filename_color_file);
-    let mut filename_to_color: Vec<_> = filename_color_reader.lines().collect::<Result<_, _>>().unwrap();
-    //Color to encoded size of bucket for this color.
-    //Color is the array (e.g. 011001) The size is the size in bytes to be read for this specific bucket.
-    let color_size_file = File::open(color_size_path).unwrap();
-    let color_size_reader = BufReader::new(color_size_file);
-    let color_size_decoder = Decoder::new(color_size_reader).unwrap();
-    let decoder_reader = BufReader::new(color_size_decoder);
-    let color_to_pos: Vec<_> = decoder_reader.lines().collect::<Result<Vec<String>, _>>().unwrap();
-    let mut filenames = Vec::new();
-    let mut positions_in_color = Vec::new();
-    if wanted_files_path == ""{
-        println!("No query provided, decompressing everything.");
-        for line in filename_to_color.iter(){
-            filenames.push(String::from(line.split(':').collect::<Vec<_>>()[0]));
-            positions_in_color.push(line.split(':').collect::<Vec<_>>()[1].parse::<usize>().unwrap());
+        let mut size_buffer = [0; 4];
+        positions_reader.read_exact(&mut size_buffer)?;
+        let compressed_size = u32::from_le_bytes(size_buffer) as usize;
+
+        let mut current_buffer = vec![0;compressed_size];
+        positions_reader.read_exact(&mut current_buffer)?;
+        let mut decompressed_positions = Vec::new();
+
+        {
+            let mut decoder_positions = Decoder::new(&current_buffer[..])?;
+            decoder_positions.read_to_end(&mut decompressed_positions)?;
+            println!("a{}a", decompressed_positions.len());
+            let pos_size = u32::from_le_bytes(decompressed_positions[..4].try_into().unwrap());
+            let pos_tigs = u32::from_le_bytes(decompressed_positions[4..].try_into().unwrap());
+            println!("SIZE: {}", pos_size);
+            println!("TIGS {}", pos_tigs);
+            positions.push((pos_tigs, pos_size));
         }
-    }else{
-        positions_in_color = filter_filenames_multicolor(wanted_files_path, &mut filename_to_color);
     }
-    let elapsed = now.elapsed();
-    println!("Reading interface files took: {:.2?} seconds.", elapsed);
-    let now = Instant::now();
-    decompress_needed(&color_to_pos, multicolor, files, &positions_in_color);
-    let elapsed = now.elapsed();
-    println!("Decompression of multicolored + organising interface data took: {:.2?} seconds.", elapsed);
+    Ok(positions)
+}
+
+/// Read individual position records for a targeted set of color ids.
+///
+/// This function seeks into the positions file to the exact byte offsets
+/// corresponding to color ids present in `cid_to_id_map` and returns the
+/// decompressed pairs.
+///
+/// PARAM
+/// - `position_filename`: path to the positions file.
+/// - `cid_to_id_map`: keys are color ids required; the function reads only those.
+///
+/// RETURNS
+/// - Vec<(u32,u32)> for the requested color ids.
+fn get_specific_pos(position_filename: &String, cid_to_id_map: &HashMap<usize, Vec<u32>>) -> Result<Vec<(u32, u32)>>{
+    let position_file = File::open(position_filename)?;
+    let mut positions_reader = BufReader::new(position_file);
+    let mut positions: Vec<(u32, u32)> = Vec::new();
+    let mut buffer_position_tigs = [0; 4];
+    let mut buffer_position_size = [0; 4];
+    for elem in cid_to_id_map.keys(){
+        let cursor_pos : u64 = (elem+SIZE_PAIR_POS) as u64;
+        positions_reader.seek(std::io::SeekFrom::Start(cursor_pos as u64))?;
+        positions_reader.read_exact(&mut buffer_position_tigs)?;
+        positions_reader.read_exact(&mut buffer_position_size)?;
+        let mut decompressed_pos_tigs = Vec::new();
+        let mut decompressed_pos_size = Vec::new();
+        {
+            let mut decoder_pos_tigs = Decoder::new(&buffer_position_tigs[..])?;
+            decoder_pos_tigs.read_to_end(&mut decompressed_pos_tigs)?;
+            let mut decoder_pos_size = Decoder::new(&buffer_position_size[..])?;
+            decoder_pos_size.read_to_end(&mut decompressed_pos_size)?;
+            let pos_size = u32::from_le_bytes(decompressed_pos_size.try_into().unwrap());
+            let pos_tigs = u32::from_le_bytes(decompressed_pos_tigs.try_into().unwrap());
+            println!("SIZE: {}", pos_size);
+            println!("TIGS {}", pos_tigs);
+            positions.push((pos_tigs, pos_size));
+        }
+    }
+    Ok(positions)
+}
+
+/// Decompress the entire archive to individual FASTA shards.
+///
+/// Iterates over all color buckets and writes each unitig to every file that
+/// belongs to the color-set. The function uses the `positions` vector to seek
+/// in the size/tigs files appropriately.
+///
+/// PARAM
+/// - `size_filename`: path to decompressed sizes file.
+/// - `positions`: vector of (tigs_cursor,sizes_cursor) pairs for all buckets.
+/// - `tigs_filename`: path to the tigs (encoded) file.
+/// - `out_dir`: output directory for resulting FASTA fragments.
+/// - `filenames`: Vec of (original_path, file_id) used to name outputs.
+/// - `cid_to_id_map`: mapping color_id -> list of file ids that contain it.
+fn decompress_all(size_filename: &String, positions_filename: &String, tigs_filename: &String, out_dir: &String, filenames: Vec<(String, u32)>, cid_to_id_map: HashMap<usize, Vec<u32>>) {
+    let mut tigs_file = BufReader::new(
+        File::open(&tigs_filename).expect("Error opening tigs file")
+    );
     
-}
-
-fn read_at_pos(multicolor_reader: &mut BufReader<File>, size: usize, prev_cursor: &mut u64) -> String{
-    //let mut decompressor = Decompressor::new().unwrap();
-    multicolor_reader.seek(std::io::SeekFrom::Start(*prev_cursor)).expect("Unable to seek to specified position");
-    let mut buffer = vec![0; size.div_ceil(4)];
-    multicolor_reader.read_exact(&mut buffer).unwrap();
-    //let mut input = String::new();
-    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    //let decompressed = decompressor.decompress(&buffer, size*100).unwrap();
-    //println!("Decompressed: {}", vec2str(&buffer, &size));
-    *prev_cursor += size.div_ceil(4) as u64;
-    vec2str(&buffer, &size)
-}
-
-fn increment_cursor(cursor: &mut u64, end_pos: &String, to_read: bool){
-    //println!("CURSOR BEFORE INCREMENT: {}", cursor);
-    if !to_read{
-        *cursor = end_pos.parse::<u64>().unwrap();
-    }else{
-        *cursor += end_pos.parse::<u64>().unwrap() - *cursor;
-    }
-    //println!("cursor after increment: {}", cursor);
-}
-
-fn filter_filenames_multicolor(wanted_files_path: &str, filename_to_color: &mut Vec<String>) -> Vec<usize>{
-    let wanted_files = File::open(wanted_files_path).unwrap();
-    let wanted_files_reader = BufReader::new(wanted_files);
-    let wanted_files_list: Vec<_> = wanted_files_reader.lines().collect::<Result<_, _>>().unwrap();
-    println!("Decompressing {} files...", wanted_files_list.len());
-    //FILTER FILES AND COLORS OF INTEREST.
-    let mut filenames = Vec::new();
-    let mut positions_in_color = Vec::new();
-    for elem in filename_to_color.iter(){
-        let filename = elem.split(':').collect::<Vec<_>>()[0];
-        for line in wanted_files_list.iter(){
-            if line == filename{
-                filenames.push(String::from(filename));
-                positions_in_color.push(elem.split(':').collect::<Vec<_>>()[1].parse::<usize>().unwrap());
+    println!("nb cid: {}", cid_to_id_map.len());
+    
+    let mut sorted_cids: Vec<_> = cid_to_id_map.keys().cloned().collect();
+    sorted_cids.sort();
+    
+    for (idx, cid) in sorted_cids.iter().enumerate() {
+        let file_ids = cid_to_id_map.get(cid).unwrap();
+        for elem in file_ids.clone(){
+            println!("{elem}");
+        }
+        println!("Processing CID: {} (position in positions file)", cid);
+        
+        let (tigs_pos, sizes_pos) = match read_position_at_cid(positions_filename, *cid) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("Error reading position at CID {}: {:?}", cid, e);
+                continue;
+            }
+        };
+        
+        let (_next_tigs_pos, next_sizes_pos) = if idx + 1 < sorted_cids.len() {
+            match read_position_at_cid(positions_filename, sorted_cids[idx + 1]) {
+                Ok(pos) => pos,
+                Err(_) => {
+                    get_file_end_positions(tigs_filename, size_filename).unwrap()
+                }
+            }
+        } else {
+            get_file_end_positions(tigs_filename, size_filename).unwrap()
+        };
+        println!("{}", next_sizes_pos);
+        let sizes = match read_bucket_sizes_at_position(size_filename, sizes_pos) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error reading sizes for CID {}: {:?}", cid, e);
+                continue;
+            }
+        };
+        
+        if sizes.is_empty() {
+            println!("No unitigs in bucket at CID {}", cid);
+            continue;
+        }
+        
+        tigs_file.seek(std::io::SeekFrom::Start(tigs_pos as u64)).expect("Failed to seek in tigs file");
+        
+        for size in sizes {
+            if size < 31 {
+                eprintln!("Warning: unitig size {} is less than k-mer size", size);
+                continue;
+            }
+            
+            let read_size = size.div_ceil(4);
+            let mut tig_buffer = vec![0; read_size];
+            tigs_file.read_exact(&mut tig_buffer).expect("Failed to read tig");
+            
+            let tig = vec2str(&tig_buffer, &size);
+            for file_id in file_ids {
+                println!("{file_id}");
+                let curr_filename = &filenames[*file_id as usize];
+                let trunc_filename = Path::new(&curr_filename.0).file_stem().unwrap();
+                
+                let output_path = format!("{}Dump_{}.fa", out_dir, trunc_filename.to_str().unwrap());
+                
+                let mut out_file = BufWriter::new(File::options().append(true).create(true).open(output_path).expect("Unable to create file"));
+                writeln!(out_file, ">").unwrap();
+                writeln!(out_file, "{}", tig).unwrap();
+                out_file.flush().unwrap();
             }
         }
     }
-    //ERROR HANDLING
-    println!("There are {} files in the compressed archive", filename_to_color.len());
-    if filenames.len() != wanted_files_list.len(){
-        println!("ERROR: I found a different number of files than the number asked.");
-        println!("Maybe you asked files that where not in the initial input ?");
-        println!("Files in wanted list:");
-        for elem in wanted_files_list{
-            println!("{}", elem);
-        }
-        println!("Files found:");
-        for elem in &filenames{
-            println!("{}", elem)
-        }
-        //TODO Ask if should continue decompressing.
-    }
-    positions_in_color
 }
 
-fn decompress_needed(color_to_pos: &Vec<String>, multicolor: &str, files: &mut Vec<BufWriter<File>>, positions_in_color: &Vec<usize>){
-    let mut prev_cursor: u64 = 0;
-    let now = Instant::now();
-    let color_to_sizes = organise_interface_data(color_to_pos);
-    let elapsed = now.elapsed();
-    println!("Organising interface data took: {:.2?} seconds.", elapsed);
-    println!("NB FILES {}", files.len());
-    //OPEN MULTICOLOR FILE
-    let multicolor_file = File::open(multicolor).unwrap();
-    let mut multicolor_reader = BufReader::new(multicolor_file);
-    let mut to_read = false;
-    let mut counter_kmer = 0;
-    let now = Instant::now();
-    for (color, sizes, end_cursor_pos) in color_to_sizes.iter(){
-        for i in positions_in_color.iter(){
-            if color.chars().nth(*i).unwrap() == '1'{
-                to_read = true;
-                break;
+
+/// Read full id->color_id file and build color id -> list of file ids.
+///
+/// The function expects the id->color file format written by write_id_to_color_id:
+/// size(u64) + zstd_compressed_csv_positions repeated, terminated by 0_u64.
+///
+/// PARAM
+/// - `color_id_filename`: path to the id->color file.
+///
+/// RETURNS
+/// - HashMap<color_id, Vec<file_id>>
+fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>{
+    let mut color_id_file = BufReader::new(File::open(color_id_filename).expect("Error opening color id file, are you sur you gave the right path ?"));
+    let mut cid_ids_map = HashMap::new();
+    let mut counter: u32 = 0;
+    println!("READING CID TO ID FILE: {}", color_id_filename);
+    let mut buffer_size = [0; 8];
+    color_id_file.read_exact(&mut buffer_size)?;
+    let mut size_read = usize::from_le_bytes(buffer_size);
+    while size_read != 0 {
+        let mut buffer = vec![0; size_read];
+        color_id_file.read_exact(&mut buffer)?;
+        let mut decompressed_data = Vec::new();
+        {
+            let mut decoder = Decoder::new(&buffer[..])?;
+            decoder.read_to_end(&mut decompressed_data)?;
+        }
+        let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
+        let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
+        for cid in temp_cids{
+            if cid != "" {
+                cid_ids_map.entry(cid.parse::<usize>().unwrap())
+                    .and_modify(|list: &mut Vec<_>| list.push(counter))
+                    .or_insert(Vec::from([counter]));
             }
         }
-        if to_read{
-            for size in sizes.iter(){
-                let content = read_at_pos(&mut multicolor_reader, size.parse::<usize>().unwrap(), &mut prev_cursor);
-                let mut i:usize = 0;
-                for elem in positions_in_color{
-                    /*println!("ELEM: {}", elem);
-                    if *elem == 0{
-                        println!("COLOR: {}", color)
-                    }*/
-                    if color.chars().nth(*elem).unwrap() == '1'{
-                        //println!("{}", color);
-                        /*if *elem == 0{
-                            println!("POS IN COLOR: {}", elem);
-                            println!("IS AT POS: {}", positions_in_color.iter().position(|pos| pos == elem).unwrap());
-                            let mut input = String::new();
-                            std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-                        }*/
-                        counter_kmer += content.len()-30;
-                        write_output(&content, files.get_mut(i).unwrap());
-                        //positions_in_color.iter().position(|pos| pos == elem).unwrap()
-                    }
-                    i+=1;
-                    //let mut input = String::new();
-                    //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        color_id_file.read_exact(&mut buffer_size)?;
+        size_read = usize::from_le_bytes(buffer_size);
+        counter += 1;
+    }
+    
+    Ok(cid_ids_map)
+}
+
+/// Build cid -> file id mapping for a targeted subset of files.
+///
+/// This function reads the id->color file at the offsets provided by
+/// `filenames_id_map` for the requested file paths listed in `wanted_files_path`.
+/// It returns:
+/// - a HashMap from color id -> list of file ids found in the requested set,
+/// - a Vec of (filename, file_id) for the requested files (used by downstream code).
+///
+/// PARAM
+/// - `color_id_filename`: path to id->color file.
+/// - `filenames_id_map`: map original path -> (file_id, byte_offset_in_id_file).
+/// - `wanted_files_path`: path containing one filename per line to extract.
+///
+/// RETURNS
+/// - Result<(HashMap<usize, Vec<u32>>, Vec<(String,u32)>)>
+fn get_cid_to_id_targeted(color_id_filename: &String, filenames_id_map: &HashMap<String, (u32, u64)>, wanted_files_path: &String) -> std::io::Result<(HashMap<usize, Vec<u32>>, Vec<(String, u32)>)>{    
+    // FILE ID TO COLOR IDS
+    let mut color_id_file = BufReader::new(File::open(color_id_filename).expect("Error opening color id file, are you sur you gave the right path ?"));
+
+    // CID TO ID HASHMAP
+    let mut cid_ids_map = HashMap::new();
+
+    // WANTED FILENAMES VEC
+    let mut wanted_filenames = Vec::new();
+
+    // QUERIED FILES TO DECOMPRESS
+    let wanted_file = File::open(wanted_files_path)?;
+    let wanted_reader = BufReader::new(wanted_file);
+    for line_result in wanted_reader.lines(){
+        let line = line_result?;
+        if filenames_id_map.contains_key(&line){
+            println!("COUCOUC");
+            let entry = filenames_id_map.get(&line).unwrap();
+            println!("{}", entry.1);
+            println!("{}", entry.0);
+            color_id_file.seek(std::io::SeekFrom::Start(entry.1))?;
+            let mut buffer_size = [0; 8];
+            color_id_file.read_exact(&mut buffer_size)?;
+            let size_read = usize::from_le_bytes(buffer_size);
+            println!("{size_read}");
+            let mut buffer = vec![0; size_read];
+            color_id_file.read_exact(&mut buffer)?;
+            let mut decompressed_data = Vec::new();
+            {
+                let mut decoder = Decoder::new(&buffer[..])?;
+                decoder.read_to_end(&mut decompressed_data)?;
+            }
+            let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
+            let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
+            for cid in temp_cids{
+                if cid != "" {
+                    cid_ids_map.entry(cid.parse::<usize>().unwrap())
+                        .and_modify(|list: &mut Vec<_>| list.push(entry.0))
+                        .or_insert(Vec::from([entry.0]));
+                }
+            }
+            println!("REEEEE");
+            wanted_filenames.push((line.clone(), entry.0));
+        }else {
+            println!("FILE {} NOT FOUND IN ARCHIVE, CHECK SPELLING OR ACTUAL PRESENCE IN ARCHIVE", line);
+        }
+    }
+    Ok((cid_ids_map, wanted_filenames))
+}
+
+/// Convenience helper to fully decompress the bucket sizes file to a temporary text file.
+///
+/// This function is a small utility used in debugging and expects the input
+/// `size_filename` to be zstd-compressed. It writes decompressed sizes to
+/// `tmp_sizes.txt`.
+fn decompress_sizes(size_filename: &String){
+    let size_file = BufReader::new(File::open(size_filename).expect("Error opening size file, are you sure path is good?"));
+    let mut size_decoder = Decoder::new(size_file).expect("Failed to decode color file");
+    let mut tmp_size = BufWriter::new(File::create("tmp_sizes.txt").expect("Unable to create temporary size file"));
+    io::copy(&mut size_decoder, &mut tmp_size);
+}
+
+
+fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &String, cid_to_id_map: HashMap<usize, Vec<u32>>, tigs_filename: &String, size_filename: &String, out_dir: &String) {
+    
+    println!("NB COLOR TO DECOMPRESS: {}", cid_to_id_map.len());
+    println!("Wanted files:");
+    for elem in wanted_files {
+        println!("{} : {}", elem.0, elem.1);
+    }
+    
+    let mut tigs_file = BufReader::new(
+        File::open(&tigs_filename).expect("Error opening tigs file")
+    );
+    
+    let mut sorted_cids: Vec<_> = cid_to_id_map.keys().cloned().collect();
+    sorted_cids.sort();
+    
+    for (_idx, cid) in sorted_cids.iter().enumerate() {
+        let file_ids = cid_to_id_map.get(cid).unwrap();
+        
+        println!("Processing CID: {} (byte position in positions file)", cid);
+        
+        let (tigs_pos, sizes_pos) = match read_position_at_cid(positions_filename, *cid) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("Error reading position at CID {}: {:?}", cid, e);
+                continue;
+            }
+        };
+        
+        let sizes = match read_bucket_sizes_at_position(size_filename, sizes_pos) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error reading sizes for CID {}: {:?}", cid, e);
+                continue;
+            }
+        };
+        
+        if sizes.is_empty() {
+            println!("No unitigs at CID {}", cid);
+            continue;
+        }
+        tigs_file.seek(std::io::SeekFrom::Start(tigs_pos as u64)).expect("Failed to seek in tigs file");
+        
+        for size in sizes {
+            if size < 31 {
+                eprintln!("Warning: unitig size {} is less than k-mer size", size);
+                continue;
+            }
+            
+            let read_size = size.div_ceil(4);
+            let mut tig_buffer = vec![0; read_size];
+            tigs_file.read_exact(&mut tig_buffer).expect("Failed to read tig");
+            
+            let tig = vec2str(&tig_buffer, &size);
+            
+            for wanted_file in wanted_files {
+                if file_ids.contains(&wanted_file.1) {
+                    let trunc_filename = Path::new(&wanted_file.0).file_stem().unwrap();
                     
+                    let output_path = format!(
+                        "{}Dump_{}.fa",
+                        out_dir,
+                        trunc_filename.to_str().unwrap()
+                    );
+                    
+                    let mut out_file = BufWriter::new(
+                        File::options().append(true).create(true).open(output_path).expect("Unable to create file")
+                    );
+                    
+                    writeln!(out_file, ">").unwrap();
+                    writeln!(out_file, "{}", tig).unwrap();
+                    out_file.flush().unwrap();
                 }
             }
         }
-        //println!("filename: {}", filenames.get(pos).unwrap());
-        //println!("NB KMER = {}", counter);
-        increment_cursor(&mut prev_cursor, end_cursor_pos, to_read);
-        //let mut input = String::new();
-        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
-        to_read = false;
-    }
-    let elapsed = now.elapsed();
-    println!("Actual multicolor decompression took: {:.2?} seconds.", elapsed);
-
-    println!("IN MULT, I HAVE READ {} KMERS", counter_kmer);
-}
-
-//TRAITE LES DONNES DU FICHIER D'INTERFACE ET LES ORGANISE POUR LES RENDRE UTILISABLE EFFICACEMENT.
-fn organise_interface_data(color_to_pos: &Vec<String>) -> Vec<(String, Vec<&str>, String)>{
-    let mut color_to_sizes: Vec<(String, Vec<&str>, String)> = Vec::new();
-    for color_size in color_to_pos{
-        let first_part = color_size.split(':').collect::<Vec<_>>()[0];
-        let sizes = color_size.split(':').collect::<Vec<_>>()[1];
-        let color = first_part.split(',').collect::<Vec<_>>()[0];
-        let end_cursor_pos = first_part.split(',').collect::<Vec<_>>()[1];
-        //println!("COLOR: {}", color);
-        if sizes.contains(','){
-            let sizes_vec = sizes.split(',').collect::<Vec<_>>();
-            color_to_sizes.push((String::from(color), sizes_vec, String::from(end_cursor_pos)));
-        }else{
-            let mut vec = Vec::new();
-            vec.push(sizes);
-            color_to_sizes.push((String::from(color), vec, String::from(end_cursor_pos)));
-        }
-    }
-    color_to_sizes
-}
-
-fn write_out_omni(content: &String, files: &mut Vec<BufWriter<File>>){
-    for file in files.iter_mut(){
-        write_output(content, file);
     }
 }
 
-fn write_output(content: &String, out_file: &mut BufWriter<File>){
-    /*else{
-        let mut file = File::options().write(true).read(true).create_new(true).open(path);
-    }*/
-    //println!("BONJOURENT");
+
+fn read_position_at_cid(positions_filename: &str, cid: usize) -> Result<(u32, u32)> {
+    let mut positions_file = BufReader::new(File::open(positions_filename)?);
     
-    //println!("OUTFILENAME: {}", path.display());
-    //out_file.seek(std::io::SeekFrom::End(0)).expect("unable to seek to end of file.");
-    out_file.write_all(&">\n".as_bytes()).unwrap();
-    out_file.write_all(content.as_bytes()).unwrap();
-    out_file.write_all(&"\n".as_bytes()).unwrap(); 
+    positions_file.seek(std::io::SeekFrom::Start(cid as u64))?;
+    
+    let mut size_buffer = [0; 4];
+    positions_file.read_exact(&mut size_buffer)?;
+    let compressed_size = u32::from_le_bytes(size_buffer) as usize;
+    
+    let mut compressed_buffer = vec![0; compressed_size];
+    positions_file.read_exact(&mut compressed_buffer)?;
+    
+    let mut decompressed = Vec::new();
+    let mut decoder = Decoder::new(&compressed_buffer[..])?;
+    decoder.read_to_end(&mut decompressed)?;
+    
+    let pos_tigs = u32::from_le_bytes(decompressed[..4].try_into().unwrap());
+    let pos_sizes = u32::from_le_bytes(decompressed[4..8].try_into().unwrap());
+    
+    Ok((pos_tigs, pos_sizes))
 }
 
+
+fn read_bucket_sizes_at_position(size_file_path: &str, start_pos: u32) -> Result<Vec<usize>> {
+    let mut size_file = BufReader::new(File::open(size_file_path)?);
+    size_file.seek(std::io::SeekFrom::Start(start_pos as u64))?;
+    
+    let mut size_buffer = [0; 8];
+    size_file.read_exact(&mut size_buffer)?;
+    let compressed_size = usize::from_le_bytes(size_buffer);
+    println!("compressed size: {compressed_size}");
+    println!("start pos:{start_pos}");
+    let mut compressed_buffer = vec![0; compressed_size];
+    size_file.read_exact(&mut compressed_buffer)?;
+    
+
+    let mut decoder = Decoder::new(&compressed_buffer[..])?;
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    println!("aa");
+    let mut sizes = Vec::new();
+    let mut prev = 0;
+    for chunk in decompressed.chunks_exact(8) {
+        let delta = usize::from_le_bytes(chunk.try_into().unwrap());
+        let actual_size = delta + prev;
+        println!("actual:{actual_size}");
+        println!("encoded:{delta}");
+        println!("prev:{prev}");
+        sizes.push(actual_size);
+        prev = actual_size;
+    }
+    
+    Ok(sizes)
+}
+
+fn get_file_end_positions(tigs_filename: &str, sizes_filename: &str) -> Result<(u32, u32)> {
+    let tigs_file = File::open(tigs_filename)?;
+    let tigs_size = tigs_file.metadata()?.len() as u32;
+    
+    let sizes_file = File::open(sizes_filename)?;
+    let sizes_size = sizes_file.metadata()?.len() as u32;
+    
+    Ok((tigs_size, sizes_size))
+}

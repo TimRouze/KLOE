@@ -1,35 +1,107 @@
 use anyhow::{bail, Context, Result};
 use bio::io::fasta;
+use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use flate2::read::GzDecoder;
 use hashbrown::{hash_map::Entry, HashMap};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
+use rayon::{prelude::*, ThreadPoolBuilder};
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Arc;
 use std::sync::mpsc;
-use tempfile::{Builder as TempFileBuilder, TempPath};
+use std::sync::Arc;
+use std::thread;
 use threadpool::ThreadPool;
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 const BUFFER_TARGET: usize = 128 * 1024;
-const ZSTD_LEVEL_FAST4: i32 = -4; // zstd "fast=4" mode for lower memory and higher speed
-const SORT_RUN_TARGET_BYTES: usize = 256 * 1024 * 1024; // spill sort runs around 256 MiB
-const MERGE_FANIN: usize = 8;
-static MERGE_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const WRITE_BUFFER_TARGET: usize = 8 * 1024 * 1024;
+const ZSTD_LEVEL_FAST: i32 = -4; // zstd "fast=4" mode for high speed
+
+fn remove_intermediate_file_best_effort(path: &Path) {
+    if let Err(err) = fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "Warning: failed to remove intermediate file {}: {}",
+                path.display(),
+                err
+            );
+        }
+    }
+}
 
 struct PartitionWriter {
     path: PathBuf,
     encoder: Mutex<Option<ZstdEncoder<'static, File>>>,
+}
+
+struct PartitionReader {
+    reader: Option<Box<dyn BufRead + Send>>,
+    path: PathBuf,
+    id_width: usize,
+    header_buf: Vec<u8>,
+    seq_buf: Vec<u8>,
+}
+
+impl PartitionReader {
+    fn new(path: PathBuf, id_width: usize) -> Result<Self> {
+        let file = File::open(&path)
+            .with_context(|| format!("open partition simplitigs {}", path.display()))?;
+        #[cfg(unix)]
+        remove_intermediate_file_best_effort(&path);
+        let decoder = ZstdDecoder::new(file)
+            .with_context(|| format!("build zstd decoder for {}", path.display()))?;
+        Ok(Self {
+            reader: Some(Box::new(BufReader::new(decoder))),
+            path,
+            id_width,
+            header_buf: Vec::new(),
+            seq_buf: Vec::new(),
+        })
+    }
+
+    fn next_record(&mut self) -> Result<Option<SimplitigRecord>> {
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(None);
+        };
+
+        let result = read_simplitig_record(
+            reader.as_mut(),
+            self.id_width,
+            &mut self.header_buf,
+            &mut self.seq_buf,
+        )
+        .with_context(|| format!("read simplitig from {}", self.path.display()));
+
+        match result {
+            Ok(Some(record)) => Ok(Some(record)),
+            Ok(None) => {
+                self.reader.take();
+                remove_intermediate_file_best_effort(&self.path);
+                Ok(None)
+            }
+            Err(err) => {
+                self.reader.take();
+                remove_intermediate_file_best_effort(&self.path);
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for PartitionReader {
+    fn drop(&mut self) {
+        self.reader.take();
+        remove_intermediate_file_best_effort(&self.path);
+    }
 }
 
 type SharedEncoders = Arc<Vec<PartitionWriter>>;
@@ -57,6 +129,31 @@ impl Stats {
     }
 }
 
+struct KmerEntry {
+    ids: Vec<u64>,
+    successor: Option<u8>,
+    predecessor: Option<u8>,
+    succ_ambig: bool,
+    pred_ambig: bool,
+    visited: bool,
+}
+
+fn format_duration(duration: Duration) -> String {
+    let std_duration = duration
+        .to_std()
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+    let hours = std_duration.as_secs() / 3600;
+    let minutes = (std_duration.as_secs() % 3600) / 60;
+    let seconds = std_duration.as_secs() % 60;
+    let millis = std_duration.subsec_millis();
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn log_checkpoint(label: &str, start: DateTime<Utc>) {
+    let elapsed = Utc::now().signed_duration_since(start);
+    println!("{label} wall time: {}", format_duration(elapsed));
+}
+
 fn bitset_words(dataset_count: usize) -> usize {
     (dataset_count + 63) / 64
 }
@@ -76,32 +173,14 @@ fn ids_from_bitset(bits: &[u64]) -> Vec<usize> {
     ids
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Parse FASTA files into superkmers grouped by minimizer"
-)]
-struct Args {
-    #[arg(short = 'i', long = "input-fof")]
-    input_fof: PathBuf,
-    #[arg(short = 'o', long = "output-dir")]
-    output_dir: PathBuf,
-    #[arg(short = 'k', long = "kmer", default_value_t = 31)]
-    k: usize,
-    #[arg(short = 'm', long = "minimizer", default_value_t = 9)]
-    m: usize,
-    /// Number of partitions is 2^partition_power (default 1024 partitions)
-    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
-    partition_power: u32,
-    #[arg(short = 't', long = "threads", default_value_t = 32)]
-    threads: usize,
-    /// Concurrency for the compaction phase (per-partition simplitigs)
-    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
-    compaction_threads: usize,
-    /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
-    #[arg(long = "verify-kmers", default_value_t = false)]
-    verify_kmers: bool,
+fn id_width(dataset_count: usize) -> usize {
+    let mut value = dataset_count.max(1);
+    let mut width = 1usize;
+    while value >= 10 {
+        value /= 10;
+        width += 1;
+    }
+    width
 }
 
 fn ensure_nofile_limit(required: u64) -> Result<()> {
@@ -126,6 +205,16 @@ fn ensure_nofile_limit(required: u64) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn zstd_encoder_mt(path: &Path, level: i32, threads: usize) -> Result<ZstdEncoder<'static, File>> {
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut encoder = ZstdEncoder::new(file, level)
+        .with_context(|| format!("build zstd encoder for {}", path.display()))?;
+    if threads > 1 {
+        let _ = encoder.multithread(threads as u32);
+    }
+    Ok(encoder)
 }
 
 fn read_fof(path: &Path) -> Result<Vec<PathBuf>> {
@@ -175,6 +264,19 @@ fn base_to_bits(b: u8) -> Option<u8> {
         b'T' | b't' => Some(3),
         _ => None,
     }
+}
+
+fn bits_to_base(bits: u8) -> u8 {
+    match bits {
+        0 => b'A',
+        1 => b'C',
+        2 => b'G',
+        _ => b'T',
+    }
+}
+
+fn complement_bits(bits: u8) -> u8 {
+    bits ^ 0b11
 }
 
 fn encode_kmer(seq: &[u8]) -> Option<u64> {
@@ -227,7 +329,7 @@ fn create_partition_encoders(output_dir: &Path, partitions: u64) -> Result<Share
         let file_path = output_dir.join(format!("{i}.fa.zst"));
         let file = File::create(&file_path)
             .with_context(|| format!("create partition file {}", file_path.display()))?;
-        let encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
+        let encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST)
             .with_context(|| format!("build zstd encoder for {}", file_path.display()))?;
         writers.push(PartitionWriter {
             path: file_path,
@@ -263,14 +365,45 @@ fn flush_all_buffers(
     Ok(())
 }
 
+fn merge_successor(entry: &mut KmerEntry, next_bits: u8) {
+    match entry.successor {
+        None => entry.successor = Some(next_bits),
+        Some(existing) if existing == next_bits => {}
+        Some(_) => entry.succ_ambig = true,
+    }
+}
+
+fn merge_predecessor(entry: &mut KmerEntry, prev_bits: u8) {
+    match entry.predecessor {
+        None => entry.predecessor = Some(prev_bits),
+        Some(existing) if existing == prev_bits => {}
+        Some(_) => entry.pred_ambig = true,
+    }
+}
+
 fn build_kmer_map_from_partition(
     partition_path: &Path,
     k: usize,
     dataset_count: usize,
-) -> Result<HashMap<u64, Vec<u64>>> {
+) -> Result<HashMap<u64, KmerEntry>> {
     let words = bitset_words(dataset_count);
-    let mut map: HashMap<u64, Vec<u64>> = HashMap::with_capacity(1024);
-    let reader = open_fasta_reader(partition_path)?;
+    let est_entries = fs::metadata(partition_path)
+        .map(|m| (m.len() / (k as u64)).saturating_add(1024) as usize)
+        .unwrap_or(1024)
+        .max(1024);
+    let mut map: HashMap<u64, KmerEntry> = HashMap::with_capacity(est_entries);
+    let file = File::open(partition_path)
+        .with_context(|| format!("open partition {}", partition_path.display()))?;
+    #[cfg(unix)]
+    remove_intermediate_file_best_effort(partition_path);
+    let decoder = ZstdDecoder::new(file)
+        .with_context(|| format!("create zstd decoder for {}", partition_path.display()))?;
+    let reader = fasta::Reader::from_bufread(BufReader::new(decoder));
+    let mask: u64 = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
     for record in reader.records() {
         let record = record
             .with_context(|| format!("read partition record in {}", partition_path.display()))?;
@@ -292,12 +425,60 @@ fn build_kmer_map_from_partition(
         let id_idx = dataset_id - 1;
         let word_idx = id_idx / 64;
         let bit_mask = 1u64 << (id_idx % 64);
-        for i in 0..=seq.len() - k {
-            let kmer_slice = &seq[i..i + k];
-            if let Some(bits) = encode_kmer(kmer_slice) {
-                let canon = canonical_bits(bits, k);
-                let entry = map.entry(canon).or_insert_with(|| vec![0u64; words]);
-                entry[word_idx] |= bit_mask;
+        let mut fwd: u64 = 0;
+        let mut rev: u64 = 0;
+        let mut len = 0usize;
+        for (idx, &base) in seq.iter().enumerate() {
+            let Some(bits) = base_to_bits(base) else {
+                len = 0;
+                fwd = 0;
+                rev = 0;
+                continue;
+            };
+            fwd = ((fwd << 2) | bits as u64) & mask;
+            rev = (rev >> 2) | ((complement_bits(bits) as u64) << (2 * (k - 1)));
+            len += 1;
+            if len < k {
+                continue;
+            }
+            let start = idx + 1 - k;
+            let forward_is_canon = fwd <= rev;
+            let canon = if forward_is_canon { fwd } else { rev };
+            let successor = if forward_is_canon {
+                seq.get(idx + 1).and_then(|b| base_to_bits(*b))
+            } else if start > 0 {
+                seq.get(start - 1)
+                    .and_then(|b| base_to_bits(*b))
+                    .map(complement_bits)
+            } else {
+                None
+            };
+            let predecessor = if forward_is_canon {
+                if start > 0 {
+                    seq.get(start - 1).and_then(|b| base_to_bits(*b))
+                } else {
+                    None
+                }
+            } else {
+                seq.get(idx + 1)
+                    .and_then(|b| base_to_bits(*b))
+                    .map(complement_bits)
+            };
+
+            let entry = map.entry(canon).or_insert_with(|| KmerEntry {
+                ids: vec![0u64; words],
+                successor: None,
+                predecessor: None,
+                succ_ambig: false,
+                pred_ambig: false,
+                visited: false,
+            });
+            entry.ids[word_idx] |= bit_mask;
+            if let Some(next_bits) = successor {
+                merge_successor(entry, next_bits);
+            }
+            if let Some(prev_bits) = predecessor {
+                merge_predecessor(entry, prev_bits);
             }
         }
     }
@@ -510,100 +691,9 @@ fn verify_kmer_maps(
 
 #[derive(Debug)]
 struct SimplitigRecord {
-    ids: Vec<usize>,
+    header: Vec<u8>,
+    key: Vec<u8>,
     seq: Vec<u8>,
-}
-
-fn estimated_record_bytes(ids: &[usize], seq_len: usize) -> usize {
-    ids.len() * std::mem::size_of::<usize>() + seq_len
-}
-
-fn parse_ids_from_header(header: &str) -> Result<Vec<usize>> {
-    let Some(rest) = header.strip_prefix(">ids:") else {
-        bail!("invalid simplitig header (expected >ids:): '{header}'");
-    };
-    let mut ids = Vec::new();
-    for part in rest.split(',') {
-        if part.is_empty() {
-            continue;
-        }
-        let id: usize = part
-            .parse()
-            .with_context(|| format!("parse dataset id '{part}' from header '{header}'"))?;
-        ids.push(id);
-    }
-    if ids.is_empty() {
-        bail!("no dataset ids found in header '{header}'");
-    }
-    Ok(ids)
-}
-
-fn read_simplitig_record<R: BufRead + ?Sized>(
-    reader: &mut R,
-) -> Result<Option<SimplitigRecord>> {
-    let mut header = String::new();
-    if reader.read_line(&mut header)? == 0 {
-        return Ok(None);
-    }
-    let mut seq_line = String::new();
-    if reader.read_line(&mut seq_line)? == 0 {
-        bail!("unexpected EOF after header '{header}'");
-    }
-    let header = header.trim_end_matches(['\r', '\n']);
-    let seq = seq_line.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
-    let ids = parse_ids_from_header(header)?;
-    Ok(Some(SimplitigRecord { ids, seq }))
-}
-
-fn write_simplitig_record<W: Write>(record: &SimplitigRecord, writer: &mut W) -> Result<()> {
-    writer.write_all(b">ids:")?;
-    for (idx, id) in record.ids.iter().enumerate() {
-        if idx > 0 {
-            writer.write_all(b",")?;
-        }
-        write!(writer, "{id}")?;
-    }
-    writer.write_all(b"\n")?;
-    writer.write_all(&record.seq)?;
-    writer.write_all(b"\n")?;
-    Ok(())
-}
-
-fn simplitig_cmp(a: &SimplitigRecord, b: &SimplitigRecord) -> std::cmp::Ordering {
-    match a.ids.cmp(&b.ids) {
-        std::cmp::Ordering::Equal => a.seq.cmp(&b.seq),
-        ord => ord,
-    }
-}
-
-fn write_sorted_chunk<W: Write>(chunk: &mut [SimplitigRecord], writer: &mut W) -> Result<()> {
-    chunk.sort_by(simplitig_cmp);
-    for record in chunk.iter() {
-        write_simplitig_record(record, writer)?;
-    }
-    Ok(())
-}
-
-struct RunReader {
-    reader: BufReader<File>,
-    path: TempPath,
-}
-
-impl RunReader {
-    fn new(path: TempPath) -> Result<Self> {
-        let path_ref: &Path = path.as_ref();
-        let file = File::open(path_ref)
-            .with_context(|| format!("open temporary run {}", path.display()))?;
-        Ok(Self {
-            reader: BufReader::new(file),
-            path,
-        })
-    }
-
-    fn next_record(&mut self) -> Result<Option<SimplitigRecord>> {
-        read_simplitig_record(&mut self.reader)
-            .with_context(|| format!("read from temporary run {}", self.path.display()))
-    }
 }
 
 #[derive(Debug)]
@@ -614,7 +704,7 @@ struct HeapItem {
 
 impl PartialEq for HeapItem {
     fn eq(&self, other: &Self) -> bool {
-        self.record.ids == other.record.ids && self.record.seq == other.record.seq
+        self.record.key == other.record.key && self.record.seq == other.record.seq
     }
 }
 
@@ -632,60 +722,183 @@ impl Ord for HeapItem {
     }
 }
 
-fn merge_runs(
-    mut readers: Vec<RunReader>,
-    writer: &mut ZstdEncoder<'static, File>,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
-    for (idx, reader) in readers.iter_mut().enumerate() {
-        if let Some(record) = reader.next_record()? {
-            heap.push(Reverse(HeapItem {
-                run_idx: idx,
-                record,
-            }));
+fn build_padded_key_from_header(header: &[u8], id_width: usize) -> Result<Vec<u8>> {
+    let rest = header
+        .strip_prefix(b">ids:")
+        .with_context(|| format!("invalid simplitig header (expected >ids:): '{:?}'", header))?;
+    if rest.is_empty() {
+        bail!("no dataset ids found in header '{:?}'", header);
+    }
+    let mut key = Vec::with_capacity(rest.len() + 16);
+    let mut first = true;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        let start = idx;
+        while idx < rest.len() && rest[idx] != b',' {
+            let b = rest[idx];
+            if !(b'0'..=b'9').contains(&b) {
+                bail!("invalid dataset id token in header '{:?}'", header);
+            }
+            idx += 1;
+        }
+        let token = &rest[start..idx];
+        if token.is_empty() {
+            bail!("invalid dataset id token in header '{:?}'", header);
+        }
+        if !first {
+            key.push(b',');
+        }
+        first = false;
+        if token.len() < id_width {
+            key.extend(std::iter::repeat_n(b'0', id_width - token.len()));
+        }
+        key.extend_from_slice(token);
+        if idx < rest.len() && rest[idx] == b',' {
+            idx += 1;
         }
     }
-
-    while let Some(Reverse(item)) = heap.pop() {
-        write_simplitig_record(&item.record, writer)?;
-        if let Some(next) = readers[item.run_idx].next_record()? {
-            heap.push(Reverse(HeapItem {
-                run_idx: item.run_idx,
-                record: next,
-            }));
-        }
-    }
-    Ok(())
+    Ok(key)
 }
 
-fn flush_chunk_to_run(
-    chunk: &mut Vec<SimplitigRecord>,
-    chunk_bytes: &mut usize,
-    run_dir: &Path,
-    run_paths: &mut Vec<TempPath>,
-) -> Result<()> {
-    if chunk.is_empty() {
-        return Ok(());
+fn push_usize_decimal(buf: &mut Vec<u8>, mut value: usize) {
+    if value == 0 {
+        buf.push(b'0');
+        return;
     }
-    let mut tmp = TempFileBuilder::new()
-        .prefix("simplitig-run-")
-        .tempfile_in(run_dir)
-        .with_context(|| format!("create temporary run in {}", run_dir.display()))?;
-    {
-        let mut writer = BufWriter::new(tmp.as_file_mut());
-        write_sorted_chunk(chunk, &mut writer)?;
-        writer.flush()?;
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+    while value > 0 {
+        tmp[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
     }
-    run_paths.push(tmp.into_temp_path());
-    chunk.clear();
-    *chunk_bytes = 0;
+    for &b in tmp[..len].iter().rev() {
+        buf.push(b);
+    }
+}
+
+fn push_usize_decimal_padded(buf: &mut Vec<u8>, value: usize, width: usize) {
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+    let mut v = value;
+    if v == 0 {
+        tmp[0] = b'0';
+        len = 1;
+    } else {
+        while v > 0 {
+            tmp[len] = b'0' + (v % 10) as u8;
+            len += 1;
+            v /= 10;
+        }
+    }
+    if len < width {
+        buf.extend(std::iter::repeat_n(b'0', width - len));
+    }
+    for &b in tmp[..len].iter().rev() {
+        buf.push(b);
+    }
+}
+
+fn build_simplitig_header(ids: &[usize]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(16 + ids.len() * 4);
+    header.extend_from_slice(b">ids:");
+    for (idx, &id) in ids.iter().enumerate() {
+        if idx > 0 {
+            header.push(b',');
+        }
+        push_usize_decimal(&mut header, id);
+    }
+    header
+}
+
+fn build_simplitig_key(ids: &[usize], id_width: usize) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ids.len() * (id_width + 1));
+    for (idx, &id) in ids.iter().enumerate() {
+        if idx > 0 {
+            key.push(b',');
+        }
+        push_usize_decimal_padded(&mut key, id, id_width);
+    }
+    key
+}
+
+fn read_line_trimmed<R: BufRead + ?Sized>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let n = reader.read_until(b'\n', buf)?;
+    while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(n)
+}
+
+fn read_simplitig_record<R: BufRead + ?Sized>(
+    reader: &mut R,
+    id_width: usize,
+    header_buf: &mut Vec<u8>,
+    seq_buf: &mut Vec<u8>,
+) -> Result<Option<SimplitigRecord>> {
+    if read_line_trimmed(reader, header_buf)? == 0 {
+        return Ok(None);
+    }
+    if read_line_trimmed(reader, seq_buf)? == 0 {
+        bail!(
+            "unexpected EOF after header '{}'",
+            String::from_utf8_lossy(header_buf)
+        );
+    }
+    let header = header_buf.to_vec();
+    let key = build_padded_key_from_header(&header, id_width)?;
+    let seq = seq_buf.to_vec();
+    Ok(Some(SimplitigRecord { header, key, seq }))
+}
+
+fn write_simplitig_record_to_buf(record: &SimplitigRecord, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&record.header);
+    buf.push(b'\n');
+    buf.extend_from_slice(&record.seq);
+    buf.push(b'\n');
+}
+
+fn simplitig_cmp(a: &SimplitigRecord, b: &SimplitigRecord) -> std::cmp::Ordering {
+    match a.key.cmp(&b.key) {
+        std::cmp::Ordering::Equal => a.seq.cmp(&b.seq),
+        ord => ord,
+    }
+}
+
+fn sort_simplitigs(records: &mut [SimplitigRecord]) {
+    // Parallel sort only for large batches to avoid oversubscription on small inputs.
+    const PAR_SORT_THRESHOLD: usize = 200_000;
+    if records.len() >= PAR_SORT_THRESHOLD {
+        records.par_sort_unstable_by(simplitig_cmp);
+    } else {
+        records.sort_unstable_by(simplitig_cmp);
+    }
+}
+
+fn write_sorted_chunk<W: Write>(chunk: &mut [SimplitigRecord], writer: &mut W) -> Result<()> {
+    sort_simplitigs(chunk);
+    let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+    for record in chunk.iter() {
+        write_simplitig_record_to_buf(record, &mut buffer);
+        if buffer.len() >= WRITE_BUFFER_TARGET {
+            writer.write_all(&buffer)?;
+            buffer.clear();
+        }
+    }
+    if !buffer.is_empty() {
+        writer.write_all(&buffer)?;
+    }
     Ok(())
 }
 
 fn assemble_simplitigs(
-    mut kmer_map: HashMap<u64, Vec<u64>>,
+    kmer_map: HashMap<u64, KmerEntry>,
     k: usize,
-    mut sink: impl FnMut(Vec<u8>, Vec<u64>) -> Result<()>,
+    mut sink: impl FnMut(Vec<u8>, Vec<usize>) -> Result<()>,
 ) -> Result<()> {
     let mask: u64 = if k == 32 {
         u64::MAX
@@ -693,69 +906,82 @@ fn assemble_simplitigs(
         (1u64 << (2 * k)) - 1
     };
 
-    while let Some((&seed_canon, ids)) = kmer_map.iter().next() {
-        let ids = ids.clone();
-        kmer_map.remove(&seed_canon);
+    let mut entries: Vec<(u64, KmerEntry)> = kmer_map.into_iter().collect();
+    let mut index: HashMap<u64, usize> = HashMap::with_capacity(entries.len());
+    for (idx, (canon, _)) in entries.iter().enumerate() {
+        index.insert(*canon, idx);
+    }
 
-        let mut forward_bits = seed_canon;
-        let mut seq = decode_kmer(forward_bits, k);
+    for seed_idx in 0..entries.len() {
+        if entries[seed_idx].1.visited {
+            continue;
+        }
+        let ids_bits = entries[seed_idx].1.ids.clone();
+        entries[seed_idx].1.visited = true;
 
-        // Extend forward
+        let mut seq = decode_kmer(entries[seed_idx].0, k);
+
+        // extend to the right using successor pointers when unambiguous
+        let mut right_idx = seed_idx;
+        let mut right_bits = entries[seed_idx].0;
         loop {
-            let mut extended = false;
-            for base_bits in [0u64, 1, 2, 3] {
-                let next_forward = ((forward_bits << 2) & mask) | base_bits;
-                let next_canon = canonical_bits(next_forward, k);
-                if let Some(entry) = kmer_map.get(&next_canon) {
-                    if entry == &ids {
-                        forward_bits = next_forward;
-                        let next_base = match base_bits {
-                            0 => b'A',
-                            1 => b'C',
-                            2 => b'G',
-                            _ => b'T',
-                        };
-                        seq.push(next_base);
-                        kmer_map.remove(&next_canon);
-                        extended = true;
-                        break;
-                    }
-                }
-            }
-            if !extended {
+            let entry = &entries[right_idx].1;
+            if entry.succ_ambig {
                 break;
             }
-        }
-
-        // Extend backward
-        let mut left_bits = seed_canon;
-        loop {
-            let mut extended = false;
-            for base_bits in [0u64, 1, 2, 3] {
-                let prev_forward = ((base_bits << (2 * (k - 1))) | (left_bits >> 2)) & mask;
-                let prev_canon = canonical_bits(prev_forward, k);
-                if let Some(entry) = kmer_map.get(&prev_canon) {
-                    if entry == &ids {
-                        left_bits = prev_forward;
-                        let prev_base = match base_bits {
-                            0 => b'A',
-                            1 => b'C',
-                            2 => b'G',
-                            _ => b'T',
-                        };
-                        seq.insert(0, prev_base);
-                        kmer_map.remove(&prev_canon);
-                        extended = true;
-                        break;
-                    }
-                }
-            }
-            if !extended {
+            let Some(base_bits) = entry.successor else {
+                break;
+            };
+            let next_forward = ((right_bits << 2) & mask) | base_bits as u64;
+            let next_canon = canonical_bits(next_forward, k);
+            let Some(&next_idx) = index.get(&next_canon) else {
+                break;
+            };
+            if entries[next_idx].1.visited || entries[next_idx].1.ids != ids_bits {
                 break;
             }
+            seq.push(bits_to_base(base_bits));
+            entries[next_idx].1.visited = true;
+            right_idx = next_idx;
+            right_bits = entries[next_idx].0;
         }
 
-        sink(seq, ids)?;
+        // extend to the left using predecessor pointers when unambiguous
+        let mut left_idx = seed_idx;
+        let mut left_bits = entries[seed_idx].0;
+        let mut prefix: Vec<u8> = Vec::new();
+        loop {
+            let entry = &entries[left_idx].1;
+            if entry.pred_ambig {
+                break;
+            }
+            let Some(base_bits) = entry.predecessor else {
+                break;
+            };
+            let prev_forward = ((base_bits as u64) << (2 * (k - 1)) | (left_bits >> 2)) & mask;
+            let prev_canon = canonical_bits(prev_forward, k);
+            let Some(&next_idx) = index.get(&prev_canon) else {
+                break;
+            };
+            if entries[next_idx].1.visited || entries[next_idx].1.ids != ids_bits {
+                break;
+            }
+            prefix.push(bits_to_base(base_bits));
+            entries[next_idx].1.visited = true;
+            left_idx = next_idx;
+            left_bits = entries[next_idx].0;
+        }
+
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + seq.len());
+            for b in prefix.into_iter().rev() {
+                full.push(b);
+            }
+            full.extend(seq);
+            seq = full;
+        }
+
+        sink(seq, ids_from_bitset(&ids_bits))?;
     }
     Ok(())
 }
@@ -851,42 +1077,104 @@ fn write_partition_simplitigs(
     k: usize,
     dataset_count: usize,
     output_path: &Path,
+    threads: usize,
+    sort_records: bool,
 ) -> Result<()> {
     let map = build_kmer_map_from_partition(partition_path, k, dataset_count)?;
-    let run_dir = output_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut chunk: Vec<SimplitigRecord> = Vec::new();
-    let mut chunk_bytes = 0usize;
-    let mut run_paths: Vec<TempPath> = Vec::new();
-
-    assemble_simplitigs(map, k, |seq, ids_bits| {
-        let ids = ids_from_bitset(&ids_bits);
-        chunk_bytes += estimated_record_bytes(&ids, seq.len());
-        chunk.push(SimplitigRecord { ids, seq });
-        if chunk_bytes >= SORT_RUN_TARGET_BYTES {
-            flush_chunk_to_run(&mut chunk, &mut chunk_bytes, &run_dir, &mut run_paths)?;
-        }
+    let mut records: Vec<SimplitigRecord> = Vec::with_capacity(map.len());
+    let width = id_width(dataset_count);
+    assemble_simplitigs(map, k, |seq, ids| {
+        let header = build_simplitig_header(&ids);
+        let key = build_simplitig_key(&ids, width);
+        records.push(SimplitigRecord { header, key, seq });
         Ok(())
     })?;
 
-    let file = File::create(output_path)
-        .with_context(|| format!("create simplitig output {}", output_path.display()))?;
-    let mut encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
-        .with_context(|| format!("build zstd encoder for {}", output_path.display()))?;
-
-    if run_paths.is_empty() {
-        write_sorted_chunk(&mut chunk, &mut encoder)?;
+    let mut encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
+    if sort_records {
+        write_sorted_chunk(&mut records, &mut encoder)?;
     } else {
-        if !chunk.is_empty() {
-            flush_chunk_to_run(&mut chunk, &mut chunk_bytes, &run_dir, &mut run_paths)?;
+        let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+        for record in records.iter() {
+            write_simplitig_record_to_buf(record, &mut buffer);
+            if buffer.len() >= WRITE_BUFFER_TARGET {
+                encoder.write_all(&buffer)?;
+                buffer.clear();
+            }
         }
-        let readers = run_paths
-            .into_iter()
-            .map(RunReader::new)
-            .collect::<Result<Vec<_>>>()?;
-        merge_runs(readers, &mut encoder)?;
+        if !buffer.is_empty() {
+            encoder.write_all(&buffer)?;
+        }
+    }
+    records.clear();
+
+    encoder
+        .finish()
+        .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
+    Ok(())
+}
+
+fn merge_sorted_partitions(
+    partition_paths: &[PathBuf],
+    output_path: &Path,
+    threads: usize,
+    sort_records: bool,
+    dataset_count: usize,
+) -> Result<()> {
+    if !sort_records {
+        concatenate_zstd_frames(partition_paths, output_path, threads)?;
+        return Ok(());
+    }
+
+    // The k-way merge is inherently sequential, but we can parallelize by first merging subsets of
+    // runs into sorted streams in worker threads, then performing a final k-way merge of those
+    // streams (far fewer inputs) while writing the final output.
+    let threads = threads.max(1);
+    if threads > 1 && partition_paths.len() > 8 {
+        return parallel_streaming_merge(partition_paths, output_path, threads, dataset_count);
+    }
+
+    kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count)
+}
+
+fn kway_merge_sorted_partitions(
+    partition_paths: &[PathBuf],
+    output_path: &Path,
+    threads: usize,
+    dataset_count: usize,
+) -> Result<()> {
+    let width = id_width(dataset_count);
+    let mut readers: Vec<PartitionReader> = Vec::new();
+    for path in partition_paths {
+        readers.push(PartitionReader::new(path.clone(), width)?);
+    }
+
+    let mut encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
+    let mut out_buf = Vec::with_capacity(WRITE_BUFFER_TARGET);
+    let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
+    for (idx, reader) in readers.iter_mut().enumerate() {
+        if let Some(record) = reader.next_record()? {
+            heap.push(Reverse(HeapItem {
+                run_idx: idx,
+                record,
+            }));
+        }
+    }
+    while let Some(Reverse(item)) = heap.pop() {
+        write_simplitig_record_to_buf(&item.record, &mut out_buf);
+        if out_buf.len() >= WRITE_BUFFER_TARGET {
+            encoder.write_all(&out_buf)?;
+            out_buf.clear();
+        }
+        if let Some(next) = readers[item.run_idx].next_record()? {
+            heap.push(Reverse(HeapItem {
+                run_idx: item.run_idx,
+                record: next,
+            }));
+        }
+    }
+    if !out_buf.is_empty() {
+        encoder.write_all(&out_buf)?;
     }
 
     encoder
@@ -895,39 +1183,15 @@ fn write_partition_simplitigs(
     Ok(())
 }
 
-struct PartitionReader {
-    reader: Box<dyn BufRead + Send>,
-    path: PathBuf,
-}
-
-impl PartitionReader {
-    fn new(path: PathBuf) -> Result<Self> {
-        let file = File::open(&path)
-            .with_context(|| format!("open partition simplitigs {}", path.display()))?;
-        let decoder = ZstdDecoder::new(file)
-            .with_context(|| format!("build zstd decoder for {}", path.display()))?;
-        Ok(Self {
-            reader: Box::new(BufReader::new(decoder)),
-            path,
-        })
-    }
-
-    fn next_record(&mut self) -> Result<Option<SimplitigRecord>> {
-        read_simplitig_record(self.reader.as_mut())
-            .with_context(|| format!("read simplitig from {}", self.path.display()))
-    }
-}
-
-fn merge_sorted_partitions(partition_paths: &[PathBuf], output_path: &Path) -> Result<()> {
-    let mut readers: Vec<PartitionReader> = Vec::new();
+fn merge_partition_group_to_channel(
+    partition_paths: Vec<PathBuf>,
+    sender: mpsc::SyncSender<Vec<SimplitigRecord>>,
+    id_width: usize,
+) -> Result<()> {
+    let mut readers: Vec<PartitionReader> = Vec::with_capacity(partition_paths.len());
     for path in partition_paths {
-        readers.push(PartitionReader::new(path.clone())?);
+        readers.push(PartitionReader::new(path, id_width)?);
     }
-
-    let file = File::create(output_path)
-        .with_context(|| format!("create simplitig output {}", output_path.display()))?;
-    let mut encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
-        .with_context(|| format!("build zstd encoder for {}", output_path.display()))?;
 
     let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
     for (idx, reader) in readers.iter_mut().enumerate() {
@@ -936,23 +1200,98 @@ fn merge_sorted_partitions(partition_paths: &[PathBuf], output_path: &Path) -> R
                 run_idx: idx,
                 record,
             }));
-        } else {
-            // remove empty partition outputs immediately
-            let _ = fs::remove_file(&reader.path);
+        }
+    }
+
+    const BATCH_SIZE: usize = 512;
+    let mut batch: Vec<SimplitigRecord> = Vec::with_capacity(BATCH_SIZE);
+    while let Some(Reverse(item)) = heap.pop() {
+        let run_idx = item.run_idx;
+        batch.push(item.record);
+        if batch.len() >= BATCH_SIZE {
+            // Reverse so the consumer can `pop()` in sorted order (O(1)).
+            batch.reverse();
+            if sender.send(batch).is_err() {
+                // Receiver dropped (e.g. due to an upstream error); stop early.
+                return Ok(());
+            }
+            batch = Vec::with_capacity(BATCH_SIZE);
+        }
+        if let Some(next) = readers[run_idx].next_record()? {
+            heap.push(Reverse(HeapItem {
+                run_idx,
+                record: next,
+            }));
+        }
+    }
+    if !batch.is_empty() {
+        batch.reverse();
+        let _ = sender.send(batch);
+    }
+    Ok(())
+}
+
+struct BatchedRecordStream {
+    receiver: mpsc::Receiver<Vec<SimplitigRecord>>,
+    buffer: Vec<SimplitigRecord>,
+}
+
+impl BatchedRecordStream {
+    fn next_record(&mut self) -> Option<SimplitigRecord> {
+        loop {
+            if let Some(record) = self.buffer.pop() {
+                return Some(record);
+            }
+            match self.receiver.recv() {
+                Ok(batch) => self.buffer = batch,
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+fn merge_sorted_streams_to_output(
+    receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>>,
+    output_path: &Path,
+    encoder_threads: usize,
+) -> Result<()> {
+    let mut encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, encoder_threads)?;
+    let mut out_buf = Vec::with_capacity(WRITE_BUFFER_TARGET);
+    let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
+
+    let mut streams: Vec<BatchedRecordStream> = receivers
+        .into_iter()
+        .map(|receiver| BatchedRecordStream {
+            receiver,
+            buffer: Vec::new(),
+        })
+        .collect();
+
+    for (idx, stream) in streams.iter_mut().enumerate() {
+        if let Some(record) = stream.next_record() {
+            heap.push(Reverse(HeapItem {
+                run_idx: idx,
+                record,
+            }));
         }
     }
 
     while let Some(Reverse(item)) = heap.pop() {
-        write_simplitig_record(&item.record, &mut encoder)?;
-        if let Some(next) = readers[item.run_idx].next_record()? {
-            heap.push(Reverse(HeapItem {
-                run_idx: item.run_idx,
-                record: next,
-            }));
-        } else {
-            let path = readers[item.run_idx].path.clone();
-            let _ = fs::remove_file(&path);
+        write_simplitig_record_to_buf(&item.record, &mut out_buf);
+        if out_buf.len() >= WRITE_BUFFER_TARGET {
+            encoder.write_all(&out_buf)?;
+            out_buf.clear();
         }
+        let stream_idx = item.run_idx;
+        if let Some(record) = streams[stream_idx].next_record() {
+            heap.push(Reverse(HeapItem {
+                run_idx: stream_idx,
+                record,
+            }));
+        }
+    }
+    if !out_buf.is_empty() {
+        encoder.write_all(&out_buf)?;
     }
 
     encoder
@@ -961,16 +1300,245 @@ fn merge_sorted_partitions(partition_paths: &[PathBuf], output_path: &Path) -> R
     Ok(())
 }
 
-fn parallel_merge_sorted_partitions(
-    partition_paths: Vec<PathBuf>,
+fn parallel_streaming_merge(
+    partition_paths: &[PathBuf],
+    output_path: &Path,
+    threads: usize,
+    dataset_count: usize,
+) -> Result<()> {
+    let threads = threads.max(1);
+    if threads <= 1 || partition_paths.len() <= 1 {
+        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count);
+    }
+
+    // Favor output compression: the final encoder tends to dominate wall time.
+    let encoder_threads = (threads * 3 / 4).max(1);
+    let worker_threads = threads.saturating_sub(encoder_threads).max(1);
+    let group_count = worker_threads.min(partition_paths.len()).max(1);
+    if group_count <= 1 {
+        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count);
+    }
+
+    let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
+    let channel_capacity = 1usize;
+    let width = id_width(dataset_count);
+
+    let mut receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>> = Vec::new();
+    let mut handles = Vec::new();
+
+    for chunk in partition_paths.chunks(chunk_size) {
+        let (tx, rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(channel_capacity);
+        receivers.push(rx);
+        let group: Vec<PathBuf> = chunk.to_vec();
+        handles.push(thread::spawn(move || {
+            merge_partition_group_to_channel(group, tx, width)
+        }));
+    }
+
+    let merge_result = merge_sorted_streams_to_output(receivers, output_path, encoder_threads);
+
+    let mut first_worker_err: Option<anyhow::Error> = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_worker_err.is_none() {
+                    first_worker_err = Some(e);
+                }
+            }
+            Err(_) => {
+                if first_worker_err.is_none() {
+                    first_worker_err = Some(anyhow::anyhow!("merge worker thread panicked"));
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_worker_err {
+        return Err(err);
+    }
+    merge_result
+}
+
+fn concatenate_zstd_frames(
+    partition_paths: &[PathBuf],
     output_path: &Path,
     threads: usize,
 ) -> Result<()> {
     if partition_paths.is_empty() {
-        let file = File::create(output_path)
+        let encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads.max(1))?;
+        encoder
+            .finish()
+            .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
+        return Ok(());
+    }
+
+    let threads = threads.max(1);
+    if threads <= 1 || partition_paths.len() <= 1 {
+        return concatenate_zstd_frames_sequential(partition_paths, output_path);
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        const COPY_BUFFER: usize = 8 * 1024 * 1024;
+        let mut offset = 0u64;
+        let mut tasks: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(partition_paths.len());
+        for path in partition_paths {
+            let len = fs::metadata(path)
+                .with_context(|| format!("stat partition {}", path.display()))?
+                .len();
+            tasks.push((path.clone(), offset, len));
+            offset = offset
+                .checked_add(len)
+                .context("output simplitig file too large")?;
+        }
+
+        let output = File::create(output_path)
             .with_context(|| format!("create simplitig output {}", output_path.display()))?;
-        let encoder = ZstdEncoder::new(file, ZSTD_LEVEL_FAST4)
-            .with_context(|| format!("build zstd encoder for {}", output_path.display()))?;
+        output
+            .set_len(offset)
+            .with_context(|| format!("preallocate {}", output_path.display()))?;
+        let output = Arc::new(output);
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("build merge thread pool")?;
+        pool.install(|| {
+            tasks
+                .par_iter()
+                .try_for_each(|(path, start, len)| -> Result<()> {
+                    copy_file_region(path, &output, *start, *len, COPY_BUFFER, output_path)
+                })
+        })?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        concatenate_zstd_frames_sequential(partition_paths, output_path)
+    }
+}
+
+fn concatenate_zstd_frames_sequential(
+    partition_paths: &[PathBuf],
+    output_path: &Path,
+) -> Result<()> {
+    const COPY_BUFFER: usize = 8 * 1024 * 1024;
+    let output = File::create(output_path)
+        .with_context(|| format!("create simplitig output {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(COPY_BUFFER, output);
+    let mut buffer = vec![0u8; COPY_BUFFER];
+    for path in partition_paths {
+        {
+            let input =
+                File::open(path).with_context(|| format!("open partition {}", path.display()))?;
+            #[cfg(unix)]
+            remove_intermediate_file_best_effort(path);
+            let mut reader = BufReader::with_capacity(COPY_BUFFER, input);
+            loop {
+                let n = reader
+                    .read(&mut buffer)
+                    .with_context(|| format!("read partition {}", path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                writer
+                    .write_all(&buffer[..n])
+                    .with_context(|| format!("write simplitig output {}", output_path.display()))?;
+            }
+        }
+        remove_intermediate_file_best_effort(path);
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flush simplitig output {}", output_path.display()))?;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn copy_file_region(
+    input_path: &Path,
+    output: &File,
+    mut output_offset: u64,
+    mut remaining: u64,
+    buffer_size: usize,
+    output_path: &Path,
+) -> Result<()> {
+    if remaining == 0 {
+        return Ok(());
+    }
+    let mut input = File::open(input_path)
+        .with_context(|| format!("open partition {}", input_path.display()))?;
+    #[cfg(unix)]
+    remove_intermediate_file_best_effort(input_path);
+    let buffer_len = buffer_size.min(remaining as usize).max(1024);
+    let mut buffer = vec![0u8; buffer_len];
+    while remaining > 0 {
+        let want = (remaining.min(buffer.len() as u64)) as usize;
+        let n = input
+            .read(&mut buffer[..want])
+            .with_context(|| format!("read partition {}", input_path.display()))?;
+        if n == 0 {
+            bail!(
+                "unexpected EOF while concatenating {} into {}",
+                input_path.display(),
+                output_path.display()
+            );
+        }
+        write_all_at(output, &buffer[..n], output_offset).with_context(|| {
+            format!(
+                "write {} bytes at offset {} into {}",
+                n,
+                output_offset,
+                output_path.display()
+            )
+        })?;
+        output_offset += n as u64;
+        remaining -= n as u64;
+    }
+    drop(input);
+    remove_intermediate_file_best_effort(input_path);
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let written = write_at(file, buf, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write to output",
+            ));
+        }
+        offset += written as u64;
+        buf = &buf[written..];
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+fn parallel_merge_sorted_partitions(
+    partition_paths: Vec<PathBuf>,
+    output_path: &Path,
+    threads: usize,
+    sort_records: bool,
+    dataset_count: usize,
+) -> Result<()> {
+    if partition_paths.is_empty() {
+        let encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
         encoder
             .finish()
             .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
@@ -982,11 +1550,7 @@ fn parallel_merge_sorted_partitions(
             Ok(_) => return Ok(()),
             Err(_) => {
                 fs::copy(&only, output_path).with_context(|| {
-                    format!(
-                        "copy {} to {}",
-                        only.display(),
-                        output_path.display()
-                    )
+                    format!("copy {} to {}", only.display(), output_path.display())
                 })?;
                 let _ = fs::remove_file(&only);
                 return Ok(());
@@ -994,66 +1558,13 @@ fn parallel_merge_sorted_partitions(
         }
     }
 
-    let temp_dir = output_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let next_merge_path = |dir: &Path| -> PathBuf {
-        loop {
-            let id = MERGE_TMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let candidate = dir.join(format!("simplitig-merge-{id}.fa.zst"));
-            if !candidate.exists() {
-                return candidate;
-            }
-        }
-    };
-
-    let mut current = partition_paths;
-    while current.len() > 1 {
-        let mut next = Vec::new();
-        let (tx, rx) = mpsc::channel();
-        let batch_threads = threads.max(1).min(current.len());
-        let pool = ThreadPool::new(batch_threads);
-        for chunk in current.chunks(MERGE_FANIN) {
-            let paths = chunk.to_vec();
-            let tx = tx.clone();
-            let temp_dir = temp_dir.clone();
-            pool.execute(move || {
-                let result: Result<PathBuf> = (|| {
-                    if paths.len() == 1 {
-                        return Ok(paths[0].clone());
-                    }
-                    let out_path = next_merge_path(&temp_dir);
-                    merge_sorted_partitions(&paths, &out_path)?;
-                    Ok(out_path)
-                })();
-                let _ = tx.send(result);
-            });
-        }
-        drop(tx);
-        for result in rx {
-            next.push(result?);
-        }
-        pool.join();
-        current = next;
-    }
-
-    let final_path = current.pop().unwrap();
-    match fs::rename(&final_path, output_path) {
-        Ok(_) => {}
-        Err(_) => {
-            fs::copy(&final_path, output_path).with_context(|| {
-                format!(
-                    "copy {} to {}",
-                    final_path.display(),
-                    output_path.display()
-                )
-            })?;
-            let _ = fs::remove_file(&final_path);
-        }
-    }
-    Ok(())
+    merge_sorted_partitions(
+        &partition_paths,
+        output_path,
+        threads,
+        sort_records,
+        dataset_count,
+    )
 }
 
 fn finalize_encoders(encoders: &SharedEncoders) -> Result<()> {
@@ -1105,9 +1616,34 @@ pub fn test_parser_with_verify(
     threads: usize,
     verify_kmers: bool,
 ) -> Result<()> {
+    run_parser(
+        input_fof,
+        output_dir,
+        k,
+        m,
+        partition_power,
+        threads,
+        threads,
+        verify_kmers,
+        false,
+    )
+}
+
+pub fn run_parser(
+    input_fof: PathBuf,
+    output_dir: PathBuf,
+    k: usize,
+    m: usize,
+    partition_power: u32,
+    threads: usize,
+    compaction_threads: usize,
+    verify_kmers: bool,
+    skip_sort: bool,
+) -> Result<()> {
     if k < m {
         bail!("k-mer length ({}) must be >= minimizer length ({})", k, m);
     }
+    let overall_start = Utc::now();
     let partitions = 1u64
         .checked_shl(partition_power)
         .context("partition power too large")?;
@@ -1132,10 +1668,13 @@ pub fn test_parser_with_verify(
         threads
     );
 
+    let partitioning_start = Utc::now();
     let pool = ThreadPool::new(threads);
     for (idx, file_path) in file_paths.iter().enumerate() {
         let encoders = Arc::clone(&encoders);
         let partitions = partitions;
+        let k = k;
+        let m = m;
         let stats = Arc::clone(&stats);
         let dataset_count = dataset_count;
         let file_path = file_path.clone();
@@ -1182,185 +1721,60 @@ pub fn test_parser_with_verify(
         max_size.to_formatted_string(&loc)
     );
 
+    log_checkpoint("Step 1 - superkmer partitioning", partitioning_start);
+
     // Second phase: per-partition compaction into simplitigs with identical ID sets.
     println!("Starting per-partition simplitig compaction...");
+    let compaction_start = Utc::now();
     let output_simplitigs = output_dir.join("simplitigs.fa.zst");
     let partition_outputs = Arc::new(Mutex::new(Vec::new()));
-    let compaction_pool = ThreadPool::new(threads);
-    for (idx, pw) in encoders.iter().enumerate() {
-        let partition_path = pw.path.clone();
-        let partition_outputs = Arc::clone(&partition_outputs);
-        let part_output = output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
-        compaction_pool.execute(move || {
+    let compaction_pool = ThreadPoolBuilder::new()
+        .num_threads(compaction_threads)
+        .build()
+        .context("build compaction thread pool")?;
+    compaction_pool.install(|| {
+        encoders.par_iter().enumerate().for_each(|(idx, pw)| {
+            let partition_path = pw.path.clone();
+            let partition_outputs = Arc::clone(&partition_outputs);
+            let part_output = output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
             let result = write_partition_simplitigs(
                 &partition_path,
                 k,
                 dataset_count,
                 &part_output,
+                1,
+                !skip_sort,
             );
             match result {
-                Ok(_) => partition_outputs.lock().push(part_output),
-                Err(e) => eprintln!(
-                    "Failed to assemble simplitigs for {}: {}",
-                    partition_path.display(),
-                    e
-                ),
+                Ok(_) => partition_outputs.lock().push(part_output.clone()),
+                Err(e) => {
+                    eprintln!(
+                        "Failed to assemble simplitigs for {}: {}",
+                        partition_path.display(),
+                        e
+                    );
+                    remove_intermediate_file_best_effort(&part_output);
+                }
             }
+            remove_intermediate_file_best_effort(&partition_path);
         });
-    }
-    compaction_pool.join();
+    });
+    log_checkpoint("Step 2 - simplitig compaction", compaction_start);
     let mut partition_paths = partition_outputs.lock().clone();
     partition_paths.sort();
-    parallel_merge_sorted_partitions(partition_paths, &output_simplitigs, threads)?;
-
-    if verify_kmers {
-        println!("Verifying k-mer preservation...");
-        let output_map = build_output_kmer_map(&output_simplitigs, k, dataset_count)?;
-        let input_map = build_kmer_map_from_inputs(&file_paths, k)?;
-        verify_kmer_maps(&input_map, &output_map, k)?;
-        println!(
-            "Verified {} canonical k-mers; all input k-mers were found in the output.",
-            input_map.len().to_formatted_string(&Locale::en)
-        );
-    }
-
-    println!(
-        "Simplitig compaction complete. Output: {}",
-        output_simplitigs.display()
-    );
-    println!("Partitioning complete.");
-    Ok(())
-}
-
-pub fn run_parser(
-    input_fof: PathBuf,
-    output_dir: PathBuf,
-    k: usize,
-    m: usize,
-    partition_power: u32,
-    threads: usize,
-    compaction_threads: usize,
-    verify_kmers: bool,
-) -> Result<()> {
-    if k < m {
-        bail!(
-            "k-mer length ({}) must be >= minimizer length ({})",
-            k,
-            m
-        );
-    }
-    let partitions = 1u64
-        .checked_shl(partition_power)
-        .context("partition power too large")?;
-    let window = k
-        .checked_sub(m)
-        .context("failed to compute window size; ensure k > m")?;
-    let required_limit = partitions + 64;
-
-    ensure_nofile_limit(required_limit)?;
-    fs::create_dir_all(&output_dir)?;
-    let encoders = create_partition_encoders(&output_dir, partitions)?;
-    let file_paths = read_fof(&input_fof)?;
-    let dataset_count = file_paths.len();
-    let stats = Arc::new(Stats::new());
-
-    println!(
-        "Starting superkmer partitioning for {} files (k={}, m={}, partitions={}, threads={})",
-        file_paths.len(),
-        k,
-        m,
-        partitions,
-        threads
-    );
-
-    let pool = ThreadPool::new(threads);
-    for (idx, file_path) in file_paths.iter().enumerate() {
-        let encoders = Arc::clone(&encoders);
-        let partitions = partitions;
-        let k = k;
-        let m = m;
-        let stats = Arc::clone(&stats);
-        let dataset_count = dataset_count;
-        let file_path = file_path.clone();
-        pool.execute(move || {
-            if let Err(err) = process_file(
-                &file_path,
-                idx + 1,
-                &encoders,
-                k,
-                m,
-                window,
-                partitions,
-                &stats,
-                dataset_count,
-            ) {
-                eprintln!("Failed to process {}: {err}", file_path.display());
-            }
-        });
-    }
-    pool.join();
-    finalize_encoders(&encoders)?;
-    let (total_size, min_size, max_size) = partition_size_stats(&encoders)?;
-    let total_superkmers = stats.total_superkmers.load(Ordering::Relaxed);
-    let total_bases = stats.total_bases.load(Ordering::Relaxed);
-    let total_kmers =
-        total_bases.saturating_sub(total_superkmers.saturating_mul((k - 1) as u64));
-
-    let loc = Locale::en;
-    println!(
-        "Superkmer count: {}",
-        total_superkmers.to_formatted_string(&loc)
-    );
-    println!(
-        "Total superkmer length (bp): {}",
-        total_bases.to_formatted_string(&loc)
-    );
-    println!(
-        "Total kmers covered: {}",
-        total_kmers.to_formatted_string(&loc)
-    );
-    println!(
-        "Partition file sizes (bytes): total={}, min={}, max={}",
-        total_size.to_formatted_string(&loc),
-        min_size.to_formatted_string(&loc),
-        max_size.to_formatted_string(&loc)
-    );
-
-    // Second phase: per-partition compaction into simplitigs with identical ID sets.
-    println!("Starting per-partition simplitig compaction...");
-    let output_simplitigs = output_dir.join("simplitigs.fa.zst");
-    let partition_outputs = Arc::new(Mutex::new(Vec::new()));
-    let compaction_pool = ThreadPool::new(compaction_threads);
-    for (idx, pw) in encoders.iter().enumerate() {
-        let partition_path = pw.path.clone();
-        let partition_outputs = Arc::clone(&partition_outputs);
-        let part_output = output_dir
-            .join(format!("simplitigs-part-{idx}.fa.zst"));
-        compaction_pool.execute(move || {
-            let result = write_partition_simplitigs(
-                &partition_path,
-                k,
-                dataset_count,
-                &part_output,
-            );
-            match result {
-                Ok(_) => partition_outputs.lock().push(part_output),
-                Err(e) => eprintln!(
-                    "Failed to assemble simplitigs for {}: {}",
-                    partition_path.display(),
-                    e
-                ),
-            }
-        });
-    }
-    compaction_pool.join();
-    let mut partition_paths = partition_outputs.lock().clone();
-    partition_paths.sort();
-    parallel_merge_sorted_partitions(
-        partition_paths,
+    let merge_start = Utc::now();
+    let merge_result = parallel_merge_sorted_partitions(
+        partition_paths.clone(),
         &output_simplitigs,
         compaction_threads,
-    )?;
+        !skip_sort,
+        dataset_count,
+    );
+    for path in &partition_paths {
+        remove_intermediate_file_best_effort(path);
+    }
+    merge_result?;
+    log_checkpoint("Step 3 - simplitig merge/sort", merge_start);
 
     if verify_kmers {
         println!("Verifying k-mer preservation...");
@@ -1371,26 +1785,18 @@ pub fn run_parser(
             "Verified {} canonical k-mers; all input k-mers were found in the output.",
             input_map.len().to_formatted_string(&Locale::en)
         );
+    } else {
+        println!("Step 3 - k-mer verification skipped.");
     }
 
     println!(
         "Simplitig compaction complete. Output: {}",
         output_simplitigs.display()
     );
+    println!(
+        "Total wall time: {}",
+        format_duration(Utc::now().signed_duration_since(overall_start))
+    );
     println!("Partitioning complete.");
     Ok(())
 }
-
-/*fn main() -> Result<()> {
-    let args = Args::parse();
-    run(
-        args.input_fof,
-        args.output_dir,
-        args.k,
-        args.m,
-        args.partition_power,
-        args.threads,
-        args.compaction_threads,
-        args.verify_kmers,
-    )
-}*/

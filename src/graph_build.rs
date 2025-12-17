@@ -10,7 +10,7 @@ use std::u32;
 use num_traits::ToPrimitive;
 use zstd::{Decoder, Encoder};
 
-use crate::utils::{str2num, vec2str};
+use crate::utils::{Converter, Convert, vec2str};
 
 const SIZE_PAIR_POS: usize = 17;
 //TODO DEBUG MODE -> WRITE SUBPART OF FILES (UNITIGS, COLOR ID TO SIZES ETC ETC) UNCOMPRESSED + READABLE TO HAVE A REF
@@ -270,7 +270,8 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Result<Ve
         }else{
             nb_lines_dna += 1;
             nb_kmer += line.len()-30;
-            unitigs_sizes_list.push((str2num(&line), line.len()));
+            let converter = Converter;
+            unitigs_sizes_list.push((<Converter as Convert<&String>>::str2num(&line), line.len()));
         }
         line.clear();
     }
