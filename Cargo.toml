@@ -16,10 +16,9 @@ nuc2bit = {git = "https://github.com/natir/nuc2bit.git"}
 rand = "0.8.5"
 bit-set = "0.5.3"
 bit-vec = "0.6.3"
-num-traits = "0.2.18"
 bitvec = "1.0.1"
 miette = "5"
-zstd = "0.13.1"
+zstd = { version = "0.13.3", features = ["zstdmt"]}
 parking_lot = "0.12.3"
 crossbeam = "0.8.4"
 indexmap = "2.5.0"
@@ -31,19 +30,20 @@ bio = "3.0.0"
 simd-minimizers = "2.2.0"
 rlimit = "0.10.2"
 threadpool = "1.8.1"
+num-traits = "0.2.18"
 num_cpus = "1.17.0"
 num-format = "0.4"
 anyhow = "1.0"
 hashbrown = { version = "0.14", default-features = false, features = ["ahash"] }
 xz2 = "0.1"
 tempfile = "3.23.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
 
 [profile.release]
 debug = true
-strip = false
 opt-level = 3
 lto = true
 codegen-units = 1
