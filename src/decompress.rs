@@ -11,7 +11,6 @@ use zstd::{Decoder, Encoder};
 
 use crate::utils::{Converter, Convert, vec2str};
 
-const SIZE_PAIR_POS: usize = 17;
 
 //   =========================================================================================== DECOMPRESSION ==============================================================================
 
@@ -130,46 +129,6 @@ fn get_positions(position_filename: &String, cid_to_id_map: &HashMap<usize, Vec<
     Ok(positions)
 }
 
-/// Read individual position records for a targeted set of color ids.
-///
-/// This function seeks into the positions file to the exact byte offsets
-/// corresponding to color ids present in `cid_to_id_map` and returns the
-/// decompressed pairs.
-///
-/// PARAM
-/// - `position_filename`: path to the positions file.
-/// - `cid_to_id_map`: keys are color ids required; the function reads only those.
-///
-/// RETURNS
-/// - Vec<(u32,u32)> for the requested color ids.
-fn get_specific_pos(position_filename: &String, cid_to_id_map: &HashMap<usize, Vec<u32>>) -> Result<Vec<(u32, u32)>>{
-    let position_file = File::open(position_filename)?;
-    let mut positions_reader = BufReader::new(position_file);
-    let mut positions: Vec<(u32, u32)> = Vec::new();
-    let mut buffer_position_tigs = [0; 4];
-    let mut buffer_position_size = [0; 4];
-    for elem in cid_to_id_map.keys(){
-        let cursor_pos : u64 = (elem+SIZE_PAIR_POS) as u64;
-        positions_reader.seek(std::io::SeekFrom::Start(cursor_pos as u64))?;
-        positions_reader.read_exact(&mut buffer_position_tigs)?;
-        positions_reader.read_exact(&mut buffer_position_size)?;
-        let mut decompressed_pos_tigs = Vec::new();
-        let mut decompressed_pos_size = Vec::new();
-        {
-            let mut decoder_pos_tigs = Decoder::new(&buffer_position_tigs[..])?;
-            decoder_pos_tigs.read_to_end(&mut decompressed_pos_tigs)?;
-            let mut decoder_pos_size = Decoder::new(&buffer_position_size[..])?;
-            decoder_pos_size.read_to_end(&mut decompressed_pos_size)?;
-            let pos_size = u32::from_le_bytes(decompressed_pos_size.try_into().unwrap());
-            let pos_tigs = u32::from_le_bytes(decompressed_pos_tigs.try_into().unwrap());
-            println!("SIZE: {}", pos_size);
-            println!("TIGS {}", pos_tigs);
-            positions.push((pos_tigs, pos_size));
-        }
-    }
-    Ok(positions)
-}
-
 /// Decompress the entire archive to individual FASTA shards.
 ///
 /// Iterates over all color buckets and writes each unitig to every file that
@@ -198,7 +157,7 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
         for elem in file_ids.clone(){
             println!("{elem}");
         }
-        println!("Processing CID: {} (position in positions file)", cid);
+        //println!("Processing CID: {} (position in positions file)", cid);
         
         let (tigs_pos, sizes_pos) = match read_position_at_cid(positions_filename, *cid) {
             Ok(pos) => pos,
@@ -218,7 +177,7 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
         } else {
             get_file_end_positions(tigs_filename, size_filename).unwrap()
         };
-        println!("{}", next_sizes_pos);
+        //println!("{}", next_sizes_pos);
         let sizes = match read_bucket_sizes_at_position(size_filename, sizes_pos) {
             Ok(s) => s,
             Err(e) => {
@@ -246,7 +205,7 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
             
             let tig = vec2str(&tig_buffer, &size);
             for file_id in file_ids {
-                println!("{file_id}");
+                //println!("{file_id}");
                 let curr_filename = &filenames[*file_id as usize];
                 let trunc_filename = Path::new(&curr_filename.0).file_stem().unwrap();
                 
@@ -280,6 +239,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
     let mut buffer_size = [0; 8];
     color_id_file.read_exact(&mut buffer_size)?;
     let mut size_read = usize::from_le_bytes(buffer_size);
+    println!("SIZE READ: {size_read}");
     while size_read != 0 {
         let mut buffer = vec![0; size_read];
         color_id_file.read_exact(&mut buffer)?;
@@ -291,6 +251,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
         let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
         let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
         for cid in temp_cids{
+            println!("CID: {cid}");
             if cid != "" {
                 cid_ids_map.entry(cid.parse::<usize>().unwrap())
                     .and_modify(|list: &mut Vec<_>| list.push(counter))
@@ -299,6 +260,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
         }
         color_id_file.read_exact(&mut buffer_size)?;
         size_read = usize::from_le_bytes(buffer_size);
+        println!("SIZE READ: {size_read}");
         counter += 1;
     }
     
@@ -491,8 +453,8 @@ fn read_bucket_sizes_at_position(size_file_path: &str, start_pos: u32) -> Result
     let mut size_buffer = [0; 8];
     size_file.read_exact(&mut size_buffer)?;
     let compressed_size = usize::from_le_bytes(size_buffer);
-    println!("compressed size: {compressed_size}");
-    println!("start pos:{start_pos}");
+    //println!("compressed size: {compressed_size}");
+    //println!("start pos:{start_pos}");
     let mut compressed_buffer = vec![0; compressed_size];
     size_file.read_exact(&mut compressed_buffer)?;
     
@@ -500,15 +462,14 @@ fn read_bucket_sizes_at_position(size_file_path: &str, start_pos: u32) -> Result
     let mut decoder = Decoder::new(&compressed_buffer[..])?;
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed)?;
-    println!("aa");
     let mut sizes = Vec::new();
     let mut prev = 0;
     for chunk in decompressed.chunks_exact(8) {
         let delta = usize::from_le_bytes(chunk.try_into().unwrap());
         let actual_size = delta + prev;
-        println!("actual:{actual_size}");
-        println!("encoded:{delta}");
-        println!("prev:{prev}");
+        //println!("actual:{actual_size}");
+        //println!("encoded:{delta}");
+        //println!("prev:{prev}");
         sizes.push(actual_size);
         prev = actual_size;
     }

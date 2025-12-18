@@ -152,6 +152,14 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             .map(|s| s.parse::<usize>().unwrap() - 1) // Convert to 0-based
             .collect();
 
+        if prev_id_vec.is_empty(){
+            prev_id_vec = ids.clone();
+        }
+        nb_lines_dna += 1;
+        nb_kmer += seq.len()-30;
+        let converter = Converter;
+        unitigs_sizes_list.push((<Converter as Convert<&[u8]>>::str2num(seq), seq.len()));
+
         //let color_id: usize = line.split(":").collect::<Vec<_>>()[1].split(",").collect::<Vec<_>>().parse().unwrap();
         if ids != prev_id_vec{
             //println!("CHANGING COLOR, DUMPING CURRENT COLOR");
@@ -198,10 +206,6 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             cid += 1;
             
         }
-        nb_lines_dna += 1;
-        nb_kmer += seq.len()-30;
-        let converter = Converter;
-        unitigs_sizes_list.push((<Converter as Convert<&[u8]>>::str2num(seq), seq.len()));
     }
     if !unitigs_sizes_list.is_empty(){
         let mut prev = 0;
@@ -214,7 +218,8 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         let mut total_size = 0;
 
         let mut vec_sizes = Vec::new();
-        
+        let mut size_file_test = BufWriter::new(File::create(output_dir.clone()+"sizes_test.txt").expect("unable to create file"));
+    
         for pair in &unitigs_sizes_list{
             omni_file.write_all(&pair.0);
             println!("SIZE: {}", pair.1);
@@ -229,9 +234,11 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         let mut buffer = Vec::new();
         {
             let mut sizes_encoder = Encoder::new(&mut buffer, 12).expect("Failed to create zstd encoder");
+            size_file_test.write_all(String::from(vec_sizes.len().to_string()).as_bytes())?;
             for elem in vec_sizes{
                 println!("a{}a", elem);
                 sizes_encoder.write_all(&elem.to_le_bytes())?;
+                size_file_test.write_all(String::from(elem.to_string()).as_bytes())?;
             }
             sizes_encoder.finish()?;
         }
@@ -242,12 +249,10 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         size_file.write_all(&buffer)?;
 
         unitigs_sizes_list.clear();
-        if ids != prev_id_vec{
-            for elem in ids{
-                id_to_color_vec[elem].push(cid);
-            }
-            cid += 1;
+        for elem in ids{
+            id_to_color_vec[elem].push(cid);
         }
+        cid += 1;
     }
     println!("SIZE TOTALE TIGS: {}\nSIZE TOTALE SIZES: {}", prev_tigs_size, prev_bucket_pos);
     println!("I HAVE SEEN {} LINES WITH DNA", nb_lines_dna);
@@ -273,7 +278,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     omni_file.flush()?;
     size_file.flush()?;
 
-    pos_nb_unitig.push((prev_tigs_size as u32, prev_bucket_pos as u32));
+    //pos_nb_unitig.push((prev_tigs_size as u32, prev_bucket_pos as u32));
     // STARTING POSITIONS IN THE TIGS FILE FOR EACH COLOR BUCKET (ACTUALLY THE SIZE OF EACH COLOR BUCKET) + NB UNITIG IN EACH COLOR BUCKET
     // NB UNITIGS GIVES THE NUMBER OF SIZES == 64B * NB UNITIGS = POS OF COLOR BUCKET IN THE POS FILE
     Ok((pos_nb_unitig, id_to_color_vec))
@@ -343,8 +348,8 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
             //to_write += &(e.to_u16().unwrap()-prev).to_string();
             //cid_encoder.write_all(&(e.to_u16().unwrap()-prev).to_le_bytes())?;
             let pos = cursor_positions.get(e).unwrap();
-            //println!("{pos}");
-            //println!("{e}");    
+            println!("{pos}");
+            println!("{e}");    
             if i != 0{
                 to_write = to_write + "," + &(pos.to_u32().unwrap()).to_string();// - prev).to_string();
             }else {
@@ -363,7 +368,7 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
         tot_size += 8 + buffer.len();
         cid_file.write_all(&buffer.len().to_le_bytes())?;
         cid_file.write_all(&buffer)?;
-        //println!("{to_write}");
+        println!("{to_write}");
     }
     cid_file.write_all(&(0_u64).to_le_bytes())?;
     Ok(id_cid_line_sizes)
