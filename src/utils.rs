@@ -5,12 +5,6 @@ use std::fs::File;
 
 use minimizer_iter::MinimizerBuilder;
 
-pub mod constants {
-    include!("constants.rs");
-}
-use constants::{K, KT};
-
-use crate::kmer::{Kmer, RawKmer};
 
 pub fn extract_filename(path: &str) -> Option<&str> {
     // Split the path by '/'
@@ -57,24 +51,6 @@ pub fn vec2str(seq: &Vec<u8>, size: &usize) -> String{
     res
 }
 
-pub fn num2str(mut k_mer: KT) -> String{
-    let mut res = String::from("");
-    let mut nuc: KT;
-    for _i in 0..K{
-        nuc = k_mer%4;
-        if nuc == 0{
-            res.push('A');
-        }else if nuc == 1{
-            res.push('C');
-        }else if nuc == 2{//bebou
-            res.push('G');
-        }else if nuc == 3{
-            res.push('T');
-        }
-        k_mer >>= 2;
-    }
-    res.chars().rev().collect()
-}
 
 pub fn nuc2str(nuc: &u8) -> &str{
 
@@ -143,18 +119,4 @@ pub fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where P: AsRef<Path>, {
     let file = File::open(filename)?;
     Ok(io::BufReader::new(file).lines())
-}
-pub fn find_min(kmer: RawKmer<K, KT>) -> u64{
-    let tampon = kmer.to_nucs();
-    let min_iter = MinimizerBuilder::<u64, _>::new_mod()
-    .minimizer_size(7)
-    .width(24)
-    .iter(&tampon);
-    let mut min = u64::MAX;
-    for (minimizer, _position) in min_iter {
-        if minimizer < min{
-            min = minimizer;
-        }
-    }
-    min
 }

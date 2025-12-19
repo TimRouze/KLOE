@@ -39,9 +39,6 @@ struct Args {
     memory: usize,
 
 }
-pub mod constants {
-    include!("constants.rs");
-}
 const BLOCK_SIZE: usize = 1 << (12 - 3);
 const SHARD_AMOUNT: usize = 1024;
 const M: u8 = 7;
