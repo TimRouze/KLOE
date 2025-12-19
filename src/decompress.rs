@@ -118,11 +118,11 @@ fn get_positions(position_filename: &String, cid_to_id_map: &HashMap<usize, Vec<
         {
             let mut decoder_positions = Decoder::new(&current_buffer[..])?;
             decoder_positions.read_to_end(&mut decompressed_positions)?;
-            println!("a{}a", decompressed_positions.len());
+            //println!("a{}a", decompressed_positions.len());
             let pos_size = u32::from_le_bytes(decompressed_positions[..4].try_into().unwrap());
             let pos_tigs = u32::from_le_bytes(decompressed_positions[4..].try_into().unwrap());
-            println!("SIZE: {}", pos_size);
-            println!("TIGS {}", pos_tigs);
+            //println!("SIZE: {}", pos_size);
+            //println!("TIGS {}", pos_tigs);
             positions.push((pos_tigs, pos_size));
         }
     }
@@ -154,9 +154,9 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
     
     for (idx, cid) in sorted_cids.iter().enumerate() {
         let file_ids = cid_to_id_map.get(cid).unwrap();
-        for elem in file_ids.clone(){
+        /*for elem in file_ids.clone(){
             println!("{elem}");
-        }
+        }*/
         //println!("Processing CID: {} (position in positions file)", cid);
         
         let (tigs_pos, sizes_pos) = match read_position_at_cid(positions_filename, *cid) {
@@ -239,7 +239,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
     let mut buffer_size = [0; 8];
     color_id_file.read_exact(&mut buffer_size)?;
     let mut size_read = usize::from_le_bytes(buffer_size);
-    println!("SIZE READ: {size_read}");
+    //println!("SIZE READ: {size_read}");
     while size_read != 0 {
         let mut buffer = vec![0; size_read];
         color_id_file.read_exact(&mut buffer)?;
@@ -251,7 +251,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
         let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
         let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
         for cid in temp_cids{
-            println!("CID: {cid}");
+            //println!("CID: {cid}");
             if cid != "" {
                 cid_ids_map.entry(cid.parse::<usize>().unwrap())
                     .and_modify(|list: &mut Vec<_>| list.push(counter))
@@ -260,7 +260,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
         }
         color_id_file.read_exact(&mut buffer_size)?;
         size_read = usize::from_le_bytes(buffer_size);
-        println!("SIZE READ: {size_read}");
+        //println!("SIZE READ: {size_read}");
         counter += 1;
     }
     
@@ -298,15 +298,15 @@ fn get_cid_to_id_targeted(color_id_filename: &String, filenames_id_map: &HashMap
     for line_result in wanted_reader.lines(){
         let line = line_result?;
         if filenames_id_map.contains_key(&line){
-            println!("COUCOUC");
+            //println!("COUCOUC");
             let entry = filenames_id_map.get(&line).unwrap();
-            println!("{}", entry.1);
-            println!("{}", entry.0);
+            //println!("{}", entry.1);
+            //println!("{}", entry.0);
             color_id_file.seek(std::io::SeekFrom::Start(entry.1))?;
             let mut buffer_size = [0; 8];
             color_id_file.read_exact(&mut buffer_size)?;
             let size_read = usize::from_le_bytes(buffer_size);
-            println!("{size_read}");
+            //println!("{size_read}");
             let mut buffer = vec![0; size_read];
             color_id_file.read_exact(&mut buffer)?;
             let mut decompressed_data = Vec::new();
@@ -323,7 +323,7 @@ fn get_cid_to_id_targeted(color_id_filename: &String, filenames_id_map: &HashMap
                         .or_insert(Vec::from([entry.0]));
                 }
             }
-            println!("REEEEE");
+            //println!("REEEEE");
             wanted_filenames.push((line.clone(), entry.0));
         }else {
             println!("FILE {} NOT FOUND IN ARCHIVE, CHECK SPELLING OR ACTUAL PRESENCE IN ARCHIVE", line);

@@ -1,7 +1,7 @@
 
 use core::panic;
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, id};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -115,7 +115,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
 
     let mut size_file = BufWriter::new(File::create(output_dir.clone()+"bucket_sizes.txt").expect("unable to create file"));
     //let mut sizes_encoder = Encoder::new(BufWriter::new(size_file), 12).expect("Failed to create zstd encoder");
-    
+
     let mut nb_lines_dna: usize = 0;
     let mut nb_kmer = 0;
     let unitigs_file = File::open(output_dir.clone() + "simplitigs.fa.zst")?;
@@ -126,7 +126,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     //let mut to_write = Vec::new();
     let mut line = String::new();
     //let mut size_read = reader.read_line(&mut line);
-    let mut prev_id_vec = Vec::new();
+    let mut curr_id_vec = Vec::new();
 
     let mut id_to_color_vec: Vec<Vec<_>> = vec![Vec::new(); nb_files as usize];
     let mut ids = Vec::new();
@@ -149,11 +149,15 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         let ids_str = header.strip_prefix("ids:").unwrap();
         ids = ids_str.split(',')
             .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<usize>().unwrap() - 1) // Convert to 0-based
+            .map(|s| s.parse::<usize>().unwrap() -1) // Convert to 0-based
             .collect();
 
-        if prev_id_vec.is_empty(){
-            prev_id_vec = ids.clone();
+        for id in &ids{
+            print!("{id}");
+        }
+        println!("");
+        if curr_id_vec.is_empty(){
+            curr_id_vec = ids.clone();
         }
         nb_lines_dna += 1;
         nb_kmer += seq.len()-30;
@@ -161,7 +165,8 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         unitigs_sizes_list.push((<Converter as Convert<&[u8]>>::str2num(seq), seq.len()));
 
         //let color_id: usize = line.split(":").collect::<Vec<_>>()[1].split(",").collect::<Vec<_>>().parse().unwrap();
-        if ids != prev_id_vec{
+        if ids != curr_id_vec{
+
             //println!("CHANGING COLOR, DUMPING CURRENT COLOR");
             unitigs_sizes_list.sort_by(|a, b| a.1.cmp(&b.1));
             // 2BIT / NUC (A = 00, T = 10, C = 01, G = 11)
@@ -199,10 +204,15 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             size_file.write_all(&buffer.len().to_le_bytes())?;
             size_file.write_all(&buffer)?;
             cpt_debug_bucket += 1;
-            prev_id_vec = ids.clone();
-            for elem in &ids{
+            for elem in &curr_id_vec{
                 id_to_color_vec[*elem].push(cid);
+                //println!("Writting color id {cid} in {elem}");
             }
+            curr_id_vec = ids.clone();
+            //println!("{cid}");
+            //let mut input = String::new();
+            //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+
             cid += 1;
             
         }
@@ -222,8 +232,8 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     
         for pair in &unitigs_sizes_list{
             omni_file.write_all(&pair.0);
-            println!("SIZE: {}", pair.1);
-            println!("PREV: {prev}");
+            //println!("SIZE: {}", pair.1);
+            //println!("PREV: {prev}");
             //println!("SIZE TIG ENCODED: {}", pair.0.len());
             total_size += pair.0.len();
             vec_sizes.push(pair.1 - prev);
@@ -236,7 +246,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             let mut sizes_encoder = Encoder::new(&mut buffer, 12).expect("Failed to create zstd encoder");
             size_file_test.write_all(String::from(vec_sizes.len().to_string()).as_bytes())?;
             for elem in vec_sizes{
-                println!("a{}a", elem);
+                //println!("a{}a", elem);
                 sizes_encoder.write_all(&elem.to_le_bytes())?;
                 size_file_test.write_all(String::from(elem.to_string()).as_bytes())?;
             }
@@ -245,14 +255,18 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         prev_bucket_pos += 8 + buffer.len();
         pos_nb_unitig.push((prev_tigs_size as u32, prev_bucket_pos as u32));
         size_file.write_all(&buffer.len().to_le_bytes())?;
-        println!("buffer len: {}", buffer.len());
+        //println!("buffer len: {}", buffer.len());
         size_file.write_all(&buffer)?;
 
         unitigs_sizes_list.clear();
-        for elem in ids{
+        for elem in curr_id_vec{
             id_to_color_vec[elem].push(cid);
+            println!("Writting color id {cid} in {elem}");
         }
-        cid += 1;
+
+        println!("{cid}");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
     }
     println!("SIZE TOTALE TIGS: {}\nSIZE TOTALE SIZES: {}", prev_tigs_size, prev_bucket_pos);
     println!("I HAVE SEEN {} LINES WITH DNA", nb_lines_dna);
@@ -348,8 +362,8 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
             //to_write += &(e.to_u16().unwrap()-prev).to_string();
             //cid_encoder.write_all(&(e.to_u16().unwrap()-prev).to_le_bytes())?;
             let pos = cursor_positions.get(e).unwrap();
-            println!("{pos}");
-            println!("{e}");    
+            //println!("{pos}");
+            //println!("{e}");    
             if i != 0{
                 to_write = to_write + "," + &(pos.to_u32().unwrap()).to_string();// - prev).to_string();
             }else {
@@ -368,7 +382,7 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
         tot_size += 8 + buffer.len();
         cid_file.write_all(&buffer.len().to_le_bytes())?;
         cid_file.write_all(&buffer)?;
-        println!("{to_write}");
+        //println!("{to_write}");
     }
     cid_file.write_all(&(0_u64).to_le_bytes())?;
     Ok(id_cid_line_sizes)
