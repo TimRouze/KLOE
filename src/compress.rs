@@ -15,7 +15,7 @@ use zstd::Encoder;
 use crate::utils::{Converter, Convert, vec2str};
 use crate::parser;
 
-pub fn compress(output_dir: &String, input_fof: &String, threads: usize, temp_dir: &String, k: usize, m: usize, partition_power: u32, compaction_threads: usize) -> Result<()>{
+pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, compaction_threads: usize) -> Result<()>{
 
     parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
     
@@ -152,10 +152,10 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             .map(|s| s.parse::<usize>().unwrap() -1) // Convert to 0-based
             .collect();
 
-        for id in &ids{
+        /*for id in &ids{
             print!("{id}");
         }
-        println!("");
+        println!("");*/
         if curr_id_vec.is_empty(){
             curr_id_vec = ids.clone();
         }
@@ -228,7 +228,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         let mut total_size = 0;
 
         let mut vec_sizes = Vec::new();
-        let mut size_file_test = BufWriter::new(File::create(output_dir.clone()+"sizes_test.txt").expect("unable to create file"));
+        //let mut size_file_test = BufWriter::new(File::create(output_dir.clone()+"sizes_test.txt").expect("unable to create file"));
     
         for pair in &unitigs_sizes_list{
             omni_file.write_all(&pair.0);
@@ -244,11 +244,11 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         let mut buffer = Vec::new();
         {
             let mut sizes_encoder = Encoder::new(&mut buffer, 12).expect("Failed to create zstd encoder");
-            size_file_test.write_all(String::from(vec_sizes.len().to_string()).as_bytes())?;
+            //size_file_test.write_all(String::from(vec_sizes.len().to_string()).as_bytes())?;
             for elem in vec_sizes{
                 //println!("a{}a", elem);
                 sizes_encoder.write_all(&elem.to_le_bytes())?;
-                size_file_test.write_all(String::from(elem.to_string()).as_bytes())?;
+                //size_file_test.write_all(String::from(elem.to_string()).as_bytes())?;
             }
             sizes_encoder.finish()?;
         }
@@ -261,26 +261,26 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         unitigs_sizes_list.clear();
         for elem in curr_id_vec{
             id_to_color_vec[elem].push(cid);
-            println!("Writting color id {cid} in {elem}");
+            //println!("Writting color id {cid} in {elem}");
         }
 
-        println!("{cid}");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
+        //println!("{cid}");
+        //let mut input = String::new();
+        //std::io::stdin().read_line(&mut input).expect("error: unable to read user input");
     }
     println!("SIZE TOTALE TIGS: {}\nSIZE TOTALE SIZES: {}", prev_tigs_size, prev_bucket_pos);
     println!("I HAVE SEEN {} LINES WITH DNA", nb_lines_dna);
     println!("I HAVE SEEN {} K-MERS", nb_kmer);
 
     let mut i = 0;
-    for elem in id_to_color_vec.clone(){
+    /*for elem in id_to_color_vec.clone(){
         println!("CID = {i}");
         for id in elem{
             print!("{id}");
         }
         print!("\n");
         i += 1;
-    }
+    }*/
 
     //println!("NB BUCKETS {cpt_debug_bucket}");
     /*for elem in &pos_nb_unitig{

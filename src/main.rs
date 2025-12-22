@@ -90,7 +90,7 @@ fn main() {
                 compaction_threads
             );*/
             //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
-            let _ = compress::compress(&output_dir, &input_fof, threads, &temp_dir, k, m, args.partition_power, args.compaction_threads);
+            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.compaction_threads);
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
     }else {
