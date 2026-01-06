@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
 use std::path::Path;
 use std::u32;
-
+use chrono::{DateTime, Duration, Utc};
 use num_traits::ToPrimitive;
 use zstd::{Decoder, Encoder};
 
@@ -79,8 +79,9 @@ pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize, tm
 
     }
     println!("Sorting sequences by color bucket");
+    let sort_time = Utc::now();
     let id_cid_line_sizes = sort_by_bucket(&output_dir, filenames.len() as u32);
-
+    log_checkpoint("Sorting took: ", sort_time);
     let mut file_cpt: usize = 0;
     for filename in filenames{
         println!("a{}a", filename);
@@ -110,29 +111,35 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     
     // GET COLORING INFORMATION FOR DECOMPRESSION PURPOSES
     println!("gathering colors");
+    let color_time = Utc::now();
     id_to_color_vec = get_colors(String::from(output_dir.clone()+"fulgor_index_unitigs.color_sets.txt"), nb_files);
+    log_checkpoint("Getting colors took: ", color_time);
     // PROCESS AND COMPRESS UNITIGS
     println!("Starting writing compressed sequences.");
+    let write_time = Utc::now();
     let pos_nb_unitig = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir){
         Ok(vector) => vector,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
-    
+    log_checkpoint("writing compressed simplitigs took: ", write_time);
     // POS NB UNITIGS: 
         // STARTING POSITIONS IN THE TIGS FILE FOR EACH COLOR BUCKET (ACTUALLY THE SIZE OF EACH COLOR BUCKET) + NB UNITIG IN EACH COLOR BUCKET
         // NB UNITIGS GIVES THE NUMBER OF SIZES == 64B * NB UNITIGS = POS OF COLOR BUCKET IN THE POS FILE
 
     println!("Starting to write positions");
+    let position_time = Utc::now();
     let cursor_positions = match write_positions(pos_nb_unitig, String::from(output_dir.clone()+"positions_kloe.txt.zst")){
         Ok(vec) => vec,
         Err(e) => panic!("Error writting positions: {e:?}"),
     };
-
+    log_checkpoint("Writing positions took: ", position_time);
+    let id_time = Utc::now();
     // WRITE FILE ID TO COLOR ID FILE
     let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
+    log_checkpoint("Writing id to cid took: ", id_time);
     write_id_cid
 }
 
@@ -285,8 +292,8 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Result<Ve
         
         for pair in &unitigs_sizes_list{
             omni_file.write_all(&pair.0);
-            println!("SIZE: {}", pair.1);
-            println!("SIZE TIG ENCODED: {}", pair.0.len());
+            //println!("SIZE: {}", pair.1);
+            //println!("SIZE TIG ENCODED: {}", pair.0.len());
             total_size += pair.0.len();
             vec_sizes.push(pair.1 - prev);
             prev = pair.1;
@@ -313,9 +320,9 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String) -> Result<Ve
     println!("I HAVE SEEN {} K-MERS", nb_kmer);
 
     println!("NB BUCKETS {cpt_debug_bucket}");
-    for elem in &pos_nb_unitig{
+    /*for elem in &pos_nb_unitig{
         println!("SIZE: {}", elem.1);
-    }
+    }*/
     //debug_sizes.flush();
     //debug_tigs.flush();
 
@@ -393,7 +400,7 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
             //cid_encoder.write_all(&(e.to_u16().unwrap()-prev).to_le_bytes())?;
             let pos = cursor_positions.get(e).unwrap();
             //println!("{pos}");
-            println!("{e}");    
+            //println!("{e}");    
             if i != 0{
                 to_write = to_write + "," + &(pos.to_u32().unwrap()).to_string();// - prev).to_string();
             }else {
@@ -412,7 +419,7 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
         tot_size += 8 + buffer.len();
         cid_file.write_all(&buffer.len().to_le_bytes())?;
         cid_file.write_all(&buffer)?;
-        println!("{to_write}");
+        //println!("{to_write}");
     }
     cid_file.write_all(&(0_u64).to_le_bytes())?;
     Ok(id_cid_line_sizes)
@@ -527,11 +534,11 @@ fn get_positions(position_filename: &String, cid_to_id_map: &HashMap<usize, Vec<
         {
             let mut decoder_positions = Decoder::new(&current_buffer[..])?;
             decoder_positions.read_to_end(&mut decompressed_positions)?;
-            println!("a{}a", decompressed_positions.len());
+            //println!("a{}a", decompressed_positions.len());
             let pos_size = u32::from_le_bytes(decompressed_positions[..4].try_into().unwrap());
             let pos_tigs = u32::from_le_bytes(decompressed_positions[4..].try_into().unwrap());
-            println!("SIZE: {}", pos_size);
-            println!("TIGS {}", pos_tigs);
+            //println!("SIZE: {}", pos_size);
+            //println!("TIGS {}", pos_tigs);
             positions.push((pos_tigs, pos_size));
         }
     }
@@ -570,8 +577,8 @@ fn get_specific_pos(position_filename: &String, cid_to_id_map: &HashMap<usize, V
             decoder_pos_size.read_to_end(&mut decompressed_pos_size)?;
             let pos_size = u32::from_le_bytes(decompressed_pos_size.try_into().unwrap());
             let pos_tigs = u32::from_le_bytes(decompressed_pos_tigs.try_into().unwrap());
-            println!("SIZE: {}", pos_size);
-            println!("TIGS {}", pos_tigs);
+            //println!("SIZE: {}", pos_size);
+            //println!("TIGS {}", pos_tigs);
             positions.push((pos_tigs, pos_size));
         }
     }
@@ -624,7 +631,7 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
         } else {
             get_file_end_positions(tigs_filename, size_filename).unwrap()
         };
-        println!("{}", next_sizes_pos);
+        //println!("{}", next_sizes_pos);
         let sizes = match read_bucket_sizes_at_position(size_filename, sizes_pos) {
             Ok(s) => s,
             Err(e) => {
@@ -926,4 +933,20 @@ fn get_file_end_positions(tigs_filename: &str, sizes_filename: &str) -> Result<(
     let sizes_size = sizes_file.metadata()?.len() as u32;
     
     Ok((tigs_size, sizes_size))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let std_duration = duration
+        .to_std()
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+    let hours = std_duration.as_secs() / 3600;
+    let minutes = (std_duration.as_secs() % 3600) / 60;
+    let seconds = std_duration.as_secs() % 60;
+    let millis = std_duration.subsec_millis();
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+pub fn log_checkpoint(label: &str, start: DateTime<Utc>) {
+    let elapsed = Utc::now().signed_duration_since(start);
+    println!("{label} wall time: {}", format_duration(elapsed));
 }

@@ -28,6 +28,7 @@ dashmap = "6.1.0"
 minimizer-iter = "1.2.1"
 itertools = "0.14.0"
 zeekstd = "0.6.1"
+chrono = "0.4.42"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
