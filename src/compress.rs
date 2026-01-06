@@ -7,6 +7,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::u32;
 use bio::io::fasta;
+use chrono::{DateTime, Duration, Utc};
 
 use num_traits::ToPrimitive;
 use zstd::stream::read::Decoder;
@@ -16,9 +17,9 @@ use crate::utils::{Converter, Convert, vec2str};
 use crate::parser;
 
 pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, compaction_threads: usize) -> Result<()>{
-
+    let overall_start = Utc::now();
     parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
-    
+    let parsing_time = Utc::now();
     println!("Simplitigs created, processing sequences");
     let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
     let mut filename = String::new();
@@ -30,8 +31,10 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
 
     }
     println!("Sorting sequences by color bucket");
+    let sort_time = Utc::now();
+    parser::log_checkpoint("Wall time:", parsing_time);
     let id_cid_line_sizes = sort_by_bucket(&output_dir, filenames.len() as u32);
-
+    parser::log_checkpoint("Sorting took:", sort_time);
     let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
     let mut file_cpt: usize = 0;
     for filename in filenames{
@@ -56,13 +59,15 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
 /// - Vector of sizes (cursor positions) per input file used to annotate filenames,
 ///   the position of cid list in id to cid file for each id (used later during decompression).
 pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
+    let write_time = Utc::now();
     // PROCESS AND COMPRESS UNITIGS
     println!("Starting writing compressed sequences.");
     let pair = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files){
         Ok(res_pair) => res_pair,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
-    
+    parser::log_checkpoint("Writing compressed sequences wall time:", write_time);
+    let position_time = Utc::now();
     let pos_nb_unitig = pair.0;
     let id_to_color_vec = pair.1;
     // POS NB UNITIGS: 
@@ -74,12 +79,14 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
         Ok(vec) => vec,
         Err(e) => panic!("Error writting positions: {e:?}"),
     };
-
+    parser::log_checkpoint("Write positions wall time:", position_time);
+    let id_time = Utc::now();
     // WRITE FILE ID TO COLOR ID FILE
     let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
+    parser::log_checkpoint("Write id to cid wall time:", id_time);
     write_id_cid
 }
 

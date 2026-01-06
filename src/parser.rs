@@ -149,7 +149,7 @@ fn format_duration(duration: Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
-fn log_checkpoint(label: &str, start: DateTime<Utc>) {
+pub fn log_checkpoint(label: &str, start: DateTime<Utc>) {
     let elapsed = Utc::now().signed_duration_since(start);
     println!("{label} wall time: {}", format_duration(elapsed));
 }
