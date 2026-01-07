@@ -13,8 +13,8 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use threadpool::ThreadPool;
@@ -26,25 +26,13 @@ const BUFFER_TARGET: usize = 128 * 1024;
 const WRITE_BUFFER_TARGET: usize = 8 * 1024 * 1024;
 const ZSTD_LEVEL_FAST: i32 = -4; // zstd "fast=4" mode for high speed
 
-fn remove_intermediate_file_best_effort(path: &Path) {
-    if let Err(err) = fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "Warning: failed to remove intermediate file {}: {}",
-                path.display(),
-                err
-            );
-        }
-    }
-}
-
 struct PartitionWriter {
     path: PathBuf,
     encoder: Mutex<Option<ZstdEncoder<'static, File>>>,
 }
 
 struct PartitionReader {
-    reader: Option<Box<dyn BufRead + Send>>,
+    reader: Box<dyn BufRead + Send>,
     path: PathBuf,
     id_width: usize,
     header_buf: Vec<u8>,
@@ -55,12 +43,10 @@ impl PartitionReader {
     fn new(path: PathBuf, id_width: usize) -> Result<Self> {
         let file = File::open(&path)
             .with_context(|| format!("open partition simplitigs {}", path.display()))?;
-        #[cfg(unix)]
-        remove_intermediate_file_best_effort(&path);
         let decoder = ZstdDecoder::new(file)
             .with_context(|| format!("build zstd decoder for {}", path.display()))?;
         Ok(Self {
-            reader: Some(Box::new(BufReader::new(decoder))),
+            reader: Box::new(BufReader::new(decoder)),
             path,
             id_width,
             header_buf: Vec::new(),
@@ -69,38 +55,13 @@ impl PartitionReader {
     }
 
     fn next_record(&mut self) -> Result<Option<SimplitigRecord>> {
-        let Some(reader) = self.reader.as_mut() else {
-            return Ok(None);
-        };
-
-        let result = read_simplitig_record(
-            reader.as_mut(),
+        read_simplitig_record(
+            self.reader.as_mut(),
             self.id_width,
             &mut self.header_buf,
             &mut self.seq_buf,
         )
-        .with_context(|| format!("read simplitig from {}", self.path.display()));
-
-        match result {
-            Ok(Some(record)) => Ok(Some(record)),
-            Ok(None) => {
-                self.reader.take();
-                remove_intermediate_file_best_effort(&self.path);
-                Ok(None)
-            }
-            Err(err) => {
-                self.reader.take();
-                remove_intermediate_file_best_effort(&self.path);
-                Err(err)
-            }
-        }
-    }
-}
-
-impl Drop for PartitionReader {
-    fn drop(&mut self) {
-        self.reader.take();
-        remove_intermediate_file_best_effort(&self.path);
+            .with_context(|| format!("read simplitig from {}", self.path.display()))
     }
 }
 
@@ -181,6 +142,37 @@ fn id_width(dataset_count: usize) -> usize {
         width += 1;
     }
     width
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Parse FASTA files into superkmers grouped by minimizer"
+)]
+struct Args {
+    #[arg(short = 'i', long = "input-fof")]
+    input_fof: PathBuf,
+    #[arg(short = 'o', long = "output-dir")]
+    output_dir: PathBuf,
+    #[arg(short = 'k', long = "kmer", default_value_t = 31)]
+    k: usize,
+    #[arg(short = 'm', long = "minimizer", default_value_t = 9)]
+    m: usize,
+    /// Number of partitions is 2^partition_power (default 1024 partitions)
+    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
+    partition_power: u32,
+    #[arg(short = 't', long = "threads", default_value_t = 32)]
+    threads: usize,
+    /// Concurrency for the compaction phase (per-partition simplitigs)
+    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
+    compaction_threads: usize,
+    /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
+    #[arg(long = "verify-kmers", default_value_t = false)]
+    verify_kmers: bool,
+    /// Skip sorting within partitions and during final merge (output will not be globally sorted)
+    #[arg(long = "skip-sort", default_value_t = false)]
+    skip_sort: bool,
 }
 
 fn ensure_nofile_limit(required: u64) -> Result<()> {
@@ -392,13 +384,7 @@ fn build_kmer_map_from_partition(
         .unwrap_or(1024)
         .max(1024);
     let mut map: HashMap<u64, KmerEntry> = HashMap::with_capacity(est_entries);
-    let file = File::open(partition_path)
-        .with_context(|| format!("open partition {}", partition_path.display()))?;
-    #[cfg(unix)]
-    remove_intermediate_file_best_effort(partition_path);
-    let decoder = ZstdDecoder::new(file)
-        .with_context(|| format!("create zstd decoder for {}", partition_path.display()))?;
-    let reader = fasta::Reader::from_bufread(BufReader::new(decoder));
+    let reader = open_fasta_reader(partition_path)?;
     let mask: u64 = if k == 32 {
         u64::MAX
     } else {
@@ -822,10 +808,7 @@ fn build_simplitig_key(ids: &[usize], id_width: usize) -> Vec<u8> {
     key
 }
 
-fn read_line_trimmed<R: BufRead + ?Sized>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<usize> {
+fn read_line_trimmed<R: BufRead + ?Sized>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
     buf.clear();
     let n = reader.read_until(b'\n', buf)?;
     while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
@@ -1086,7 +1069,11 @@ fn write_partition_simplitigs(
     assemble_simplitigs(map, k, |seq, ids| {
         let header = build_simplitig_header(&ids);
         let key = build_simplitig_key(&ids, width);
-        records.push(SimplitigRecord { header, key, seq });
+        records.push(SimplitigRecord {
+            header,
+            key,
+            seq,
+        });
         Ok(())
     })?;
 
@@ -1269,10 +1256,7 @@ fn merge_sorted_streams_to_output(
 
     for (idx, stream) in streams.iter_mut().enumerate() {
         if let Some(record) = stream.next_record() {
-            heap.push(Reverse(HeapItem {
-                run_idx: idx,
-                record,
-            }));
+            heap.push(Reverse(HeapItem { run_idx: idx, record }));
         }
     }
 
@@ -1284,10 +1268,7 @@ fn merge_sorted_streams_to_output(
         }
         let stream_idx = item.run_idx;
         if let Some(record) = streams[stream_idx].next_record() {
-            heap.push(Reverse(HeapItem {
-                run_idx: stream_idx,
-                record,
-            }));
+            heap.push(Reverse(HeapItem { run_idx: stream_idx, record }));
         }
     }
     if !out_buf.is_empty() {
@@ -1405,11 +1386,9 @@ fn concatenate_zstd_frames(
             .build()
             .context("build merge thread pool")?;
         pool.install(|| {
-            tasks
-                .par_iter()
-                .try_for_each(|(path, start, len)| -> Result<()> {
-                    copy_file_region(path, &output, *start, *len, COPY_BUFFER, output_path)
-                })
+            tasks.par_iter().try_for_each(|(path, start, len)| -> Result<()> {
+                copy_file_region(path, &output, *start, *len, COPY_BUFFER, output_path)
+            })
         })?;
         return Ok(());
     }
@@ -1420,35 +1399,26 @@ fn concatenate_zstd_frames(
     }
 }
 
-fn concatenate_zstd_frames_sequential(
-    partition_paths: &[PathBuf],
-    output_path: &Path,
-) -> Result<()> {
+fn concatenate_zstd_frames_sequential(partition_paths: &[PathBuf], output_path: &Path) -> Result<()> {
     const COPY_BUFFER: usize = 8 * 1024 * 1024;
     let output = File::create(output_path)
         .with_context(|| format!("create simplitig output {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(COPY_BUFFER, output);
     let mut buffer = vec![0u8; COPY_BUFFER];
     for path in partition_paths {
-        {
-            let input =
-                File::open(path).with_context(|| format!("open partition {}", path.display()))?;
-            #[cfg(unix)]
-            remove_intermediate_file_best_effort(path);
-            let mut reader = BufReader::with_capacity(COPY_BUFFER, input);
-            loop {
-                let n = reader
-                    .read(&mut buffer)
-                    .with_context(|| format!("read partition {}", path.display()))?;
-                if n == 0 {
-                    break;
-                }
-                writer
-                    .write_all(&buffer[..n])
-                    .with_context(|| format!("write simplitig output {}", output_path.display()))?;
+        let input = File::open(path).with_context(|| format!("open partition {}", path.display()))?;
+        let mut reader = BufReader::with_capacity(COPY_BUFFER, input);
+        loop {
+            let n = reader
+                .read(&mut buffer)
+                .with_context(|| format!("read partition {}", path.display()))?;
+            if n == 0 {
+                break;
             }
+            writer
+                .write_all(&buffer[..n])
+                .with_context(|| format!("write simplitig output {}", output_path.display()))?;
         }
-        remove_intermediate_file_best_effort(path);
     }
     writer
         .flush()
@@ -1468,10 +1438,8 @@ fn copy_file_region(
     if remaining == 0 {
         return Ok(());
     }
-    let mut input = File::open(input_path)
-        .with_context(|| format!("open partition {}", input_path.display()))?;
-    #[cfg(unix)]
-    remove_intermediate_file_best_effort(input_path);
+    let mut input =
+        File::open(input_path).with_context(|| format!("open partition {}", input_path.display()))?;
     let buffer_len = buffer_size.min(remaining as usize).max(1024);
     let mut buffer = vec![0u8; buffer_len];
     while remaining > 0 {
@@ -1497,8 +1465,6 @@ fn copy_file_region(
         output_offset += n as u64;
         remaining -= n as u64;
     }
-    drop(input);
-    remove_intermediate_file_best_effort(input_path);
     Ok(())
 }
 
@@ -1746,34 +1712,26 @@ pub fn run_parser(
                 !skip_sort,
             );
             match result {
-                Ok(_) => partition_outputs.lock().push(part_output.clone()),
-                Err(e) => {
-                    eprintln!(
-                        "Failed to assemble simplitigs for {}: {}",
-                        partition_path.display(),
-                        e
-                    );
-                    remove_intermediate_file_best_effort(&part_output);
-                }
+                Ok(_) => partition_outputs.lock().push(part_output),
+                Err(e) => eprintln!(
+                    "Failed to assemble simplitigs for {}: {}",
+                    partition_path.display(),
+                    e
+                ),
             }
-            remove_intermediate_file_best_effort(&partition_path);
         });
     });
     log_checkpoint("Step 2 - simplitig compaction", compaction_start);
     let mut partition_paths = partition_outputs.lock().clone();
     partition_paths.sort();
     let merge_start = Utc::now();
-    let merge_result = parallel_merge_sorted_partitions(
-        partition_paths.clone(),
+    parallel_merge_sorted_partitions(
+        partition_paths,
         &output_simplitigs,
         compaction_threads,
         !skip_sort,
         dataset_count,
-    );
-    for path in &partition_paths {
-        remove_intermediate_file_best_effort(path);
-    }
-    merge_result?;
+    )?;
     log_checkpoint("Step 3 - simplitig merge/sort", merge_start);
 
     if verify_kmers {
