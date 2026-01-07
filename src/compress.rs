@@ -62,6 +62,13 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     let write_time = Utc::now();
     // PROCESS AND COMPRESS UNITIGS
     println!("Starting writing compressed sequences.");
+    // let pair = match process_simplitigs(
+    //                         &(output_dir.clone() + "simplitigs.fa.zst"),
+    //                         &(output_dir.clone()+"tigs_kloe.fa"),
+    //                         &(output_dir.clone() + "bucket_sizes.txt")){
+    //     Ok(res_pair) => res_pair,
+    //     Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
+    // };
     let pair = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files){
         Ok(res_pair) => res_pair,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
@@ -166,11 +173,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         if curr_id_vec.is_empty(){
             curr_id_vec = ids.clone();
         }
-        nb_lines_dna += 1;
-        nb_kmer += seq.len()-30;
-        let converter = Converter;
-        unitigs_sizes_list.push((<Converter as Convert<&[u8]>>::str2num(seq), seq.len()));
-
+        
         //let color_id: usize = line.split(":").collect::<Vec<_>>()[1].split(",").collect::<Vec<_>>().parse().unwrap();
         if ids != curr_id_vec{
 
@@ -223,6 +226,11 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             cid += 1;
             
         }
+        nb_lines_dna += 1;
+        nb_kmer += seq.len()-30;
+        let converter = Converter;
+        unitigs_sizes_list.push((<Converter as Convert<&[u8]>>::str2num(seq), seq.len()));
+
     }
     if !unitigs_sizes_list.is_empty(){
         let mut prev = 0;
@@ -304,6 +312,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     // NB UNITIGS GIVES THE NUMBER OF SIZES == 64B * NB UNITIGS = POS OF COLOR BUCKET IN THE POS FILE
     Ok((pos_nb_unitig, id_to_color_vec))
 }
+
 
 /// Write position pairs (tigs cursor, sizes cursor) on disk.
 ///
