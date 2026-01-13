@@ -202,7 +202,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
 
             let mut buffer = Vec::new();
             {
-                let mut sizes_encoder = Encoder::new(&mut buffer, 12).expect("Failed to create zstd encoder");
+                let mut sizes_encoder = Encoder::new(&mut buffer, 1).expect("Failed to create zstd encoder");
                 for elem in vec_sizes{
                     sizes_encoder.write_all(&elem.to_le_bytes())?;
                 }
@@ -258,7 +258,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         prev_tigs_size += total_size;
         let mut buffer = Vec::new();
         {
-            let mut sizes_encoder = Encoder::new(&mut buffer, 12).expect("Failed to create zstd encoder");
+            let mut sizes_encoder = Encoder::new(&mut buffer, 1).expect("Failed to create zstd encoder");
             //size_file_test.write_all(String::from(vec_sizes.len().to_string()).as_bytes())?;
             for elem in vec_sizes{
                 //println!("a{}a", elem);
@@ -331,7 +331,7 @@ fn write_positions(pos_nb_unitigs: Vec<(u32, u32)>, filepath: String) -> Result<
     for elem in pos_nb_unitigs{
         let mut buffer = Vec::new();
         {
-            let mut pos_encoder = Encoder::new(&mut buffer, 12).expect("Failed to create zstd encoder");
+            let mut pos_encoder = Encoder::new(&mut buffer, 1).expect("Failed to create zstd encoder");
             pos_encoder.write_all(&elem.0.to_le_bytes())?;
             pos_encoder.write_all(&elem.1.to_le_bytes())?;
             pos_encoder.finish()?;
