@@ -67,9 +67,9 @@ pub fn decompress(size_filename: &String, color_id_filename: &String, tigs_filen
             Ok(map) => map,
             Err(e) => panic!("Error getting cid to id map {e:?}"),
         };
-        for elem in &cid_to_id_map{
+        /*for elem in &cid_to_id_map{
             println!("CID: {}", elem.0);
-        }
+        }*/
         let input_file = File::open(input_dir.clone() + filename_id).unwrap();
         let input_reader = BufReader::new(input_file);
         let mut filenames_id = Vec::new();

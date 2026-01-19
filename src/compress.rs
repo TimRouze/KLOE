@@ -381,9 +381,9 @@ fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>,
             //println!("{pos}");
             //println!("{e}");    
             if i != 0{
-                to_write = to_write + "," + &(pos.to_u32().unwrap()).to_string();// - prev).to_string();
+                to_write = to_write + "," + &pos.to_string();// - prev).to_string();
             }else {
-                to_write = to_write + &(pos.to_u32().unwrap()).to_string();// - prev).to_string();
+                to_write = to_write + &pos.to_string();// - prev).to_string();
                 i += 1;
             }
             //prev = e.to_u16().unwrap();
