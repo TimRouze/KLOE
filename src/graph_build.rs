@@ -44,17 +44,17 @@ pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize, tm
     if tmp_dir == ""{
         output = Command::new("sh")
             .arg("-c")
-            .arg("\\time ./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -g " + &memory.to_string())
+            .arg("\\time fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -g " + &memory.to_string())
             .output()
             .expect("failed to execute process");
     }else{
         output = Command::new("sh")
             .arg("-c")
-            .arg("\\time ./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir + " -g " + &memory.to_string())
+            .arg("\\time fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir + " -g " + &memory.to_string())
             .output()
             .expect("failed to execute process");
     }
-    println!("Command was: {}", "./../fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir + " -g " + &memory.to_string());
+    println!("Command was: {}", "fulgor/build/fulgor build --force -k 31 -m 19 -l ".to_owned() + input_fof + " -o " + output_dir + "fulgor_index_unitigs -t " + &threads.to_string() + " -d " + tmp_dir + " -g " + &memory.to_string());
     println!("{}", String::from_utf8(output.stdout).unwrap());
     println!("{}", String::from_utf8(output.stderr).unwrap());
     println!("Fulgor index created, dumping");
@@ -62,10 +62,10 @@ pub fn build_graphs(output_dir: &String, input_fof: &String, threads: &usize, tm
     let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to create file"));
     let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
     fof_id.flush()?;
-    println!("./../fulgor/build/fulgor dump -i {} fulgor_index_unitigs.fur", output_dir);
+    println!("fulgor dump -i {} fulgor_index_unitigs.fur", output_dir);
     let output = Command::new("sh")
         .arg("-c")
-        .arg("\\time ./../fulgor/build/fulgor dump -i ".to_owned() + output_dir + "fulgor_index_unitigs.fur")
+        .arg("\\time fulgor dump -i ".to_owned() + output_dir + "fulgor_index_unitigs.fur")
         .output()
         .expect("failed to execute process");
     println!("{}", String::from_utf8(output.stdout).unwrap());
