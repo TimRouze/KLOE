@@ -69,7 +69,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     //     Ok(res_pair) => res_pair,
     //     Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     // };
-    let pair = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files){
+    let pair = match write_compressed_test(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files){
         Ok(res_pair) => res_pair,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
@@ -89,12 +89,149 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
     // WRITE FILE ID TO COLOR ID FILE
-    let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
+    let write_id_cid = match write_id_to_color_id_test(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
     parser::log_checkpoint("Write id to cid wall time:", id_time);
     write_id_cid
+}
+
+fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_files: u32) -> Result<(Vec<(u32, u32)>, Vec<Vec<usize>>)>{
+    let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
+    let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
+
+    let unitigs_file = File::open(output_dir.clone() + "simplitigs.fa.zst")?;
+    let decoder = zstd::Decoder::new(unitigs_file)?;
+    let reader: Box<dyn BufRead> = Box::new(BufReader::new(decoder));
+    let fa_reader = fasta::Reader::from_bufread(reader);
+
+    let mut id_to_color_vec: Vec<Vec<usize>> = vec![Vec::new(); nb_files as usize];
+    let mut pos_nb_unitig: Vec<(u32, u32)> = vec![(0, 0)];
+    
+    let mut prev_tigs_size: u32 = 0;
+    let mut prev_bucket_pos: u32 = 0;
+    let mut cid = 0_usize;
+
+    // Temporary buffer to store one group
+    let mut group: Vec<(Vec<u8>, usize)> = Vec::with_capacity(10000);
+    let mut current_ids: Option<Vec<usize>> = None;
+
+    for record_result in fa_reader.records() {
+        let record = record_result?;
+        let header = record.id();
+        let ids_str = header.strip_prefix("ids:").unwrap();
+        let ids: Vec<usize> = ids_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<usize>().unwrap() - 1)
+            .collect();
+
+        let seq = record.seq();
+        let encoded = <Converter as Convert<&[u8]>>::str2num(seq);
+        let size = seq.len();
+
+        // Check if group changed
+        if let Some(ref current) = current_ids {
+            if &ids != current {
+                // Process completed group
+                process_and_write_group(
+                    &mut group,
+                    &mut omni_file,
+                    &mut size_file,
+                    &mut prev_tigs_size,
+                    &mut prev_bucket_pos,
+                    &mut pos_nb_unitig,
+                    &mut id_to_color_vec,
+                    current,
+                    cid,
+                )?;
+                cid += 1;
+                group.clear();
+                current_ids = Some(ids);
+            }
+        } else {
+            current_ids = Some(ids);
+        }
+
+        group.push((encoded, size));
+    }
+
+    // Process final group
+    if !group.is_empty() {
+        if let Some(current) = current_ids {
+            process_and_write_group(
+                &mut group,
+                &mut omni_file,
+                &mut size_file,
+                &mut prev_tigs_size,
+                &mut prev_bucket_pos,
+                &mut pos_nb_unitig,
+                &mut id_to_color_vec,
+                &current,
+                cid,
+            )?;
+        }
+    }
+
+    omni_file.flush()?;
+    size_file.flush()?;
+
+    println!("Completed compression: total tigs={}, total sizes={}", prev_tigs_size, prev_bucket_pos);
+    Ok((pos_nb_unitig, id_to_color_vec))
+}
+
+fn process_and_write_group(
+    group: &mut Vec<(Vec<u8>, usize)>,
+    seq_writer: &mut BufWriter<File>,
+    sizes_writer: &mut BufWriter<File>,
+    prev_tigs_size: &mut u32,
+    prev_bucket_pos: &mut u32,
+    pos_nb_unitig: &mut Vec<(u32, u32)>,
+    id_to_color_vec: &mut Vec<Vec<usize>>,
+    current_ids: &[usize],
+    cid: usize,
+) -> Result<()> {
+    // 1. Sort by size
+    group.sort_by_key(|(_, size)| *size);
+
+    // 2. Write sequences and collect deltas
+    let mut deltas: Vec<usize> = Vec::with_capacity(group.len());
+    let mut prev_size = 0;
+    let mut total_tigs_bytes = 0;
+
+    for (encoded_seq, size) in group.iter() {
+        seq_writer.write_all(encoded_seq)?;
+        total_tigs_bytes += encoded_seq.len();
+        let delta = *size - prev_size;
+        deltas.push(delta);
+        prev_size = *size;
+    }
+
+    *prev_tigs_size += total_tigs_bytes as u32;
+
+    // 3. Compress sizes
+    let mut buffer = Vec::with_capacity(deltas.len() * 16); // Reasonable pre-allocation
+    {
+        let mut encoder = Encoder::new(&mut buffer, 1)?; // Level 1 is fast, good for small data
+        for delta in &deltas {
+            encoder.write_all(&delta.to_le_bytes())?;
+        }
+        encoder.finish()?;
+    }
+
+    // 4. Write sizes block
+    *prev_bucket_pos += (8 + buffer.len()) as u32;
+    pos_nb_unitig.push((*prev_tigs_size, *prev_bucket_pos));
+    sizes_writer.write_all(&(buffer.len() as u64).to_le_bytes())?;
+    sizes_writer.write_all(&buffer)?;
+
+    // 5. Update color mapping
+    for id in current_ids {
+        id_to_color_vec[*id].push(cid);
+    }
+
+    Ok(())
 }
 
 /*
@@ -143,7 +280,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     let mut curr_id_vec = Vec::new();
 
     let mut id_to_color_vec: Vec<Vec<_>> = vec![Vec::new(); nb_files as usize];
-    let mut ids = Vec::new();
+    //let mut ids = Vec::new();
     let mut cid = 0_usize;
 
     let mut pos_nb_unitig: Vec<(u32,u32)> = Vec::new();
@@ -161,7 +298,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         let header = record.id();
 
         let ids_str = header.strip_prefix("ids:").unwrap();
-        ids = ids_str.split(',')
+        let ids: Vec<usize> = ids_str.split(',')
             .filter(|s| !s.is_empty())
             .map(|s| s.parse::<usize>().unwrap() -1) // Convert to 0-based
             .collect();
@@ -344,6 +481,42 @@ fn write_positions(pos_nb_unitigs: Vec<(u32, u32)>, filepath: String) -> Result<
     Ok(vec_cursor_position)
 }
 
+
+fn write_id_to_color_id_test(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>, cursor_positions: Vec<usize>) -> std::io::Result<Vec<usize>>{
+    let mut cid_file = BufWriter::new(File::create(&cid_file_path)?);
+    let mut id_cid_line_sizes = Vec::with_capacity(id_to_color_vec.len());
+    let mut tot_size = 0;
+
+    for elem in id_to_color_vec {
+        // Pre-allocate string with estimated size
+        let mut to_write = String::with_capacity(elem.len() * 10);
+        
+        for (i, e) in elem.iter().enumerate() {
+            let pos = cursor_positions[*e];
+            if i > 0 {
+                to_write.push(',');
+            }
+            // Use fmt::write instead of string concat
+            use std::fmt::Write;
+            write!(&mut to_write, "{}", pos).unwrap();
+        }
+
+        let mut buffer = Vec::new();
+        {
+            let mut cid_encoder = Encoder::new(&mut buffer, 12)?;
+            cid_encoder.write_all(to_write.as_bytes())?;
+            cid_encoder.finish()?;
+        }
+
+        id_cid_line_sizes.push(tot_size);
+        tot_size += 8 + buffer.len();
+        cid_file.write_all(&(buffer.len() as u64).to_le_bytes())?;
+        cid_file.write_all(&buffer)?;
+    }
+
+    cid_file.write_all(&(0_u64).to_le_bytes())?;
+    Ok(id_cid_line_sizes)
+}
 
 //TODO SORT CID AND WRITE BIT VECTOR (1 COLOR IS PRESENT, 0 OTHERWISE)
 // THEN COMPRESS FURTHER BY WRITING DIFFERENCES BETWEEN VECS
