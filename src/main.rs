@@ -8,6 +8,9 @@ use clap::Parser;
 use std::env;
 use std::path::{Path, PathBuf};
 
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -96,7 +99,25 @@ fn main() {
     }else {
         let compaction_threads = args.compaction_threads;
         //parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
-        compress::sort_by_bucket(&output_dir, 256);
+
+        let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
+        let mut filename = String::new();
+        let mut filenames = Vec::new();
+        while input_fof_reader.read_line(&mut filename).unwrap() != 0{
+            filename.pop();
+            filenames.push(filename.clone());
+            filename.clear();
+
+        }
+        let id_cid_line_sizes = compress::sort_by_bucket(&output_dir, 256);
+        let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
+        let mut file_cpt: usize = 0;
+        for filename in filenames{
+            println!("a{}a", filename);
+            fof_id.write_all((filename + ":" + id_cid_line_sizes.get(file_cpt).unwrap().to_string().as_str() + "\n").as_bytes()).unwrap();
+            file_cpt += 1;
+        }
+
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");

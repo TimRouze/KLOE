@@ -1,7 +1,6 @@
 
 use core::panic;
 use std::collections::HashMap;
-use std::process::{Command, id};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -94,6 +93,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
     parser::log_checkpoint("Write id to cid wall time:", id_time);
+    parser::log_checkpoint("Compression took:", write_time);
     write_id_cid
 }
 
