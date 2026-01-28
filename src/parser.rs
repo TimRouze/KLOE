@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use tempfile::{Builder as TempBuilder, TempPath};
 use threadpool::ThreadPool;
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -25,6 +26,8 @@ use zstd::stream::write::Encoder as ZstdEncoder;
 const BUFFER_TARGET: usize = 128 * 1024;
 const WRITE_BUFFER_TARGET: usize = 8 * 1024 * 1024;
 const ZSTD_LEVEL_FAST: i32 = -4; // zstd "fast=4" mode for high speed
+const PAR_SORT_THRESHOLD: usize = 200_000;
+const BUCKET_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 
 fn remove_intermediate_file_best_effort(path: &Path) {
     if let Err(err) = fs::remove_file(path) {
@@ -182,7 +185,6 @@ fn id_width(dataset_count: usize) -> usize {
     }
     width
 }
-
 
 fn ensure_nofile_limit(required: u64) -> Result<()> {
     let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
@@ -1058,14 +1060,17 @@ fn write_simplitig_record_to_buf(record: &SimplitigRecord, buf: &mut Vec<u8>) {
 
 fn simplitig_cmp(a: &SimplitigRecord, b: &SimplitigRecord) -> std::cmp::Ordering {
     match a.key.cmp(&b.key) {
-        std::cmp::Ordering::Equal => a.seq.cmp(&b.seq),
+        std::cmp::Ordering::Equal => a
+            .seq
+            .len()
+            .cmp(&b.seq.len())
+            .then_with(|| a.seq.cmp(&b.seq)),
         ord => ord,
     }
 }
 
 fn sort_simplitigs(records: &mut [SimplitigRecord]) {
     // Parallel sort only for large batches to avoid oversubscription on small inputs.
-    const PAR_SORT_THRESHOLD: usize = 200_000;
     if records.len() >= PAR_SORT_THRESHOLD {
         records.par_sort_unstable_by(simplitig_cmp);
     } else {
@@ -1309,25 +1314,257 @@ struct AssemblyJob {
     map: HashMap<u64, KmerEntry>,
 }
 
-fn assemble_group(
+enum GroupPayload {
+    InMemory(Vec<Vec<u8>>),
+    TempFile(TempPath),
+}
+
+struct GroupOutput {
+    idx: usize,
+    header: Vec<u8>,
+    payload: GroupPayload,
+}
+
+struct SeqRunReader {
+    reader: BufReader<File>,
+    buf: Vec<u8>,
+}
+
+impl SeqRunReader {
+    fn new(path: &Path) -> Result<Self> {
+        let file = File::open(path)
+            .with_context(|| format!("open sequence run {}", path.display()))?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            buf: Vec::new(),
+        })
+    }
+
+    fn next_seq(&mut self) -> Result<Option<Vec<u8>>> {
+        if read_line_trimmed(&mut self.reader, &mut self.buf)? == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.buf.clone()))
+    }
+}
+
+#[derive(Debug)]
+struct SeqHeapItem {
+    run_idx: usize,
+    len: usize,
+    seq: Vec<u8>,
+}
+
+impl PartialEq for SeqHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.run_idx == other.run_idx
+    }
+}
+
+impl Eq for SeqHeapItem {}
+
+impl PartialOrd for SeqHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SeqHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.len
+            .cmp(&other.len)
+            .then_with(|| self.run_idx.cmp(&other.run_idx))
+    }
+}
+
+fn sort_sequences_by_length(seqs: &mut [Vec<u8>]) {
+    if seqs.len() >= PAR_SORT_THRESHOLD {
+        seqs.par_sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    } else {
+        seqs.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    }
+}
+
+fn write_sequence_lines<W: Write>(seqs: &[Vec<u8>], writer: &mut W) -> Result<()> {
+    let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+    for seq in seqs {
+        buffer.extend_from_slice(seq);
+        buffer.push(b'\n');
+        if buffer.len() >= WRITE_BUFFER_TARGET {
+            writer.write_all(&buffer)?;
+            buffer.clear();
+        }
+    }
+    if !buffer.is_empty() {
+        writer.write_all(&buffer)?;
+    }
+    Ok(())
+}
+
+fn spill_sequence_run(
+    seqs: &mut Vec<Vec<u8>>,
+    run_paths: &mut Vec<TempPath>,
+    spill_dir: &Path,
+) -> Result<()> {
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    sort_sequences_by_length(seqs);
+    let mut tmp = TempBuilder::new()
+        .prefix("simplitigs-run-")
+        .suffix(".seq")
+        .tempfile_in(spill_dir)
+        .with_context(|| format!("create sequence run in {}", spill_dir.display()))?;
+    {
+        let mut writer = BufWriter::with_capacity(WRITE_BUFFER_TARGET, tmp.as_file_mut());
+        write_sequence_lines(seqs, &mut writer)?;
+        writer.flush()?;
+    }
+    let temp_path = tmp.into_temp_path();
+    run_paths.push(temp_path);
+    seqs.clear();
+    Ok(())
+}
+
+fn merge_sequence_runs(run_paths: &mut [TempPath], output_path: &Path) -> Result<()> {
+    let mut readers: Vec<SeqRunReader> = Vec::with_capacity(run_paths.len());
+    for path in run_paths.iter() {
+        readers.push(SeqRunReader::new(path)?);
+    }
+
+    let mut heap: BinaryHeap<Reverse<SeqHeapItem>> = BinaryHeap::new();
+    for (idx, reader) in readers.iter_mut().enumerate() {
+        if let Some(seq) = reader.next_seq()? {
+            let len = seq.len();
+            heap.push(Reverse(SeqHeapItem { run_idx: idx, len, seq }));
+        }
+    }
+
+    let output = File::create(output_path)
+        .with_context(|| format!("create sorted sequence file {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(WRITE_BUFFER_TARGET, output);
+    let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+
+    while let Some(Reverse(item)) = heap.pop() {
+        buffer.extend_from_slice(&item.seq);
+        buffer.push(b'\n');
+        if buffer.len() >= WRITE_BUFFER_TARGET {
+            writer.write_all(&buffer)?;
+            buffer.clear();
+        }
+        if let Some(seq) = readers[item.run_idx].next_seq()? {
+            let len = seq.len();
+            heap.push(Reverse(SeqHeapItem {
+                run_idx: item.run_idx,
+                len,
+                seq,
+            }));
+        }
+    }
+
+    if !buffer.is_empty() {
+        writer.write_all(&buffer)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn assemble_group_output(
+    idx: usize,
     ids: Vec<usize>,
     map: HashMap<u64, KmerEntry>,
     k: usize,
-    id_width: usize,
-) -> Result<Vec<SimplitigRecord>> {
+    spill_dir: &Path,
+) -> Result<GroupOutput> {
     let header = build_simplitig_header(&ids);
-    let key = build_simplitig_key(&ids, id_width);
-    let mut records: Vec<SimplitigRecord> = Vec::new();
+    let mut sequences: Vec<Vec<u8>> = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut run_paths: Vec<TempPath> = Vec::new();
+
     assemble_simplitigs_bidirected(map, k, |seq, _| {
-        records.push(SimplitigRecord {
-            header: header.clone(),
-            key: key.clone(),
-            seq,
-        });
+        buffered_bytes = buffered_bytes.saturating_add(seq.len());
+        sequences.push(seq);
+        if buffered_bytes >= BUCKET_SORT_SPILL_BYTES {
+            spill_sequence_run(&mut sequences, &mut run_paths, spill_dir)?;
+            buffered_bytes = 0;
+        }
         Ok(())
     })?;
-    sort_simplitigs(&mut records);
-    Ok(records)
+
+    if run_paths.is_empty() {
+        sort_sequences_by_length(&mut sequences);
+        return Ok(GroupOutput {
+            idx,
+            header,
+            payload: GroupPayload::InMemory(sequences),
+        });
+    }
+
+    if !sequences.is_empty() {
+        spill_sequence_run(&mut sequences, &mut run_paths, spill_dir)?;
+    }
+
+    let tmp = TempBuilder::new()
+        .prefix("simplitigs-group-")
+        .suffix(".seq")
+        .tempfile_in(spill_dir)
+        .with_context(|| format!("create sorted sequence file in {}", spill_dir.display()))?;
+    let output_path = tmp.path().to_path_buf();
+    merge_sequence_runs(&mut run_paths, &output_path)?;
+    for run in run_paths {
+        remove_intermediate_file_best_effort(run.as_ref());
+    }
+
+    Ok(GroupOutput {
+        idx,
+        header,
+        payload: GroupPayload::TempFile(tmp.into_temp_path()),
+    })
+}
+
+fn write_group_output<W: Write>(
+    group: GroupOutput,
+    writer: &mut W,
+    out_buf: &mut Vec<u8>,
+) -> Result<()> {
+    let GroupOutput { header, payload, .. } = group;
+    match payload {
+        GroupPayload::InMemory(seqs) => {
+            for seq in seqs {
+                out_buf.extend_from_slice(&header);
+                out_buf.push(b'\n');
+                out_buf.extend_from_slice(&seq);
+                out_buf.push(b'\n');
+                if out_buf.len() >= WRITE_BUFFER_TARGET {
+                    writer.write_all(out_buf)?;
+                    out_buf.clear();
+                }
+            }
+        }
+        GroupPayload::TempFile(temp_path) => {
+            let path: &Path = temp_path.as_ref();
+            let mut reader = BufReader::new(
+                File::open(path)
+                    .with_context(|| format!("open sorted sequence file {}", temp_path.display()))?,
+            );
+            let mut seq_buf = Vec::new();
+            loop {
+                if read_line_trimmed(&mut reader, &mut seq_buf)? == 0 {
+                    break;
+                }
+                out_buf.extend_from_slice(&header);
+                out_buf.push(b'\n');
+                out_buf.extend_from_slice(&seq_buf);
+                out_buf.push(b'\n');
+                if out_buf.len() >= WRITE_BUFFER_TARGET {
+                    writer.write_all(out_buf)?;
+                    out_buf.clear();
+                }
+            }
+            remove_intermediate_file_best_effort(temp_path.as_ref());
+        }
+    }
+    Ok(())
 }
 
 fn assemble_sorted_records_parallel(
@@ -1341,15 +1578,18 @@ fn assemble_sorted_records_parallel(
     let assembly_threads = assembly_threads.max(1);
     let job_capacity = assembly_threads * 2;
     let (job_tx, job_rx) = mpsc::sync_channel::<AssemblyJob>(job_capacity);
-    let (result_tx, result_rx) =
-        mpsc::sync_channel::<(usize, Result<Vec<SimplitigRecord>>)>(job_capacity);
+    let (result_tx, result_rx) = mpsc::sync_channel::<Result<GroupOutput>>(job_capacity);
     let job_rx = Arc::new(Mutex::new(job_rx));
-    let id_width = id_width(dataset_count);
+    let spill_dir = output_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
 
     let mut worker_handles = Vec::new();
     for _ in 0..assembly_threads {
         let job_rx = Arc::clone(&job_rx);
         let result_tx = result_tx.clone();
+        let spill_dir = spill_dir.clone();
         let handle = thread::spawn(move || -> Result<()> {
             loop {
                 let job = {
@@ -1360,8 +1600,8 @@ fn assemble_sorted_records_parallel(
                     Ok(job) => job,
                     Err(_) => break,
                 };
-                let result = assemble_group(ids, map, k, id_width);
-                if result_tx.send((idx, result)).is_err() {
+                let result = assemble_group_output(idx, ids, map, k, &spill_dir);
+                if result_tx.send(result).is_err() {
                     break;
                 }
             }
@@ -1375,18 +1615,16 @@ fn assemble_sorted_records_parallel(
     let writer_handle = thread::spawn(move || -> Result<()> {
         let mut encoder = zstd_encoder_mt(&output_path, ZSTD_LEVEL_FAST, encoder_threads)?;
         let mut out_buf = Vec::with_capacity(WRITE_BUFFER_TARGET);
-        let mut pending: BTreeMap<usize, Vec<SimplitigRecord>> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, GroupOutput> = BTreeMap::new();
         let mut next_idx = 0usize;
-        for (idx, result) in result_rx {
-            let records = result?;
-            pending.insert(idx, records);
-            while let Some(records) = pending.remove(&next_idx) {
-                for record in records {
-                    write_simplitig_record_to_buf(&record, &mut out_buf);
-                    if out_buf.len() >= WRITE_BUFFER_TARGET {
-                        encoder.write_all(&out_buf)?;
-                        out_buf.clear();
-                    }
+        for result in result_rx {
+            let group = result?;
+            pending.insert(group.idx, group);
+            while let Some(group) = pending.remove(&next_idx) {
+                write_group_output(group, &mut encoder, &mut out_buf)?;
+                if out_buf.len() >= WRITE_BUFFER_TARGET {
+                    encoder.write_all(&out_buf)?;
+                    out_buf.clear();
                 }
                 next_idx += 1;
             }

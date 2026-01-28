@@ -97,6 +97,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     write_id_cid
 }
 
+
 fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_files: u32) -> Result<(Vec<(u32, u32)>, Vec<Vec<usize>>)>{
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
     let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
@@ -113,9 +114,10 @@ fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_file
     let mut prev_bucket_pos: u32 = 0;
     let mut cid = 0_usize;
 
-    // Temporary buffer to store one group
-    let mut group: Vec<(Vec<u8>, usize)> = Vec::with_capacity(10000);
     let mut current_ids: Option<Vec<usize>> = None;
+    let mut prev_size: usize = 0;  // For delta encoding within a group
+    let mut total_tigs_bytes: u32 = 0;  // Cumulative tigs bytes for current group
+    let mut group_sizes_buffer: Vec<u8> = Vec::new();  // Zstd buffer for current group
 
     for record_result in fa_reader.records() {
         let record = record_result?;
@@ -134,43 +136,50 @@ fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_file
         // Check if group changed
         if let Some(ref current) = current_ids {
             if &ids != current {
-                // Process completed group
-                process_and_write_group(
-                    &mut group,
-                    &mut omni_file,
-                    &mut size_file,
-                    &mut prev_tigs_size,
-                    &mut prev_bucket_pos,
-                    &mut pos_nb_unitig,
-                    &mut id_to_color_vec,
-                    current,
-                    cid,
-                )?;
+                // Flush previous group to disk
+                prev_bucket_pos += (8 + group_sizes_buffer.len()) as u32;
+                pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
+                size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
+                size_file.write_all(&group_sizes_buffer)?;
+
+                // Reset for new group
+                for id in current {
+                    id_to_color_vec[*id].push(cid);
+                }
                 cid += 1;
-                group.clear();
+                prev_size = 0;
+                total_tigs_bytes = 0;
+                group_sizes_buffer.clear();
                 current_ids = Some(ids);
             }
         } else {
             current_ids = Some(ids);
         }
 
-        group.push((encoded, size));
+        // Write encoded sequence directly to file
+        omni_file.write_all(&encoded)?;
+        total_tigs_bytes += encoded.len() as u32;
+        prev_tigs_size += encoded.len() as u32;
+
+        // Delta encode size and write to buffer
+        let delta = size - prev_size;
+        {
+            let mut encoder = Encoder::new(&mut group_sizes_buffer, 4)?;
+            encoder.write_all(&delta.to_le_bytes())?;
+            encoder.finish()?;
+        }
+        prev_size = size;
     }
 
     // Process final group
-    if !group.is_empty() {
-        if let Some(current) = current_ids {
-            process_and_write_group(
-                &mut group,
-                &mut omni_file,
-                &mut size_file,
-                &mut prev_tigs_size,
-                &mut prev_bucket_pos,
-                &mut pos_nb_unitig,
-                &mut id_to_color_vec,
-                &current,
-                cid,
-            )?;
+    if let Some(current) = current_ids {
+        prev_bucket_pos += (8 + group_sizes_buffer.len()) as u32;
+        pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
+        size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
+        size_file.write_all(&group_sizes_buffer)?;
+
+        for id in current {
+            id_to_color_vec[id].push(cid);
         }
     }
 
@@ -181,58 +190,6 @@ fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_file
     Ok((pos_nb_unitig, id_to_color_vec))
 }
 
-fn process_and_write_group(
-    group: &mut Vec<(Vec<u8>, usize)>,
-    seq_writer: &mut BufWriter<File>,
-    sizes_writer: &mut BufWriter<File>,
-    prev_tigs_size: &mut u32,
-    prev_bucket_pos: &mut u32,
-    pos_nb_unitig: &mut Vec<(u32, u32)>,
-    id_to_color_vec: &mut Vec<Vec<usize>>,
-    current_ids: &[usize],
-    cid: usize,
-) -> Result<()> {
-    // 1. Sort by size
-    group.sort_by_key(|(_, size)| *size);
-
-    // 2. Write sequences and collect deltas
-    let mut deltas: Vec<usize> = Vec::with_capacity(group.len());
-    let mut prev_size = 0;
-    let mut total_tigs_bytes = 0;
-
-    for (encoded_seq, size) in group.iter() {
-        seq_writer.write_all(encoded_seq)?;
-        total_tigs_bytes += encoded_seq.len();
-        let delta = *size - prev_size;
-        deltas.push(delta);
-        prev_size = *size;
-    }
-
-    *prev_tigs_size += total_tigs_bytes as u32;
-
-    // 3. Compress sizes
-    let mut buffer = Vec::with_capacity(deltas.len() * 16); // Reasonable pre-allocation
-    {
-        let mut encoder = Encoder::new(&mut buffer, 1)?; // Level 1 is fast, good for small data
-        for delta in &deltas {
-            encoder.write_all(&delta.to_le_bytes())?;
-        }
-        encoder.finish()?;
-    }
-
-    // 4. Write sizes block
-    *prev_bucket_pos += (8 + buffer.len()) as u32;
-    pos_nb_unitig.push((*prev_tigs_size, *prev_bucket_pos));
-    sizes_writer.write_all(&(buffer.len() as u64).to_le_bytes())?;
-    sizes_writer.write_all(&buffer)?;
-
-    // 5. Update color mapping
-    for id in current_ids {
-        id_to_color_vec[*id].push(cid);
-    }
-
-    Ok(())
-}
 
 /*
 WRITE COMPRESSED READS SIMPLITIGS DUMP FILE.
@@ -489,7 +446,7 @@ fn write_id_to_color_id_test(cid_file_path: String, id_to_color_vec: Vec<Vec<usi
 
     for elem in id_to_color_vec {
         // Pre-allocate string with estimated size
-        let mut to_write = String::with_capacity(elem.len() * 10);
+        let mut to_write = String::new();
         
         for (i, e) in elem.iter().enumerate() {
             let pos = cursor_positions[*e];
