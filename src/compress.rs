@@ -116,8 +116,9 @@ fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_file
 
     let mut current_ids: Option<Vec<usize>> = None;
     let mut prev_size: usize = 0;  // For delta encoding within a group
-    let mut total_tigs_bytes: u32 = 0;  // Cumulative tigs bytes for current group
     let mut group_sizes_buffer: Vec<u8> = Vec::new();  // Zstd buffer for current group
+    let mut group_encoder: Option<Encoder<&mut Vec<u8>>> = None;
+    let mut buffer_encoded_seq: Vec<Vec<u8>> = Vec::new();
 
     for record_result in fa_reader.records() {
         let record = record_result?;
@@ -130,13 +131,16 @@ fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_file
             .collect();
 
         let seq = record.seq();
-        let encoded = <Converter as Convert<&[u8]>>::str2num(seq);
+        //let encoded = <Converter as Convert<&[u8]>>::str2num(seq);
+        buffer_encoded_seq.push(<Converter as Convert<&[u8]>>::str2num(seq));
         let size = seq.len();
 
         // Check if group changed
         if let Some(ref current) = current_ids {
             if &ids != current {
-                // Flush previous group to disk
+                if let Some(encoder) = group_encoder.take() {
+                    encoder.finish()?;
+                }
                 prev_bucket_pos += (8 + group_sizes_buffer.len()) as u32;
                 pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
                 size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
@@ -148,31 +152,44 @@ fn write_compressed_test(unitigs_file_path: String, output_dir: &String, nb_file
                 }
                 cid += 1;
                 prev_size = 0;
-                total_tigs_bytes = 0;
                 group_sizes_buffer.clear();
                 current_ids = Some(ids);
+                group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 1)?);
             }
         } else {
             current_ids = Some(ids);
+            group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 1)?);
         }
 
-        // Write encoded sequence directly to file
-        omni_file.write_all(&encoded)?;
-        total_tigs_bytes += encoded.len() as u32;
-        prev_tigs_size += encoded.len() as u32;
+        if buffer_encoded_seq.len() >= 1000{
+            for elem in &buffer_encoded_seq{
+                omni_file.write_all(&elem)?;
+                prev_tigs_size += elem.len() as u32;
+            }
+            buffer_encoded_seq.clear();
+            
+        }
 
         // Delta encode size and write to buffer
         let delta = size - prev_size;
-        {
-            let mut encoder = Encoder::new(&mut group_sizes_buffer, 4)?;
+        if let Some(ref mut encoder) = group_encoder {
             encoder.write_all(&delta.to_le_bytes())?;
-            encoder.finish()?;
         }
         prev_size = size;
     }
 
     // Process final group
     if let Some(current) = current_ids {
+        for elem in &buffer_encoded_seq{
+            omni_file.write_all(&elem)?;
+            prev_tigs_size += elem.len() as u32;
+        }
+        buffer_encoded_seq.clear();
+
+
+        if let Some(encoder) = group_encoder.take() {
+            encoder.finish()?;
+        }
         prev_bucket_pos += (8 + group_sizes_buffer.len()) as u32;
         pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
         size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
