@@ -3,7 +3,25 @@ use bio::io::fasta;
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use flate2::read::GzDecoder;
+use genome_graph::bigraph::interface::BidirectedData;
+use genome_graph::bigraph::traitgraph::implementation::petgraph_impl::PetGraph;
+use genome_graph::bigraph::traitgraph::interface::{DynamicGraph, ImmutableGraphContainer};
+use genome_graph::bigraph::traitgraph::traitsequence::interface::Sequence;
+use genome_graph::bigraph::traitgraph::walks::VecEdgeWalk;
+use genome_graph::bigraph::implementation::node_bigraph_wrapper::NodeBigraphWrapper;
+use genome_graph::compact_genome::implementation::{
+    alphabets::dna_alphabet::DnaAlphabet, DefaultGenome, DefaultSequenceStore,
+};
+use genome_graph::compact_genome::interface::alphabet::Alphabet;
+use genome_graph::compact_genome::interface::sequence::{GenomeSequence, OwnedGenomeSequence};
+use genome_graph::compact_genome::interface::sequence_store::{HandleWithLength, SequenceStore};
+use genome_graph::io::fasta::{read_bigraph_from_fasta_as_edge_centric, FastaNodeData};
+use genome_graph::io::SequenceData;
 use hashbrown::{hash_map::Entry, HashMap};
+use libmatchtigs::{
+    EulertigAlgorithm, EulertigAlgorithmConfiguration, GreedytigAlgorithm,
+    GreedytigAlgorithmConfiguration, MatchtigEdgeData, NodeWeightArrayType, TigAlgorithm,
+};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
 use rayon::{prelude::*, ThreadPoolBuilder};
@@ -19,6 +37,7 @@ use std::sync::Arc;
 use std::thread;
 use tempfile::{Builder as TempBuilder, TempPath};
 use threadpool::ThreadPool;
+use traitgraph_algo::dijkstra::DijkstraWeightedEdgeData;
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -28,6 +47,7 @@ const WRITE_BUFFER_TARGET: usize = 8 * 1024 * 1024;
 const ZSTD_LEVEL_FAST: i32 = -4; // zstd "fast=4" mode for high speed
 const PAR_SORT_THRESHOLD: usize = 200_000;
 const BUCKET_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
+const PARTITION_HASH_MUL: u64 = 0x9e3779b97f4a7c15;
 
 fn remove_intermediate_file_best_effort(path: &Path) {
     if let Err(err) = fs::remove_file(path) {
@@ -184,6 +204,55 @@ fn id_width(dataset_count: usize) -> usize {
         width += 1;
     }
     width
+}
+
+fn ids_match(a: &[u64], b: &[u64]) -> bool {
+    a.is_empty() || b.is_empty() || a == b
+}
+
+fn matchtig_threading(available: usize) -> (usize, usize) {
+    let available = available.max(1);
+    (available, 1)
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Parse FASTA files into superkmers grouped by minimizer"
+)]
+struct Args {
+    #[arg(short = 'i', long = "input-fof")]
+    input_fof: PathBuf,
+    #[arg(short = 'o', long = "output-dir")]
+    output_dir: PathBuf,
+    #[arg(short = 'k', long = "kmer", default_value_t = 31)]
+    k: usize,
+    #[arg(short = 'm', long = "minimizer", default_value_t = 9)]
+    m: usize,
+    /// Number of partitions is 2^partition_power (default 1024 partitions)
+    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
+    partition_power: u32,
+    #[arg(short = 't', long = "threads", default_value_t = 32)]
+    threads: usize,
+    /// Concurrency for the compaction phase (per-partition simplitigs)
+    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
+    compaction_threads: usize,
+    /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
+    #[arg(long = "verify-kmers", default_value_t = false)]
+    verify_kmers: bool,
+    /// Output greedy matchtigs instead of simplitigs
+    #[arg(long = "matchtig", default_value_t = false)]
+    matchtig: bool,
+    /// Output eulertigs instead of simplitigs
+    #[arg(long = "eulertig", default_value_t = false)]
+    eulertig: bool,
+    /// Output unitigs (maximal non-branching paths) instead of simplitigs
+    #[arg(long = "unitig", default_value_t = false)]
+    unitig: bool,
+    /// Skip sorting within partitions and during final merge (output will not be globally sorted)
+    #[arg(long = "skip-sort", default_value_t = false)]
+    skip_sort: bool,
 }
 
 fn ensure_nofile_limit(required: u64) -> Result<()> {
@@ -492,7 +561,7 @@ fn insert_kmers_from_sequence(
     map: &mut HashMap<u64, KmerEntry>,
     seq: &[u8],
     k: usize,
-    ids_bits: &[u64],
+    _ids_bits: &[u64],
 ) {
     if seq.len() < k {
         return;
@@ -520,7 +589,7 @@ fn insert_kmers_from_sequence(
         }
         let canon = if fwd <= rev { fwd } else { rev };
         map.entry(canon).or_insert_with(|| KmerEntry {
-            ids: ids_bits.to_vec(),
+            ids: Vec::new(),
             successor: None,
             predecessor: None,
             succ_ambig: false,
@@ -563,7 +632,9 @@ fn assemble_simplitigs_bidirected(
                     let next_bits = ((bits << 2) & mask) | base as u64;
                     let next_canon = canonical_bits(next_bits, k);
                     if let Some(&idx) = index.get(&next_canon) {
-                        if !entries[idx].1.visited && entries[idx].1.ids == ids_bits {
+                        if !entries[idx].1.visited
+                            && ids_match(&ids_bits, &entries[idx].1.ids)
+                        {
                             return true;
                         }
                     }
@@ -571,7 +642,9 @@ fn assemble_simplitigs_bidirected(
                         ((base as u64) << (2 * (k - 1)) | (bits >> 2)) & mask;
                     let prev_canon = canonical_bits(prev_bits, k);
                     if let Some(&idx) = index.get(&prev_canon) {
-                        if !entries[idx].1.visited && entries[idx].1.ids == ids_bits {
+                        if !entries[idx].1.visited
+                            && ids_match(&ids_bits, &entries[idx].1.ids)
+                        {
                             return true;
                         }
                     }
@@ -595,7 +668,9 @@ fn assemble_simplitigs_bidirected(
                 let Some(&next_idx) = index.get(&next_canon) else {
                     continue;
                 };
-                if entries[next_idx].1.visited || entries[next_idx].1.ids != ids_bits {
+                if entries[next_idx].1.visited
+                    || !ids_match(&ids_bits, &entries[next_idx].1.ids)
+                {
                     continue;
                 }
                 found = Some((next_idx, next_bits, base));
@@ -621,7 +696,9 @@ fn assemble_simplitigs_bidirected(
                 let Some(&prev_idx) = index.get(&prev_canon) else {
                     continue;
                 };
-                if entries[prev_idx].1.visited || entries[prev_idx].1.ids != ids_bits {
+                if entries[prev_idx].1.visited
+                    || !ids_match(&ids_bits, &entries[prev_idx].1.ids)
+                {
                     continue;
                 }
                 found = Some((prev_idx, prev_bits, base));
@@ -630,6 +707,167 @@ fn assemble_simplitigs_bidirected(
             let Some((prev_idx, prev_bits, base)) = found else {
                 break;
             };
+            prefix.push(bits_to_base(base));
+            entries[prev_idx].1.visited = true;
+            left_bits = prev_bits;
+        }
+
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + seq.len());
+            for b in prefix.into_iter().rev() {
+                full.push(b);
+            }
+            full.extend(seq);
+            seq = full;
+        }
+
+        sink(seq, ids_from_bitset(&ids_bits))?;
+    }
+    Ok(())
+}
+
+fn unique_out_neighbor_bidirected(
+    bits: u64,
+    ids_bits: &[u64],
+    entries: &[(u64, KmerEntry)],
+    index: &HashMap<u64, usize>,
+    mask: u64,
+    k: usize,
+) -> Option<(u8, u64, usize)> {
+    let mut found: Option<(u8, u64, usize)> = None;
+    for base in 0u8..4u8 {
+        let next_bits = ((bits << 2) & mask) | base as u64;
+        let next_canon = canonical_bits(next_bits, k);
+        let Some(&idx) = index.get(&next_canon) else {
+            continue;
+        };
+        if !ids_match(ids_bits, &entries[idx].1.ids) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((base, next_bits, idx));
+    }
+    found
+}
+
+fn unique_in_neighbor_bidirected(
+    bits: u64,
+    ids_bits: &[u64],
+    entries: &[(u64, KmerEntry)],
+    index: &HashMap<u64, usize>,
+    mask: u64,
+    k: usize,
+) -> Option<(u8, u64, usize)> {
+    let mut found: Option<(u8, u64, usize)> = None;
+    for base in 0u8..4u8 {
+        let prev_bits = ((base as u64) << (2 * (k - 1)) | (bits >> 2)) & mask;
+        let prev_canon = canonical_bits(prev_bits, k);
+        let Some(&idx) = index.get(&prev_canon) else {
+            continue;
+        };
+        if !ids_match(ids_bits, &entries[idx].1.ids) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((base, prev_bits, idx));
+    }
+    found
+}
+
+fn assemble_unitigs_bidirected(
+    kmer_map: HashMap<u64, KmerEntry>,
+    k: usize,
+    mut sink: impl FnMut(Vec<u8>, Vec<usize>) -> Result<()>,
+) -> Result<()> {
+    let mask: u64 = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+
+    let mut entries: Vec<(u64, KmerEntry)> = kmer_map.into_iter().collect();
+    let mut index: HashMap<u64, usize> = HashMap::with_capacity(entries.len());
+    for (idx, (bits, _)) in entries.iter().enumerate() {
+        index.insert(*bits, idx);
+    }
+
+    for seed_idx in 0..entries.len() {
+        if entries[seed_idx].1.visited {
+            continue;
+        }
+        let ids_bits = entries[seed_idx].1.ids.clone();
+        entries[seed_idx].1.visited = true;
+
+        let mut seq_bits = entries[seed_idx].0;
+        let mut seq = decode_kmer(seq_bits, k);
+
+        // extend to the right while out-degree==1 and next in-degree==1
+        loop {
+            let Some((base, next_bits, next_idx)) = unique_out_neighbor_bidirected(
+                seq_bits,
+                &ids_bits,
+                &entries,
+                &index,
+                mask,
+                k,
+            ) else {
+                break;
+            };
+            let Some((_, prev_bits, _)) = unique_in_neighbor_bidirected(
+                next_bits,
+                &ids_bits,
+                &entries,
+                &index,
+                mask,
+                k,
+            ) else {
+                break;
+            };
+            if prev_bits != seq_bits {
+                break;
+            }
+            if entries[next_idx].1.visited {
+                break;
+            }
+            seq.push(bits_to_base(base));
+            entries[next_idx].1.visited = true;
+            seq_bits = next_bits;
+        }
+
+        // extend to the left while in-degree==1 and prev out-degree==1
+        let mut left_bits = entries[seed_idx].0;
+        let mut prefix: Vec<u8> = Vec::new();
+        loop {
+            let Some((base, prev_bits, prev_idx)) = unique_in_neighbor_bidirected(
+                left_bits,
+                &ids_bits,
+                &entries,
+                &index,
+                mask,
+                k,
+            ) else {
+                break;
+            };
+            let Some((_, next_bits, _)) = unique_out_neighbor_bidirected(
+                prev_bits,
+                &ids_bits,
+                &entries,
+                &index,
+                mask,
+                k,
+            ) else {
+                break;
+            };
+            if next_bits != left_bits {
+                break;
+            }
+            if entries[prev_idx].1.visited {
+                break;
+            }
             prefix.push(bits_to_base(base));
             entries[prev_idx].1.visited = true;
             left_bits = prev_bits;
@@ -858,6 +1096,171 @@ struct SimplitigRecord {
     header: Vec<u8>,
     key: Vec<u8>,
     seq: Vec<u8>,
+}
+
+type DnaStore = DefaultSequenceStore<DnaAlphabet>;
+type DnaHandle = <DnaStore as SequenceStore<DnaAlphabet>>::Handle;
+type DnaGraph = NodeBigraphWrapper<PetGraph<(), CliEdgeData<DnaHandle>>>;
+
+/// Edge data used for greedy matchtigs over FASTA-derived graphs.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+struct CliEdgeData<SequenceHandle> {
+    sequence_handle: SequenceHandle,
+    forward: bool,
+    weight: usize,
+    dummy_edge_id: usize,
+}
+
+impl<SequenceHandle> DijkstraWeightedEdgeData<usize> for CliEdgeData<SequenceHandle> {
+    fn weight(&self) -> usize {
+        self.weight
+    }
+}
+
+impl<SequenceHandle: Clone> BidirectedData for CliEdgeData<SequenceHandle> {
+    fn mirror(&self) -> Self {
+        let mut result = self.clone();
+        result.forward = !result.forward;
+        result
+    }
+}
+
+impl SequenceData<DnaAlphabet, DnaStore> for CliEdgeData<DnaHandle> {
+    fn sequence_handle(&self) -> &<DnaStore as SequenceStore<DnaAlphabet>>::Handle {
+        &self.sequence_handle
+    }
+
+    fn sequence_ref<'this: 'result, 'store: 'result, 'result>(
+        &'this self,
+        source_sequence_store: &'store DnaStore,
+    ) -> Option<&'result <DnaStore as SequenceStore<DnaAlphabet>>::SequenceRef> {
+        if self.forward {
+            let handle = <Self as SequenceData<DnaAlphabet, DnaStore>>::sequence_handle(self);
+            Some(source_sequence_store.get(handle))
+        } else {
+            None
+        }
+    }
+
+    fn sequence_owned<
+        ResultSequence: OwnedGenomeSequence<DnaAlphabet, ResultSubsequence>,
+        ResultSubsequence: GenomeSequence<DnaAlphabet, ResultSubsequence> + ?Sized,
+    >(
+        &self,
+        source_sequence_store: &DnaStore,
+    ) -> ResultSequence {
+        let handle = <Self as SequenceData<DnaAlphabet, DnaStore>>::sequence_handle(self);
+        if self.forward {
+            source_sequence_store.get(handle).convert()
+        } else {
+            source_sequence_store
+                .get(handle)
+                .convert_with_reverse_complement()
+        }
+    }
+}
+
+impl<SequenceHandle: Clone> MatchtigEdgeData<SequenceHandle> for CliEdgeData<SequenceHandle> {
+    fn is_dummy(&self) -> bool {
+        self.dummy_edge_id != 0
+    }
+
+    fn is_forwards(&self) -> bool {
+        self.forward
+    }
+
+    fn new(
+        sequence_handle: SequenceHandle,
+        forwards: bool,
+        weight: usize,
+        dummy_id: usize,
+    ) -> Self {
+        Self {
+            sequence_handle,
+            forward: forwards,
+            weight,
+            dummy_edge_id: dummy_id,
+        }
+    }
+}
+
+impl<SequenceHandle> From<FastaNodeData<SequenceHandle>> for CliEdgeData<SequenceHandle> {
+    fn from(node_data: FastaNodeData<SequenceHandle>) -> Self {
+        Self {
+            sequence_handle: node_data.sequence_handle,
+            forward: node_data.forwards,
+            weight: 0,
+            dummy_edge_id: 0,
+        }
+    }
+}
+
+fn compute_edge_weights<NodeData, Graph: DynamicGraph<NodeData = NodeData, EdgeData = CliEdgeData<DnaHandle>>>(
+    graph: &mut Graph,
+    k: usize,
+) {
+    for edge_index in graph.edge_indices_copied() {
+        let edge_data = graph.edge_data_mut(edge_index);
+        let weight = edge_data.sequence_handle.len() + 1 - k;
+        edge_data.weight = weight;
+    }
+}
+
+fn collect_walks_sequences(
+    graph: &DnaGraph,
+    walks: &[VecEdgeWalk<DnaGraph>],
+    source_sequence_store: &DnaStore,
+    k: usize,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(walks.len());
+    for walk in walks {
+        if walk.is_empty() {
+            continue;
+        }
+        let first_edge = *walk.first().unwrap();
+        let first_data = graph.edge_data(first_edge);
+        let first_sequence: DefaultGenome<DnaAlphabet> =
+            first_data.sequence_owned(source_sequence_store);
+        let first_sequence = first_sequence.as_string();
+
+        let mut seq = Vec::with_capacity(first_sequence.len() + 64);
+        seq.extend_from_slice(first_sequence.as_bytes());
+
+        let mut previous = first_edge;
+        for &current in walk.iter().skip(1) {
+            let previous_data = graph.edge_data(previous);
+            let current_data = graph.edge_data(current);
+
+            if current_data.is_dummy() {
+                previous = current;
+                continue;
+            }
+
+            let offset = if previous_data.is_original() {
+                k - 1
+            } else {
+                k - 1 - previous_data.weight()
+            };
+
+            if let Some(current_sequence) = current_data.sequence_ref(source_sequence_store) {
+                let current_sequence = &current_sequence[offset..current_sequence.len()];
+                for character in current_sequence.iter() {
+                    seq.push(DnaAlphabet::character_to_ascii(character.clone()));
+                }
+            } else {
+                let handle = current_data.sequence_handle();
+                let sequence_ref = source_sequence_store.get(handle);
+                let sequence_ref = &sequence_ref[0..sequence_ref.len() - offset];
+                for character in sequence_ref.reverse_complement_iter() {
+                    seq.push(DnaAlphabet::character_to_ascii(character));
+                }
+            }
+
+            previous = current;
+        }
+        out.push(seq);
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -1134,7 +1537,7 @@ fn assemble_simplitigs(
             let Some(&next_idx) = index.get(&next_canon) else {
                 break;
             };
-            if entries[next_idx].1.visited || entries[next_idx].1.ids != ids_bits {
+            if entries[next_idx].1.visited || !ids_match(&ids_bits, &entries[next_idx].1.ids) {
                 break;
             }
             seq.push(bits_to_base(base_bits));
@@ -1157,7 +1560,7 @@ fn assemble_simplitigs(
             let Some(&next_idx) = index.get(&prev_canon) else {
                 break;
             };
-            if entries[next_idx].1.visited || entries[next_idx].1.ids != ids_bits {
+            if entries[next_idx].1.visited || !ids_match(&ids_bits, &entries[next_idx].1.ids) {
                 break;
             }
             prefix.push(bits_to_base(base_bits));
@@ -1185,9 +1588,10 @@ fn process_file(
     file_id: usize,
     encoders: &SharedEncoders,
     k: usize,
-    _m: usize,
+    m: usize,
     window_kmers: usize,
-    partitions: u64,
+    _partitions: u64,
+    partition_mask: u64,
     stats: &Arc<Stats>,
     dataset_count: usize,
 ) -> Result<()> {
@@ -1202,6 +1606,14 @@ fn process_file(
             dataset_count
         );
     }
+    let mut header = Vec::with_capacity(16);
+    header.push(b'>');
+    push_usize_decimal(&mut header, file_id);
+    header.push(b'\n');
+
+    let mut superkmer_starts = Vec::new();
+    let mut minimizer_positions = Vec::new();
+    let mut minimizer_values: Vec<u64> = Vec::new();
 
     for record in reader.records() {
         let record = record.with_context(|| format!("parse record in {}", file_path.display()))?;
@@ -1213,15 +1625,16 @@ fn process_file(
         let packed_seq = PackedSeqVec::from_ascii(seq);
         let packed_slice = packed_seq.as_slice();
 
-        let mut superkmer_starts = Vec::new();
-        let mut minimizer_positions = Vec::new();
-        let kmers_in_seq = seq.len() - k + 1;
-        let effective_window = window_kmers.min(kmers_in_seq).max(1);
-        let minimizer_values: Vec<u64> = simd_minimizers::minimizers(k, effective_window)
+        superkmer_starts.clear();
+        minimizer_positions.clear();
+        minimizer_values.clear();
+
+        let mmers_in_seq = seq.len() - m + 1;
+        let effective_window = window_kmers.min(mmers_in_seq).max(1);
+        let output = simd_minimizers::canonical_minimizers(m, effective_window)
             .super_kmers(&mut superkmer_starts)
-            .run(packed_slice, &mut minimizer_positions)
-            .values_u64()
-            .collect();
+            .run(packed_slice, &mut minimizer_positions);
+        minimizer_values.extend(output.values_u64());
         if superkmer_starts.is_empty() {
             continue;
         }
@@ -1244,11 +1657,12 @@ fn process_file(
             }
 
             let superkmer_slice = &seq[start..end];
-            let partition_id = (min_val.wrapping_mul(0x9e3779b97f4a7c15) % partitions) as usize;
+            let partition_id =
+                (min_val.wrapping_mul(PARTITION_HASH_MUL) & partition_mask) as usize;
             let buffer = local_buffers
                 .entry(partition_id)
                 .or_insert_with(|| Vec::with_capacity(BUFFER_TARGET));
-            buffer.extend_from_slice(format!(">{}\n", file_id).as_bytes());
+            buffer.extend_from_slice(&header);
             buffer.extend_from_slice(superkmer_slice);
             buffer.push(b'\n');
 
@@ -1306,6 +1720,71 @@ fn write_partition_simplitigs(
         .finish()
         .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
     Ok(())
+}
+
+fn build_matchtig_sequences_from_kmers(
+    map: HashMap<u64, KmerEntry>,
+    k: usize,
+    threads: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if map.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (mut graph, sequence_store) = build_graph_from_unitigs(map, k)
+        .context("build unitig graph for matchtigs")?;
+    compute_edge_weights(&mut graph, k);
+
+    let mut config = GreedytigAlgorithmConfiguration::new(threads.max(1), k);
+    config.node_weight_array_type = NodeWeightArrayType::EpochNodeWeightArray;
+    let tigs = GreedytigAlgorithm::compute_tigs(&mut graph, &config);
+    Ok(collect_walks_sequences(&graph, &tigs, &sequence_store, k))
+}
+
+fn build_eulertig_sequences_from_kmers(
+    map: HashMap<u64, KmerEntry>,
+    k: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if map.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (mut graph, sequence_store) = build_graph_from_unitigs(map, k)
+        .context("build unitig graph for eulertigs")?;
+    compute_edge_weights(&mut graph, k);
+
+    let config = EulertigAlgorithmConfiguration { k };
+    let tigs = EulertigAlgorithm::compute_tigs(&mut graph, &config);
+    Ok(collect_walks_sequences(&graph, &tigs, &sequence_store, k))
+}
+
+fn build_graph_from_unitigs(
+    map: HashMap<u64, KmerEntry>,
+    k: usize,
+) -> Result<(DnaGraph, DnaStore)> {
+    let mut fasta_buf: Vec<u8> = Vec::new();
+    let mut count = 0usize;
+    const TIG_HEADER: &[u8] = b">tig\n";
+
+    assemble_unitigs_bidirected(map, k, |seq, _| {
+        count += 1;
+        fasta_buf.reserve(TIG_HEADER.len() + seq.len() + 1);
+        fasta_buf.extend_from_slice(TIG_HEADER);
+        fasta_buf.extend_from_slice(&seq);
+        fasta_buf.push(b'\n');
+        Ok(())
+    })?;
+
+    if count == 0 {
+        return Ok((DnaGraph::default(), DnaStore::default()));
+    }
+
+    let cursor = std::io::Cursor::new(fasta_buf);
+    let reader = BufReader::new(cursor);
+    let mut sequence_store = DnaStore::default();
+    let graph: DnaGraph = read_bigraph_from_fasta_as_edge_centric(reader, &mut sequence_store, k)
+        .context("read unitig fasta for matchtigs/eulertigs")?;
+    Ok((graph, sequence_store))
 }
 
 struct AssemblyJob {
@@ -1475,21 +1954,41 @@ fn assemble_group_output(
     map: HashMap<u64, KmerEntry>,
     k: usize,
     spill_dir: &Path,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+    matchtig_threads: usize,
 ) -> Result<GroupOutput> {
     let header = build_simplitig_header(&ids);
     let mut sequences: Vec<Vec<u8>> = Vec::new();
     let mut buffered_bytes = 0usize;
     let mut run_paths: Vec<TempPath> = Vec::new();
 
-    assemble_simplitigs_bidirected(map, k, |seq, _| {
-        buffered_bytes = buffered_bytes.saturating_add(seq.len());
-        sequences.push(seq);
-        if buffered_bytes >= BUCKET_SORT_SPILL_BYTES {
-            spill_sequence_run(&mut sequences, &mut run_paths, spill_dir)?;
-            buffered_bytes = 0;
-        }
-        Ok(())
-    })?;
+    if use_matchtigs {
+        sequences = build_matchtig_sequences_from_kmers(map, k, matchtig_threads)?;
+    } else if use_eulertigs {
+        sequences = build_eulertig_sequences_from_kmers(map, k)?;
+    } else if use_unitigs {
+        assemble_unitigs_bidirected(map, k, |seq, _| {
+            buffered_bytes = buffered_bytes.saturating_add(seq.len());
+            sequences.push(seq);
+            if buffered_bytes >= BUCKET_SORT_SPILL_BYTES {
+                spill_sequence_run(&mut sequences, &mut run_paths, spill_dir)?;
+                buffered_bytes = 0;
+            }
+            Ok(())
+        })?;
+    } else {
+        assemble_simplitigs_bidirected(map, k, |seq, _| {
+            buffered_bytes = buffered_bytes.saturating_add(seq.len());
+            sequences.push(seq);
+            if buffered_bytes >= BUCKET_SORT_SPILL_BYTES {
+                spill_sequence_run(&mut sequences, &mut run_paths, spill_dir)?;
+                buffered_bytes = 0;
+            }
+            Ok(())
+        })?;
+    }
 
     if run_paths.is_empty() {
         sort_sequences_by_length(&mut sequences);
@@ -1574,6 +2073,10 @@ fn assemble_sorted_records_parallel(
     dataset_count: usize,
     k: usize,
     assembly_threads: usize,
+    matchtig_threads: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     let assembly_threads = assembly_threads.max(1);
     let job_capacity = assembly_threads * 2;
@@ -1600,7 +2103,17 @@ fn assemble_sorted_records_parallel(
                     Ok(job) => job,
                     Err(_) => break,
                 };
-                let result = assemble_group_output(idx, ids, map, k, &spill_dir);
+                let result = assemble_group_output(
+                    idx,
+                    ids,
+                    map,
+                    k,
+                    &spill_dir,
+                    use_unitigs,
+                    use_matchtigs,
+                    use_eulertigs,
+                    matchtig_threads,
+                );
                 if result_tx.send(result).is_err() {
                     break;
                 }
@@ -1715,6 +2228,9 @@ fn merge_sorted_partitions(
     sort_records: bool,
     dataset_count: usize,
     k: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     if !sort_records {
         concatenate_zstd_frames(partition_paths, output_path, threads)?;
@@ -1726,10 +2242,28 @@ fn merge_sorted_partitions(
     // streams (far fewer inputs) while writing the final output.
     let threads = threads.max(1);
     if threads > 1 && partition_paths.len() > 8 {
-        return parallel_streaming_merge(partition_paths, output_path, threads, dataset_count, k);
+        return parallel_streaming_merge(
+            partition_paths,
+            output_path,
+            threads,
+            dataset_count,
+            k,
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+        );
     }
 
-    kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k)
+    kway_merge_sorted_partitions(
+        partition_paths,
+        output_path,
+        threads,
+        dataset_count,
+        k,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
+    )
 }
 
 fn kway_merge_sorted_partitions(
@@ -1738,6 +2272,9 @@ fn kway_merge_sorted_partitions(
     threads: usize,
     dataset_count: usize,
     k: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     let width = id_width(dataset_count);
     let mut readers: Vec<PartitionReader> = Vec::new();
@@ -1755,7 +2292,11 @@ fn kway_merge_sorted_partitions(
         }
     }
 
-    let assembly_threads = threads.saturating_sub(1).max(1);
+    let (assembly_threads, matchtig_threads) = if use_matchtigs {
+        matchtig_threading(threads)
+    } else {
+        (threads.saturating_sub(1).max(1), 1usize)
+    };
     let next_record = || -> Result<Option<SimplitigRecord>> {
         if let Some(Reverse(item)) = heap.pop() {
             let run_idx = item.run_idx;
@@ -1778,6 +2319,10 @@ fn kway_merge_sorted_partitions(
         dataset_count,
         k,
         assembly_threads,
+        matchtig_threads,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
     )
 }
 
@@ -1855,6 +2400,10 @@ fn merge_sorted_streams_to_output(
     dataset_count: usize,
     k: usize,
     assembly_threads: usize,
+    matchtig_threads: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
 
@@ -1897,6 +2446,10 @@ fn merge_sorted_streams_to_output(
         dataset_count,
         k,
         assembly_threads,
+        matchtig_threads,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
     )
 }
 
@@ -1906,10 +2459,22 @@ fn parallel_streaming_merge(
     threads: usize,
     dataset_count: usize,
     k: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     let threads = threads.max(1);
     if threads <= 1 || partition_paths.len() <= 1 {
-        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k);
+        return kway_merge_sorted_partitions(
+            partition_paths,
+            output_path,
+            threads,
+            dataset_count,
+            k,
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+        );
     }
 
     // Favor output compression: the final encoder tends to dominate wall time.
@@ -1917,7 +2482,16 @@ fn parallel_streaming_merge(
     let worker_threads = threads.saturating_sub(encoder_threads).max(1);
     let group_count = worker_threads.min(partition_paths.len()).max(1);
     if group_count <= 1 {
-        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k);
+        return kway_merge_sorted_partitions(
+            partition_paths,
+            output_path,
+            threads,
+            dataset_count,
+            k,
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+        );
     }
 
     let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
@@ -1936,13 +2510,22 @@ fn parallel_streaming_merge(
         }));
     }
 
+    let (assembly_threads, matchtig_threads) = if use_matchtigs {
+        matchtig_threading(worker_threads)
+    } else {
+        (worker_threads.max(1), 1usize)
+    };
     let merge_result = merge_sorted_streams_to_output(
         receivers,
         output_path,
         encoder_threads,
         dataset_count,
         k,
-        worker_threads.max(1),
+        assembly_threads,
+        matchtig_threads,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
     );
 
     let mut first_worker_err: Option<anyhow::Error> = None;
@@ -2145,6 +2728,9 @@ fn parallel_merge_sorted_partitions(
     sort_records: bool,
     dataset_count: usize,
     k: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     if partition_paths.is_empty() {
         let encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
@@ -2174,6 +2760,9 @@ fn parallel_merge_sorted_partitions(
         sort_records,
         dataset_count,
         k,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
     )
 }
 
@@ -2234,6 +2823,9 @@ pub fn test_parser_with_verify(
         partition_power,
         threads,
         threads,
+        false,
+        false,
+        false,
         verify_kmers,
         false,
     )
@@ -2247,19 +2839,37 @@ pub fn run_parser(
     partition_power: u32,
     threads: usize,
     compaction_threads: usize,
+    unitig: bool,
+    matchtig: bool,
+    eulertig: bool,
     verify_kmers: bool,
     skip_sort: bool,
 ) -> Result<()> {
     if k < m {
         bail!("k-mer length ({}) must be >= minimizer length ({})", k, m);
     }
+    if matchtig && skip_sort {
+        bail!("--matchtig requires sorting enabled (do not use --skip-sort)");
+    }
+    if eulertig && skip_sort {
+        bail!("--eulertig requires sorting enabled (do not use --skip-sort)");
+    }
+    if unitig && skip_sort {
+        bail!("--unitig requires sorting enabled (do not use --skip-sort)");
+    }
+    let mode_count = matchtig as u8 + unitig as u8 + eulertig as u8;
+    if mode_count > 1 {
+        bail!("--matchtig, --eulertig and --unitig are mutually exclusive");
+    }
     let overall_start = Utc::now();
     let partitions = 1u64
         .checked_shl(partition_power)
         .context("partition power too large")?;
+    let partition_mask = partitions - 1;
     let window = k
         .checked_sub(m)
-        .context("failed to compute window size; ensure k > m")?;
+        .and_then(|v| v.checked_add(1))
+        .context("failed to compute window size; ensure k >= m")?;
     let required_limit = partitions + 64;
 
     ensure_nofile_limit(required_limit)?;
@@ -2282,24 +2892,26 @@ pub fn run_parser(
     let pool = ThreadPool::new(threads);
     for (idx, file_path) in file_paths.iter().enumerate() {
         let encoders = Arc::clone(&encoders);
-        let partitions = partitions;
-        let k = k;
-        let m = m;
-        let stats = Arc::clone(&stats);
-        let dataset_count = dataset_count;
-        let file_path = file_path.clone();
-        pool.execute(move || {
-            if let Err(err) = process_file(
-                &file_path,
-                idx + 1,
-                &encoders,
-                k,
-                m,
-                window,
-                partitions,
-                &stats,
-                dataset_count,
-            ) {
+            let partitions = partitions;
+            let partition_mask = partition_mask;
+            let k = k;
+            let m = m;
+            let stats = Arc::clone(&stats);
+            let dataset_count = dataset_count;
+            let file_path = file_path.clone();
+            pool.execute(move || {
+                if let Err(err) = process_file(
+                    &file_path,
+                    idx + 1,
+                    &encoders,
+                    k,
+                    m,
+                    window,
+                    partitions,
+                    partition_mask,
+                    &stats,
+                    dataset_count,
+                ) {
                 eprintln!("Failed to process {}: {err}", file_path.display());
             }
         });
@@ -2336,7 +2948,15 @@ pub fn run_parser(
     // Second phase: per-partition compaction into simplitigs with identical ID sets.
     println!("Starting per-partition simplitig compaction...");
     let compaction_start = Utc::now();
-    let output_simplitigs = output_dir.join("simplitigs.fa.zst");
+    let output_sequences = if matchtig {
+        output_dir.join("matchtig.fa.zst")
+    } else if eulertig {
+        output_dir.join("eulertig.fa.zst")
+    } else if unitig {
+        output_dir.join("unitigs.fa.zst")
+    } else {
+        output_dir.join("simplitigs.fa.zst")
+    };
     let partition_outputs = Arc::new(Mutex::new(Vec::new()));
     let compaction_pool = ThreadPoolBuilder::new()
         .num_threads(compaction_threads)
@@ -2375,21 +2995,35 @@ pub fn run_parser(
     let merge_start = Utc::now();
     let merge_result = parallel_merge_sorted_partitions(
         partition_paths.clone(),
-        &output_simplitigs,
+        &output_sequences,
         compaction_threads,
         !skip_sort,
         dataset_count,
         k,
+        unitig,
+        matchtig,
+        eulertig,
     );
     for path in &partition_paths {
         remove_intermediate_file_best_effort(path);
     }
     merge_result?;
-    log_checkpoint("Step 3 - simplitig merge/sort", merge_start);
+    log_checkpoint(
+        if matchtig {
+            "Step 3 - matchtig merge/sort"
+        } else if eulertig {
+            "Step 3 - eulertig merge/sort"
+        } else if unitig {
+            "Step 3 - unitig merge/sort"
+        } else {
+            "Step 3 - simplitig merge/sort"
+        },
+        merge_start,
+    );
 
     if verify_kmers {
         println!("Verifying k-mer preservation...");
-        let output_map = build_output_kmer_map(&output_simplitigs, k, dataset_count)?;
+        let output_map = build_output_kmer_map(&output_sequences, k, dataset_count)?;
         let input_map = build_kmer_map_from_inputs(&file_paths, k)?;
         verify_kmer_maps(&input_map, &output_map, k)?;
         println!(
@@ -2401,8 +3035,17 @@ pub fn run_parser(
     }
 
     println!(
-        "Simplitig compaction complete. Output: {}",
-        output_simplitigs.display()
+        "{} compaction complete. Output: {}",
+        if matchtig {
+            "Matchtig"
+        } else if eulertig {
+            "Eulertig"
+        } else if unitig {
+            "Unitig"
+        } else {
+            "Simplitig"
+        },
+        output_sequences.display()
     );
     println!(
         "Total wall time: {}",
@@ -2411,3 +3054,4 @@ pub fn run_parser(
     println!("Partitioning complete.");
     Ok(())
 }
+

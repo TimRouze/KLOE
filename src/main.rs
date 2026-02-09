@@ -21,7 +21,7 @@ struct Args {
     #[arg(short, long, default_value_t=String::from(""))]
     input_list: String,
     /// Number of threads (defaults to 1)
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(short, long, default_value_t = num_cpus::get())]
     threads: usize,
     ///Output directory
     #[arg(short, long, default_value_t = String::from(""))]
@@ -44,8 +44,6 @@ struct Args {
     ///Minimizer size (< k), default = 7
     #[arg(short, long, default_value_t = 7)]
     minimizer_size: usize,
-    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
-    compaction_threads: usize,
     /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
     #[arg(long = "verify-kmers", default_value_t = false)]
     verify_kmers: bool,
@@ -55,8 +53,17 @@ struct Args {
     /// Skip sorting within partitions and during final merge (output will not be globally sorted)
     #[arg(long = "skip-sort", default_value_t = false)]
     skip_sort: bool,
-
-}
+    /// Unitigs
+    #[arg(long = "unitigs", default_value_t = false)]
+    unitigs: bool,
+    /// Matchtigs
+    #[arg(long = "matchtigs", default_value_t = false)]
+    matchtigs: bool,
+    /// Eulertigs
+    #[arg(long = "eulertigs", default_value_t = false)]
+    eulertigs: bool,
+    
+}   
 const BLOCK_SIZE: usize = 1 << (12 - 3);
 const SHARD_AMOUNT: usize = 1024;
 const M: u8 = 7;
@@ -93,11 +100,10 @@ fn main() {
                 compaction_threads
             );*/
             //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
-            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.compaction_threads);
+            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.unitigs, args.matchtigs, args.eulertigs);
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
     }else {
-        let compaction_threads = args.compaction_threads;
         //parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
 
         let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));

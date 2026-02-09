@@ -8,6 +8,7 @@ use std::u32;
 use bio::io::fasta;
 use chrono::{DateTime, Duration, Utc};
 
+use genome_graph::bigraph::traitgraph::implementation::petgraph_impl::petgraph::data::Element;
 use num_traits::ToPrimitive;
 use zstd::stream::read::Decoder;
 use zstd::Encoder;
@@ -15,9 +16,9 @@ use zstd::Encoder;
 use crate::utils::{Converter, Convert, vec2str};
 use crate::parser;
 
-pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, compaction_threads: usize) -> Result<()>{
+pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, unitigs: bool, matchtig: bool, eulertigs: bool, ) -> Result<()>{
     let overall_start = Utc::now();
-    parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
+    parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, threads, unitigs, matchtig, eulertigs, false, false);
     let parsing_time = Utc::now();
     println!("Simplitigs created, processing sequences");
     let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
@@ -137,8 +138,8 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
 
     let mut current_ids: Option<Vec<usize>> = None;
     let mut prev_size: usize = 0;
-    let mut group_sizes_buffer: Vec<u8> = Vec::new();
-    let mut group_encoder: Option<Encoder<&mut Vec<u8>>> = None;
+
+    let mut sizes: Vec<usize> = Vec::new();
     let mut buffer_encoded_seq: Vec<Vec<u8>> = Vec::new();
 
     for record_result in fa_reader.records() {
@@ -151,66 +152,74 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
             .map(|s| s.parse::<usize>().unwrap() - 1)
             .collect();
 
-        let seq = record.seq();
-        buffer_encoded_seq.push(<Converter as Convert<&[u8]>>::str2num(seq));
-        let size = seq.len();
+        
 
         if let Some(ref current) = current_ids {
             if &ids != current {
-                if let Some(encoder) = group_encoder.take() {
-                    encoder.finish()?;
+                let mut encoded_sizes = Vec::new();
+                {
+                    let mut size_encoder = Encoder::new(&mut encoded_sizes, 4)?;
+                    for elem in &sizes{
+                        size_encoder.write_all(&elem.to_le_bytes())?;
+                    }
+                    size_encoder.finish()?;
                 }
-                prev_bucket_pos += (8 + group_sizes_buffer.len()) as u32;
+
+                prev_bucket_pos += (8 + encoded_sizes.len()) as u32;
                 pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
-                size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
-                size_file.write_all(&group_sizes_buffer)?;
+                size_file.write_all(&(encoded_sizes.len() as u64).to_le_bytes())?;
+                size_file.write_all(&encoded_sizes)?;
 
                 for id in current {
                     id_to_color_vec[*id].push(cid);
                 }
                 cid += 1;
                 prev_size = 0;
-                group_sizes_buffer.clear();
                 current_ids = Some(ids);
-                group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 1)?);
+                sizes.clear();
             }
         } else {
             current_ids = Some(ids);
-            group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 4)?);
         }
+
+        let seq = record.seq();
+        let encoded = <Converter as Convert<&[u8]>>::str2num(seq);
+        buffer_encoded_seq.push(encoded.clone());
+        prev_tigs_size += encoded.len() as u32;
+        let size = seq.len();
 
         if buffer_encoded_seq.len() >= 1000{
             for elem in &buffer_encoded_seq{
                 omni_file.write_all(&elem)?;
-                prev_tigs_size += elem.len() as u32;
             }
             buffer_encoded_seq.clear();
-            
         }
 
-        // Delta encode size and write to buffer
         let delta = size - prev_size;
-        if let Some(ref mut encoder) = group_encoder {
-            encoder.write_all(&delta.to_le_bytes())?;
-        }
+        sizes.push(delta);
         prev_size = size;
     }
 
     if let Some(current) = current_ids {
         for elem in &buffer_encoded_seq{
             omni_file.write_all(&elem)?;
-            prev_tigs_size += elem.len() as u32;
         }
         buffer_encoded_seq.clear();
 
 
-        if let Some(encoder) = group_encoder.take() {
-            encoder.finish()?;
+        let mut encoded_sizes = Vec::new();
+        {
+            let mut size_encoder = Encoder::new(&mut encoded_sizes, 4)?;
+            for elem in &sizes{
+                size_encoder.write_all(&elem.to_le_bytes())?;
+            }
+            size_encoder.finish()?;
         }
-        prev_bucket_pos += (8 + group_sizes_buffer.len()) as u32;
+
+        prev_bucket_pos += (8 + encoded_sizes.len()) as u32;
         pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
-        size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
-        size_file.write_all(&group_sizes_buffer)?;
+        size_file.write_all(&(encoded_sizes.len() as u64).to_le_bytes())?;
+        size_file.write_all(&encoded_sizes)?;
 
         for id in current {
             id_to_color_vec[id].push(cid);
@@ -270,7 +279,7 @@ fn write_id_to_color_id_test(cid_file_path: String, id_to_color_vec: Vec<Vec<usi
             if i > 0 {
                 to_write.push(',');
             }
-            write!(&mut to_write, "{}", pos).unwrap();
+            to_write.push_str(&pos.to_string());
         }
 
         let mut buffer = Vec::new();
