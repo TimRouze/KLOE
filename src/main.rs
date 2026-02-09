@@ -1,5 +1,6 @@
 mod utils;
 mod decompress;
+mod assembly;
 mod parser;
 mod compress;
 use clap::Parser;
@@ -66,14 +67,10 @@ fn main() {
     
     let output_dir = args.out_dir;
     let input_dir = args.compressed_dir;
-    //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
-    let _temp_dir = args.temp_dir;
-    let _memory = args.memory;
     let k = args.k_size;
     let m = args.minimizer_size;
-    //TODO HANDLE ERRORS FOR COMP AND DECOMP
     let wanted_path = args.wanted_files;
     let use_unitigs = args.unitig;
     let use_matchtigs = args.matchtig;
@@ -88,24 +85,10 @@ fn main() {
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
             let _ = decompress::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.bin"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
-            //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
         }else if do_decompress == "compress"{
-            /*let _ = compress::compress(
-                &output_dir, 
-                &input_fof, 
-                threads, 
-                &temp_dir, 
-                k, 
-                m, 
-                partition_power, 
-                compaction_threads
-            );*/
-            //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
             let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort, use_unitigs, use_matchtigs, use_eulertigs);
-            //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
     }else {
-        //parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
 
         let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
         let mut filename = String::new();
@@ -118,11 +101,11 @@ fn main() {
         }
         let id_cid_line_sizes = compress::sort_by_bucket(&output_dir, 256);
         let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
-        let mut file_cpt: usize = 0;
+        let mut file_index: usize = 0;
         for filename in filenames{
-            println!("a{}a", filename);
-            fof_id.write_all((filename + ":" + id_cid_line_sizes.get(file_cpt).unwrap().to_string().as_str() + "\n").as_bytes()).unwrap();
-            file_cpt += 1;
+            println!("Processing file: {}", filename);
+            fof_id.write_all((filename + ":" + id_cid_line_sizes.get(file_index).unwrap().to_string().as_str() + "\n").as_bytes()).unwrap();
+            file_index += 1;
         }
 
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
