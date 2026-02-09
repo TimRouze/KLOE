@@ -115,7 +115,17 @@ fn main() {
             filename.clear();
 
         }
-        let id_cid_line_sizes = compress::sort_by_bucket(&output_dir, 256);
+        let mut sequence_type;
+        if args.unitigs{
+            sequence_type = String::from("unitigs");
+        }else if args.matchtigs{
+            sequence_type = String::from("matchtigs");
+        }else if args.eulertigs{
+            sequence_type = String::from("eulertigs");
+        }else{
+            sequence_type = String::from("simplitigs");
+        }
+        let id_cid_line_sizes = compress::sort_by_bucket(&output_dir, 256, sequence_type);
         let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
         let mut file_cpt: usize = 0;
         for filename in filenames{

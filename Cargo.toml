@@ -38,6 +38,9 @@ hashbrown = { version = "0.14", default-features = false, features = ["ahash"] }
 xz2 = "0.1"
 tempfile = "3.23.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+genome-graph = "11.0.0"
+libmatchtigs = { package = "matchtigs", version = "2.1.9" }
+traitgraph-algo = { version = "8.1.2", features = ["hashbrown_dijkstra_node_weight_array"] }
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
@@ -47,4 +50,4 @@ debug = true
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"

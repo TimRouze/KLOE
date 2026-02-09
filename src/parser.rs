@@ -2949,9 +2949,9 @@ pub fn run_parser(
     println!("Starting per-partition simplitig compaction...");
     let compaction_start = Utc::now();
     let output_sequences = if matchtig {
-        output_dir.join("matchtig.fa.zst")
+        output_dir.join("matchtigs.fa.zst")
     } else if eulertig {
-        output_dir.join("eulertig.fa.zst")
+        output_dir.join("eulertigs.fa.zst")
     } else if unitig {
         output_dir.join("unitigs.fa.zst")
     } else {

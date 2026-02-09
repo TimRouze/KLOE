@@ -20,6 +20,16 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
     let overall_start = Utc::now();
     parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, threads, unitigs, matchtig, eulertigs, false, false);
     let parsing_time = Utc::now();
+    let mut sequence_type = String::new();
+    if unitigs{
+        sequence_type = String::from("unitigs");
+    }else if matchtig{
+        sequence_type = String::from("matchtigs");
+    }else if eulertigs{
+        sequence_type = String::from("eulertigs");
+    }else{
+        sequence_type = String::from("simplitigs");
+    }
     println!("Simplitigs created, processing sequences");
     let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
     let mut filename = String::new();
@@ -33,7 +43,7 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
     println!("Sorting sequences by color bucket");
     let sort_time = Utc::now();
     parser::log_checkpoint("Wall time:", parsing_time);
-    let id_cid_line_sizes = sort_by_bucket(&output_dir, filenames.len() as u32);
+    let id_cid_line_sizes = sort_by_bucket(&output_dir, filenames.len() as u32, sequence_type);
     parser::log_checkpoint("Sorting took:", sort_time);
     let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
     let mut file_cpt: usize = 0;
@@ -58,7 +68,7 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
 /// RETURNS
 /// - Vector of sizes (cursor positions) per input file used to annotate filenames,
 ///   the position of cid list in id to cid file for each id (used later during decompression).
-pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
+pub fn sort_by_bucket(output_dir: &String, nb_files: u32, sequence_type: String) -> Vec<usize>{
     let write_time = Utc::now();
     // PROCESS AND COMPRESS UNITIGS
     println!("Starting writing compressed sequences.");
@@ -69,7 +79,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     //     Ok(res_pair) => res_pair,
     //     Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     // };
-    let pair = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files){
+    let pair = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files, sequence_type){
         Ok(res_pair) => res_pair,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
@@ -120,11 +130,11 @@ FOR EACH COLOR BUCKET
 ///
 /// RETURNS
 /// - Vec<(u32,u32)> containing pairs (tigs bucket pos in tigs file, tigs sizes positions in the sizes file) for each bucket.
-fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u32) -> Result<(Vec<(u32, u32)>, Vec<Vec<usize>>)>{
+fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u32, sequence_type: String) -> Result<(Vec<(u32, u32)>, Vec<Vec<usize>>)>{
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
     let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
 
-    let unitigs_file = File::open(output_dir.clone() + "simplitigs.fa.zst")?;
+    let unitigs_file = File::open(output_dir.clone() + &sequence_type + ".fa.zst")?;
     let decoder = zstd::Decoder::new(unitigs_file)?;
     let reader: Box<dyn BufRead> = Box::new(BufReader::new(decoder));
     let fa_reader = fasta::Reader::from_bufread(reader);
