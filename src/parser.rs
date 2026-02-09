@@ -2,7 +2,25 @@ use anyhow::{bail, Context, Result};
 use bio::io::fasta;
 use chrono::{DateTime, Duration, Utc};
 use flate2::read::GzDecoder;
+use genome_graph::bigraph::interface::BidirectedData;
+use genome_graph::bigraph::traitgraph::implementation::petgraph_impl::PetGraph;
+use genome_graph::bigraph::traitgraph::interface::{DynamicGraph, ImmutableGraphContainer};
+use genome_graph::bigraph::traitgraph::traitsequence::interface::Sequence;
+use genome_graph::bigraph::traitgraph::walks::VecEdgeWalk;
+use genome_graph::bigraph::implementation::node_bigraph_wrapper::NodeBigraphWrapper;
+use genome_graph::compact_genome::implementation::{
+    alphabets::dna_alphabet::DnaAlphabet, DefaultGenome, DefaultSequenceStore,
+};
+use genome_graph::compact_genome::interface::alphabet::Alphabet;
+use genome_graph::compact_genome::interface::sequence::{GenomeSequence, OwnedGenomeSequence};
+use genome_graph::compact_genome::interface::sequence_store::{HandleWithLength, SequenceStore};
+use genome_graph::io::fasta::{read_bigraph_from_fasta_as_edge_centric, FastaNodeData};
+use genome_graph::io::SequenceData;
 use hashbrown::{hash_map::Entry, HashMap};
+use libmatchtigs::{
+    EulertigAlgorithm, EulertigAlgorithmConfiguration, GreedytigAlgorithm,
+    GreedytigAlgorithmConfiguration, MatchtigEdgeData, NodeWeightArrayType, TigAlgorithm,
+};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
 use rayon::{prelude::*, ThreadPoolBuilder};
@@ -18,6 +36,7 @@ use std::sync::Arc;
 use std::thread;
 use tempfile::{Builder as TempBuilder, TempPath};
 use threadpool::ThreadPool;
+use traitgraph_algo::dijkstra::DijkstraWeightedEdgeData;
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -660,6 +679,397 @@ fn assemble_simplitigs_bidirected(
         sink(seq, ids_slice)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unitig assembly: maximal non-branching paths (degree-1 both directions)
+// ---------------------------------------------------------------------------
+
+fn unique_out_neighbor_bidirected(
+    bits: u64,
+    ids_slice: &[u64],
+    kmer_map: &HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    mask: u64,
+    k: usize,
+) -> Option<(u8, u64)> {
+    let mut found: Option<(u8, u64)> = None;
+    for base in 0u8..4u8 {
+        let next_bits = ((bits << 2) & mask) | base as u64;
+        let next_canon = canonical_bits(next_bits, k);
+        let Some(entry) = kmer_map.get(&next_canon) else {
+            continue;
+        };
+        if entry_ids(entry, arena, words) != ids_slice {
+            continue;
+        }
+        if found.is_some() {
+            return None; // ambiguous: >1 neighbor
+        }
+        found = Some((base, next_bits));
+    }
+    found
+}
+
+fn unique_in_neighbor_bidirected(
+    bits: u64,
+    ids_slice: &[u64],
+    kmer_map: &HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    mask: u64,
+    k: usize,
+) -> Option<(u8, u64)> {
+    let mut found: Option<(u8, u64)> = None;
+    for base in 0u8..4u8 {
+        let prev_bits = ((base as u64) << (2 * (k - 1)) | (bits >> 2)) & mask;
+        let prev_canon = canonical_bits(prev_bits, k);
+        let Some(entry) = kmer_map.get(&prev_canon) else {
+            continue;
+        };
+        if entry_ids(entry, arena, words) != ids_slice {
+            continue;
+        }
+        if found.is_some() {
+            return None; // ambiguous
+        }
+        found = Some((base, prev_bits));
+    }
+    found
+}
+
+fn assemble_unitigs_bidirected(
+    kmer_map: &mut HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    k: usize,
+    mut sink: impl FnMut(Vec<u8>, &[u64]) -> Result<()>,
+) -> Result<()> {
+    let mask: u64 = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+
+    let keys: Vec<u64> = kmer_map.keys().copied().collect();
+
+    for &seed_key in &keys {
+        let seed = kmer_map.get_mut(&seed_key).unwrap();
+        if seed.visited() {
+            continue;
+        }
+        seed.set_visited();
+        let seed_ids_offset = seed.ids_offset;
+        let ids_slice = entry_ids_by_offset(seed_ids_offset, arena, words);
+
+        let mut seq_bits = seed_key;
+        let mut seq = decode_kmer(seq_bits, k);
+
+        // extend right while out-degree==1 and next in-degree==1
+        loop {
+            let Some((base, next_bits)) = unique_out_neighbor_bidirected(
+                seq_bits, ids_slice, kmer_map, arena, words, mask, k,
+            ) else {
+                break;
+            };
+            let next_canon = canonical_bits(next_bits, k);
+            // check that next node's unique in-neighbor points back to us
+            let Some((_, back_bits)) = unique_in_neighbor_bidirected(
+                next_bits, ids_slice, kmer_map, arena, words, mask, k,
+            ) else {
+                break;
+            };
+            if back_bits != seq_bits {
+                break;
+            }
+            let next_entry = kmer_map.get_mut(&next_canon).unwrap();
+            if next_entry.visited() {
+                break;
+            }
+            next_entry.set_visited();
+            seq.push(bits_to_base(base));
+            seq_bits = next_bits;
+        }
+
+        // extend left while in-degree==1 and prev out-degree==1
+        let mut left_bits = seed_key;
+        let mut prefix: Vec<u8> = Vec::new();
+        loop {
+            let Some((base, prev_bits)) = unique_in_neighbor_bidirected(
+                left_bits, ids_slice, kmer_map, arena, words, mask, k,
+            ) else {
+                break;
+            };
+            let prev_canon = canonical_bits(prev_bits, k);
+            let Some((_, fwd_bits)) = unique_out_neighbor_bidirected(
+                prev_bits, ids_slice, kmer_map, arena, words, mask, k,
+            ) else {
+                break;
+            };
+            if fwd_bits != left_bits {
+                break;
+            }
+            let prev_entry = kmer_map.get_mut(&prev_canon).unwrap();
+            if prev_entry.visited() {
+                break;
+            }
+            prev_entry.set_visited();
+            prefix.push(bits_to_base(base));
+            left_bits = prev_bits;
+        }
+
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + seq.len());
+            for b in prefix.into_iter().rev() {
+                full.push(b);
+            }
+            full.extend(seq);
+            seq = full;
+        }
+
+        sink(seq, ids_slice)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Graph-based tig algorithms (matchtigs, eulertigs)
+// ---------------------------------------------------------------------------
+
+type DnaStore = DefaultSequenceStore<DnaAlphabet>;
+type DnaHandle = <DnaStore as SequenceStore<DnaAlphabet>>::Handle;
+type DnaGraph = NodeBigraphWrapper<PetGraph<(), CliEdgeData<DnaHandle>>>;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+struct CliEdgeData<SequenceHandle> {
+    sequence_handle: SequenceHandle,
+    forward: bool,
+    weight: usize,
+    dummy_edge_id: usize,
+}
+
+impl<SequenceHandle> DijkstraWeightedEdgeData<usize> for CliEdgeData<SequenceHandle> {
+    fn weight(&self) -> usize {
+        self.weight
+    }
+}
+
+impl<SequenceHandle: Clone> BidirectedData for CliEdgeData<SequenceHandle> {
+    fn mirror(&self) -> Self {
+        let mut result = self.clone();
+        result.forward = !result.forward;
+        result
+    }
+}
+
+impl SequenceData<DnaAlphabet, DnaStore> for CliEdgeData<DnaHandle> {
+    fn sequence_handle(&self) -> &<DnaStore as SequenceStore<DnaAlphabet>>::Handle {
+        &self.sequence_handle
+    }
+
+    fn sequence_ref<'this: 'result, 'store: 'result, 'result>(
+        &'this self,
+        source_sequence_store: &'store DnaStore,
+    ) -> Option<&'result <DnaStore as SequenceStore<DnaAlphabet>>::SequenceRef> {
+        if self.forward {
+            let handle = <Self as SequenceData<DnaAlphabet, DnaStore>>::sequence_handle(self);
+            Some(source_sequence_store.get(handle))
+        } else {
+            None
+        }
+    }
+
+    fn sequence_owned<
+        ResultSequence: OwnedGenomeSequence<DnaAlphabet, ResultSubsequence>,
+        ResultSubsequence: GenomeSequence<DnaAlphabet, ResultSubsequence> + ?Sized,
+    >(
+        &self,
+        source_sequence_store: &DnaStore,
+    ) -> ResultSequence {
+        let handle = <Self as SequenceData<DnaAlphabet, DnaStore>>::sequence_handle(self);
+        if self.forward {
+            source_sequence_store.get(handle).convert()
+        } else {
+            source_sequence_store
+                .get(handle)
+                .convert_with_reverse_complement()
+        }
+    }
+}
+
+impl<SequenceHandle: Clone> MatchtigEdgeData<SequenceHandle> for CliEdgeData<SequenceHandle> {
+    fn is_dummy(&self) -> bool {
+        self.dummy_edge_id != 0
+    }
+
+    fn is_forwards(&self) -> bool {
+        self.forward
+    }
+
+    fn new(
+        sequence_handle: SequenceHandle,
+        forwards: bool,
+        weight: usize,
+        dummy_id: usize,
+    ) -> Self {
+        Self {
+            sequence_handle,
+            forward: forwards,
+            weight,
+            dummy_edge_id: dummy_id,
+        }
+    }
+}
+
+impl<SequenceHandle> From<FastaNodeData<SequenceHandle>> for CliEdgeData<SequenceHandle> {
+    fn from(node_data: FastaNodeData<SequenceHandle>) -> Self {
+        Self {
+            sequence_handle: node_data.sequence_handle,
+            forward: node_data.forwards,
+            weight: 0,
+            dummy_edge_id: 0,
+        }
+    }
+}
+
+fn compute_edge_weights<NodeData, Graph: DynamicGraph<NodeData = NodeData, EdgeData = CliEdgeData<DnaHandle>>>(
+    graph: &mut Graph,
+    k: usize,
+) {
+    for edge_index in graph.edge_indices_copied() {
+        let edge_data = graph.edge_data_mut(edge_index);
+        let weight = edge_data.sequence_handle.len() + 1 - k;
+        edge_data.weight = weight;
+    }
+}
+
+fn collect_walks_sequences(
+    graph: &DnaGraph,
+    walks: &[VecEdgeWalk<DnaGraph>],
+    source_sequence_store: &DnaStore,
+    k: usize,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(walks.len());
+    for walk in walks {
+        if walk.is_empty() {
+            continue;
+        }
+        let first_edge = *walk.first().unwrap();
+        let first_data = graph.edge_data(first_edge);
+        let first_sequence: DefaultGenome<DnaAlphabet> =
+            first_data.sequence_owned(source_sequence_store);
+        let first_sequence = first_sequence.as_string();
+
+        let mut seq = Vec::with_capacity(first_sequence.len() + 64);
+        seq.extend_from_slice(first_sequence.as_bytes());
+
+        let mut previous = first_edge;
+        for &current in walk.iter().skip(1) {
+            let previous_data = graph.edge_data(previous);
+            let current_data = graph.edge_data(current);
+
+            if current_data.is_dummy() {
+                previous = current;
+                continue;
+            }
+
+            let offset = if previous_data.is_original() {
+                k - 1
+            } else {
+                k - 1 - previous_data.weight()
+            };
+
+            if let Some(current_sequence) = current_data.sequence_ref(source_sequence_store) {
+                let current_sequence = &current_sequence[offset..current_sequence.len()];
+                for character in current_sequence.iter() {
+                    seq.push(DnaAlphabet::character_to_ascii(character.clone()));
+                }
+            } else {
+                let handle = current_data.sequence_handle();
+                let sequence_ref = source_sequence_store.get(handle);
+                let sequence_ref = &sequence_ref[0..sequence_ref.len() - offset];
+                for character in sequence_ref.reverse_complement_iter() {
+                    seq.push(DnaAlphabet::character_to_ascii(character));
+                }
+            }
+
+            previous = current;
+        }
+        out.push(seq);
+    }
+    out
+}
+
+fn build_graph_from_unitigs(
+    kmer_map: &mut HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    k: usize,
+) -> Result<(DnaGraph, DnaStore)> {
+    let mut fasta_buf: Vec<u8> = Vec::new();
+    let mut count = 0usize;
+    const TIG_HEADER: &[u8] = b">tig\n";
+
+    assemble_unitigs_bidirected(kmer_map, arena, words, k, |seq, _| {
+        count += 1;
+        fasta_buf.reserve(TIG_HEADER.len() + seq.len() + 1);
+        fasta_buf.extend_from_slice(TIG_HEADER);
+        fasta_buf.extend_from_slice(&seq);
+        fasta_buf.push(b'\n');
+        Ok(())
+    })?;
+
+    if count == 0 {
+        return Ok((DnaGraph::default(), DnaStore::default()));
+    }
+
+    let cursor = std::io::Cursor::new(fasta_buf);
+    let reader = BufReader::new(cursor);
+    let mut sequence_store = DnaStore::default();
+    let graph: DnaGraph = read_bigraph_from_fasta_as_edge_centric(reader, &mut sequence_store, k)
+        .context("read unitig fasta for matchtigs/eulertigs")?;
+    Ok((graph, sequence_store))
+}
+
+fn build_matchtig_sequences_from_kmers(
+    kmer_map: &mut HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    k: usize,
+    threads: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if kmer_map.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (mut graph, sequence_store) = build_graph_from_unitigs(kmer_map, arena, words, k)
+        .context("build unitig graph for matchtigs")?;
+    compute_edge_weights(&mut graph, k);
+
+    let mut config = GreedytigAlgorithmConfiguration::new(threads.max(1), k);
+    config.node_weight_array_type = NodeWeightArrayType::EpochNodeWeightArray;
+    let tigs = GreedytigAlgorithm::compute_tigs(&mut graph, &config);
+    Ok(collect_walks_sequences(&graph, &tigs, &sequence_store, k))
+}
+
+fn build_eulertig_sequences_from_kmers(
+    kmer_map: &mut HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    k: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if kmer_map.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (mut graph, sequence_store) = build_graph_from_unitigs(kmer_map, arena, words, k)
+        .context("build unitig graph for eulertigs")?;
+    compute_edge_weights(&mut graph, k);
+
+    let config = EulertigAlgorithmConfiguration { k };
+    let tigs = EulertigAlgorithm::compute_tigs(&mut graph, &config);
+    Ok(collect_walks_sequences(&graph, &tigs, &sequence_store, k))
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,16 +1986,48 @@ fn write_partition_simplitigs(
     output_path: &Path,
     threads: usize,
     sort_records: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     let (mut map, arena, words) =
         build_kmer_map_from_partition(partition_path, k, dataset_count)?;
     let width = id_width(dataset_count);
     let mut records = Vec::new();
-    let use_flat = map.len() >= FLAT_TABLE_THRESHOLD;
-    if use_flat {
-        let mut flat = FlatKmerTable::from_hashmap(&map);
-        map.clear();
-        assemble_simplitigs_flat(&mut flat, &arena, words, k, |seq, ids_bits| {
+
+    if use_matchtigs {
+        let seqs = build_matchtig_sequences_from_kmers(&mut map, &arena, words, k, threads)?;
+        // Collect the union of all dataset IDs in this partition
+        let mut all_ids_bits = vec![0u64; words];
+        for (_, entry) in map.iter() {
+            let eids = entry_ids(entry, &arena, words);
+            for (dst, src) in all_ids_bits.iter_mut().zip(eids.iter()) {
+                *dst |= *src;
+            }
+        }
+        let ids = ids_from_bitset(&all_ids_bits);
+        let header = build_simplitig_header(&ids);
+        let key = build_simplitig_key(&ids, width);
+        for seq in seqs {
+            records.push(SimplitigRecord { header: header.clone(), key: key.clone(), seq });
+        }
+    } else if use_eulertigs {
+        let seqs = build_eulertig_sequences_from_kmers(&mut map, &arena, words, k)?;
+        let mut all_ids_bits = vec![0u64; words];
+        for (_, entry) in map.iter() {
+            let eids = entry_ids(entry, &arena, words);
+            for (dst, src) in all_ids_bits.iter_mut().zip(eids.iter()) {
+                *dst |= *src;
+            }
+        }
+        let ids = ids_from_bitset(&all_ids_bits);
+        let header = build_simplitig_header(&ids);
+        let key = build_simplitig_key(&ids, width);
+        for seq in seqs {
+            records.push(SimplitigRecord { header: header.clone(), key: key.clone(), seq });
+        }
+    } else if use_unitigs {
+        assemble_unitigs_bidirected(&mut map, &arena, words, k, |seq, ids_bits| {
             let ids = ids_from_bitset(ids_bits);
             let header = build_simplitig_header(&ids);
             let key = build_simplitig_key(&ids, width);
@@ -1593,13 +2035,27 @@ fn write_partition_simplitigs(
             Ok(())
         })?;
     } else {
-        assemble_simplitigs_bidirected(&mut map, &arena, words, k, |seq, ids_bits| {
-            let ids = ids_from_bitset(ids_bits);
-            let header = build_simplitig_header(&ids);
-            let key = build_simplitig_key(&ids, width);
-            records.push(SimplitigRecord { header, key, seq });
-            Ok(())
-        })?;
+        // Default: simplitigs
+        let use_flat = map.len() >= FLAT_TABLE_THRESHOLD;
+        if use_flat {
+            let mut flat = FlatKmerTable::from_hashmap(&map);
+            map.clear();
+            assemble_simplitigs_flat(&mut flat, &arena, words, k, |seq, ids_bits| {
+                let ids = ids_from_bitset(ids_bits);
+                let header = build_simplitig_header(&ids);
+                let key = build_simplitig_key(&ids, width);
+                records.push(SimplitigRecord { header, key, seq });
+                Ok(())
+            })?;
+        } else {
+            assemble_simplitigs_bidirected(&mut map, &arena, words, k, |seq, ids_bits| {
+                let ids = ids_from_bitset(ids_bits);
+                let header = build_simplitig_header(&ids);
+                let key = build_simplitig_key(&ids, width);
+                records.push(SimplitigRecord { header, key, seq });
+                Ok(())
+            })?;
+        }
     }
 
     let mut encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
@@ -2447,6 +2903,9 @@ pub fn run_parser(
     threads: usize,
     verify_kmers: bool,
     skip_sort: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<()> {
     if k < m {
         bail!("k-mer length ({}) must be >= minimizer length ({})", k, m);
@@ -2574,6 +3033,9 @@ pub fn run_parser(
                         &part_output,
                         1,
                         !skip_sort,
+                        use_unitigs,
+                        use_matchtigs,
+                        use_eulertigs,
                     );
                     match result {
                         Ok(_) => partition_outputs.lock().push(part_output.clone()),
@@ -2648,6 +3110,9 @@ pub fn run_parser_streaming(
     threads: usize,
     verify_kmers: bool,
     skip_sort: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
 ) -> Result<(
     mpsc::Receiver<SimplitigRecord>,
     thread::JoinHandle<Result<()>>,
@@ -2772,6 +3237,9 @@ pub fn run_parser_streaming(
                         &part_output,
                         1,
                         !skip_sort,
+                        use_unitigs,
+                        use_matchtigs,
+                        use_eulertigs,
                     );
                     match result {
                         Ok(_) => partition_outputs.lock().push(part_output.clone()),

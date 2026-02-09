@@ -12,7 +12,7 @@ use zstd::Encoder;
 use crate::utils::{Converter, Convert};
 use crate::parser;
 
-pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, verify_kmers: bool, skip_sort: bool) -> Result<()>{
+pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, verify_kmers: bool, skip_sort: bool, use_unitigs: bool, use_matchtigs: bool, use_eulertigs: bool) -> Result<()>{
     let _overall_start = Utc::now();
 
     // Start parser in streaming mode: Steps 1+2 run synchronously,
@@ -21,6 +21,7 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
         PathBuf::from(input_fof),
         PathBuf::from(output_dir),
         k, m, partition_power, threads, verify_kmers, skip_sort,
+        use_unitigs, use_matchtigs, use_eulertigs,
     ).expect("run_parser_streaming failed");
 
     println!("Simplitigs created, processing sequences (streaming)");

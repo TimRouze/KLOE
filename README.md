@@ -9,35 +9,27 @@ cd KLOE
 ```
 
 ## Usage example
+This projects uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers?tab=readme-ov-file) which requires AVX2 or NEON instruction sets, which, on x64, requires either target-cpu=native or target-cpu=x86-64-v3. See [this README](https://github.com/ragnargrootkoerkamp/ensure_simd) for details.
+
 ```sh
-I="PATH/TO/FOF" K=31 cargo build -r
-./target/release/kloe compress -t 12
+RUSTFLAGS="-C target-cpu=native" cargo build -r
+./target/release/kloe compress -i path/to/file/of/file -o output/path -t 12
 ```
 This will create a compressed KLOE archive with the k-mer content of every files in the input file of file.
-The archive is composed of 3 files:
-- multicolor.kloe
-- omnicolor.kloe
-- multicolor_bucket_files.txt.zst
+The archive is composed of 5 files:
+- tigs_kloe.fa
+- id_to_color_id.txt.zst
+- positions_kloe.bin
+- bucket_sizes.txt
+- filenames_id.txt
 
-For decompression, Kloe currently needs to have a specific fof in the same directory as the other 3. To create this file, simply use this command:
-```sh
-awk '{print $0":"NR-1}' PATH/TO/FOF > filename_to_color.txt
-```
-Then simply run:
+For decompression, run:
 ```sh
 # WHOLE ARCHIVE DECOMPRESSION
-./target/release/kloe decompress --omnicolor-file omnicolor.kloe --multicolor-file multicolor.kloe
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory
 # TARGETED DECOMPRESSION
-./target/release/kloe decompress --omnicolor-file omnicolor.kloe --multicolor-file multicolor.kloe --wanted-files TARGET/FILES/LIST
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST
 ```
-### Compile time parameters
-There are two parameters that should be given during build.
-
-#### Input File of File I=
-The input file of fasta files.
-
-#### K-mer size -k
-length of the k-mers used.
 
 ### Compression parameters
 When running kloe in compression mode, add "compress" before any other parameter.
@@ -50,18 +42,33 @@ The default value is 1 thread.
 The output directory where the compressed archive should be written.
 Default is current directory
 
+#### k_size -k
+K size. Default is 31.
+
+#### minimizer_size -m
+Minimizer size. Default is 7.
+
+#### unitigs
+If this flag is set, the archive will contain monochromatic unitigs.
+
+#### matchtigs
+If this flag is set, the archive will contain monochromatic matchtigs.
+
+#### eulertigs
+If this flag is set, the archive will contain monochromatic eulertigs.
+
+By default, if none of the above flags are set, the archive will contain monochromatic simplitigs.
+There can only be one flag set at once or 0. If several flags are set the tool will not run and raise an error.
+
+
 ## Archive decompression
 When running kloe in compression mode, add "decompress" before any other parameter.
 
-#### Omnicolored file --omnicolor-file
-The file containing omnicolored monochromatigs
-
-#### Multicolored file --multicolor-file
-The file containing multicolored monochromatigs
-
-#### Input directory -i
-The directory where kloe should fetch the interfacing file.
+#### compressed-dir -c
+Input directory for decompression, the directory where the compressed kloe archive is saved.
 
 #### Wanted files -Q
 For targeted decompression, a list of files the user wants to decompress from the archive.
 
+#### out-dir -o
+Directory in which the decompressed files should be written to.

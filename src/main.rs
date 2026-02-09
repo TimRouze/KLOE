@@ -50,6 +50,15 @@ struct Args {
     /// Skip sorting within partitions and during final merge (output will not be globally sorted)
     #[arg(long = "skip-sort", default_value_t = false)]
     skip_sort: bool,
+    /// Produce monochromatic unitigs instead of simplitigs
+    #[arg(long = "unitig", default_value_t = false)]
+    unitig: bool,
+    /// Produce monochromatic matchtigs instead of simplitigs
+    #[arg(long = "matchtig", default_value_t = false)]
+    matchtig: bool,
+    /// Produce monochromatic eulertigs instead of simplitigs
+    #[arg(long = "eulertig", default_value_t = false)]
+    eulertig: bool,
 
 }
 fn main() {
@@ -66,6 +75,14 @@ fn main() {
     let m = args.minimizer_size;
     //TODO HANDLE ERRORS FOR COMP AND DECOMP
     let wanted_path = args.wanted_files;
+    let use_unitigs = args.unitig;
+    let use_matchtigs = args.matchtig;
+    let use_eulertigs = args.eulertig;
+    let tig_flags_set = [use_unitigs, use_matchtigs, use_eulertigs].iter().filter(|&&f| f).count();
+    if tig_flags_set > 1 {
+        eprintln!("Error: only one of --unitig, --matchtig, --eulertig can be set at a time.");
+        std::process::exit(1);
+    }
     if let Some(do_decompress) = args.decompress{
         if do_decompress == "decompress"{
             println!("Checking archive integrity...");
@@ -84,7 +101,7 @@ fn main() {
                 compaction_threads
             );*/
             //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
-            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort);
+            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort, use_unitigs, use_matchtigs, use_eulertigs);
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
     }else {
