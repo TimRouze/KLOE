@@ -1,15 +1,12 @@
-#![allow(dead_code)]
-
 mod utils;
 mod decompress;
 mod parser;
 mod compress;
 use clap::Parser;
-use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,8 +41,6 @@ struct Args {
     ///Minimizer size (< k), default = 7
     #[arg(short, long, default_value_t = 7)]
     minimizer_size: usize,
-    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
-    compaction_threads: usize,
     /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
     #[arg(long = "verify-kmers", default_value_t = false)]
     verify_kmers: bool,
@@ -57,10 +52,6 @@ struct Args {
     skip_sort: bool,
 
 }
-const BLOCK_SIZE: usize = 1 << (12 - 3);
-const SHARD_AMOUNT: usize = 1024;
-const M: u8 = 7;
-
 fn main() {
     let args = Args::parse();
     
@@ -69,8 +60,8 @@ fn main() {
     //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
-    let temp_dir = args.temp_dir;
-    let memory = args.memory;
+    let _temp_dir = args.temp_dir;
+    let _memory = args.memory;
     let k = args.k_size;
     let m = args.minimizer_size;
     //TODO HANDLE ERRORS FOR COMP AND DECOMP
@@ -79,7 +70,7 @@ fn main() {
         if do_decompress == "decompress"{
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
-            let _ = decompress::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.txt.zst"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
+            let _ = decompress::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.bin"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
             //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
         }else if do_decompress == "compress"{
             /*let _ = compress::compress(
@@ -93,11 +84,10 @@ fn main() {
                 compaction_threads
             );*/
             //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
-            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.compaction_threads);
+            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort);
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
     }else {
-        let compaction_threads = args.compaction_threads;
         //parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
 
         let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
@@ -127,7 +117,7 @@ fn main() {
 fn is_compressed_dir_complete(input_dir: String){
     if !Path::new(&format!("{input_dir}/filenames_id.txt")).exists(){
         panic!("file not found: {input_dir}/filenames_id.txt");
-    }else if !Path::new(&format!("{input_dir}/positions_kloe.txt.zst")).exists(){
+    }else if !Path::new(&format!("{input_dir}/positions_kloe.bin")).exists(){
         panic!("Positions file not found");
     }else if !Path::new(&format!("{input_dir}/bucket_sizes.txt")).exists(){
         panic!("Tigs sizes file not found");

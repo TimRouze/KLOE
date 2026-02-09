@@ -1,10 +1,3 @@
-use std::path::Path;
-use std::{io, u64};
-use std::io::BufRead;
-use std::fs::File;
-
-use minimizer_iter::MinimizerBuilder;
-
 pub trait Convert<T> {
     fn str2num(input: T) -> Vec<u8>;
 }
@@ -94,18 +87,3 @@ pub fn nuc2int(b: &u8) -> Option<u8> {
     }
 }
 
-pub fn rev_comp_str(seq: &str) -> String{
-    let mut res = String::new();
-    for nuc in seq.chars(){
-        if nuc == 'A' {
-            res = format!("T{}", res);
-        }else if nuc == 'C' {
-            res = format!("G{}", res);
-        }else if nuc == 'T' {
-            res = format!("A{}", res);
-        }else{
-            res = format!("C{}", res);
-        }
-    }
-    res
-}
