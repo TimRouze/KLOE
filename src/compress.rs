@@ -13,7 +13,7 @@ use num_traits::ToPrimitive;
 use zstd::stream::read::Decoder;
 use zstd::Encoder;
 
-use crate::utils::{Converter, Convert, vec2str};
+use crate::utils::{nuc2int, vec2str};
 use crate::parser;
 
 pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, unitigs: bool, matchtig: bool, eulertigs: bool, ) -> Result<()>{
@@ -131,12 +131,48 @@ FOR EACH COLOR BUCKET
 /// RETURNS
 /// - Vec<(u32,u32)> containing pairs (tigs bucket pos in tigs file, tigs sizes positions in the sizes file) for each bucket.
 fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u32, sequence_type: String) -> Result<(Vec<(u32, u32)>, Vec<Vec<usize>>)>{
-    let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
-    let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
+    fn parse_ids_zero_based_in_place(header: &str, out: &mut Vec<usize>) {
+        let ids_str = header.strip_prefix("ids:").unwrap();
+        out.clear();
+        for token in ids_str.split(',').filter(|s| !s.is_empty()) {
+            out.push(token.parse::<usize>().unwrap() - 1);
+        }
+    }
+
+    fn encode_seq_2bit_compat(seq: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        out.clear();
+        out.reserve((seq.len() + 3) / 4);
+
+        let mut tmp_res: u8 = 0;
+        let mut i: usize = 0;
+        let mut shift: u8 = 0;
+
+        for nuc in seq {
+            let code = nuc2int(nuc).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid nucleotide in sequence")
+            })?;
+            tmp_res += code << shift;
+            shift += 2;
+            i += 1;
+            if i % 4 == 0 {
+                out.push(tmp_res);
+                tmp_res = 0;
+                shift = 0;
+            }
+        }
+        if shift != 0 {
+            out.push(tmp_res);
+        }
+        Ok(())
+    }
+
+    let mut omni_file = BufWriter::with_capacity(8 * 1024 * 1024, File::create(unitigs_file_path)?);
+    let mut size_file =
+        BufWriter::with_capacity(1 * 1024 * 1024, File::create(output_dir.clone() + "bucket_sizes.txt")?);
 
     let unitigs_file = File::open(output_dir.clone() + &sequence_type + ".fa.zst")?;
     let decoder = zstd::Decoder::new(unitigs_file)?;
-    let reader: Box<dyn BufRead> = Box::new(BufReader::new(decoder));
+    let reader = BufReader::with_capacity(1 * 1024 * 1024, decoder);
     let fa_reader = fasta::Reader::from_bufread(reader);
 
     let mut id_to_color_vec: Vec<Vec<usize>> = vec![Vec::new(); nb_files as usize];
@@ -146,92 +182,61 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     let mut prev_bucket_pos: u32 = 0;
     let mut cid = 0_usize;
 
-    let mut current_ids: Option<Vec<usize>> = None;
+    let mut has_current_bucket = false;
+    let mut current_header = String::new();
+    let mut current_ids: Vec<usize> = Vec::new();
     let mut prev_size: usize = 0;
 
-    let mut sizes: Vec<usize> = Vec::new();
-    let mut buffer_encoded_seq: Vec<Vec<u8>> = Vec::new();
+    let mut size_encoder = Encoder::new(Vec::with_capacity(64 * 1024), 4)?;
+    let mut encoded_seq_buf: Vec<u8> = Vec::with_capacity(4096);
 
     for record_result in fa_reader.records() {
         let record = record_result?;
         let header = record.id();
-        let ids_str = header.strip_prefix("ids:").unwrap();
-        let ids: Vec<usize> = ids_str
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<usize>().unwrap() - 1)
-            .collect();
-
-        
-
-        if let Some(ref current) = current_ids {
-            if &ids != current {
-                let mut encoded_sizes = Vec::new();
-                {
-                    let mut size_encoder = Encoder::new(&mut encoded_sizes, 4)?;
-                    for elem in &sizes{
-                        size_encoder.write_all(&elem.to_le_bytes())?;
-                    }
-                    size_encoder.finish()?;
-                }
+        if !has_current_bucket || current_header != header {
+            if has_current_bucket {
+                let mut encoded_sizes = size_encoder.finish()?;
 
                 prev_bucket_pos += (8 + encoded_sizes.len()) as u32;
                 pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
                 size_file.write_all(&(encoded_sizes.len() as u64).to_le_bytes())?;
                 size_file.write_all(&encoded_sizes)?;
 
-                for id in current {
-                    id_to_color_vec[*id].push(cid);
+                for &id in &current_ids {
+                    id_to_color_vec[id].push(cid);
                 }
                 cid += 1;
                 prev_size = 0;
-                current_ids = Some(ids);
-                sizes.clear();
+
+                encoded_sizes.clear();
+                size_encoder = Encoder::new(encoded_sizes, 4)?;
             }
-        } else {
-            current_ids = Some(ids);
+
+            parse_ids_zero_based_in_place(header, &mut current_ids);
+            current_header.clear();
+            current_header.push_str(header);
+            has_current_bucket = true;
         }
 
         let seq = record.seq();
-        let encoded = <Converter as Convert<&[u8]>>::str2num(seq);
-        buffer_encoded_seq.push(encoded.clone());
-        prev_tigs_size += encoded.len() as u32;
+        encode_seq_2bit_compat(seq, &mut encoded_seq_buf)?;
+        prev_tigs_size += encoded_seq_buf.len() as u32;
+        omni_file.write_all(&encoded_seq_buf)?;
         let size = seq.len();
-
-        if buffer_encoded_seq.len() >= 1000{
-            for elem in &buffer_encoded_seq{
-                omni_file.write_all(&elem)?;
-            }
-            buffer_encoded_seq.clear();
-        }
-
         let delta = size - prev_size;
-        sizes.push(delta);
+        size_encoder.write_all(&delta.to_le_bytes())?;
         prev_size = size;
     }
 
-    if let Some(current) = current_ids {
-        for elem in &buffer_encoded_seq{
-            omni_file.write_all(&elem)?;
-        }
-        buffer_encoded_seq.clear();
-
-
-        let mut encoded_sizes = Vec::new();
-        {
-            let mut size_encoder = Encoder::new(&mut encoded_sizes, 4)?;
-            for elem in &sizes{
-                size_encoder.write_all(&elem.to_le_bytes())?;
-            }
-            size_encoder.finish()?;
-        }
+    if has_current_bucket {
+        let encoded_sizes = size_encoder.finish()?;
 
         prev_bucket_pos += (8 + encoded_sizes.len()) as u32;
         pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
         size_file.write_all(&(encoded_sizes.len() as u64).to_le_bytes())?;
         size_file.write_all(&encoded_sizes)?;
 
-        for id in current {
+        for &id in &current_ids {
             id_to_color_vec[id].push(cid);
         }
     }
