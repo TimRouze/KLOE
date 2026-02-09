@@ -9,8 +9,10 @@ cd KLOE
 ```
 
 ## Usage example
+This projects uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers?tab=readme-ov-file) which requires AVX2 or NEON instruction sets, which, on x64, requires either target-cpu=native or target-cpu=x86-64-v3. See [this README](https://github.com/ragnargrootkoerkamp/ensure_simd) for details.
+
 ```sh
-I="PATH/TO/FOF" K=31 cargo build -r
+RUSTFLAGS="-C target-cpu=native" cargo build -r
 ./target/release/kloe compress -t 12
 ```
 This will create a compressed KLOE archive with the k-mer content of every files in the input file of file.
