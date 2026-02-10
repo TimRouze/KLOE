@@ -11,6 +11,8 @@ cd KLOE
 ## Usage example
 This projects uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers?tab=readme-ov-file) which requires AVX2 or NEON instruction sets, which, on x64, requires either target-cpu=native or target-cpu=x86-64-v3. See [this README](https://github.com/ragnargrootkoerkamp/ensure_simd) for details.
 
+This projects uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers?tab=readme-ov-file) which requires AVX2 or NEON instruction sets, which, on x64, requires either target-cpu=native or target-cpu=x86-64-v3. See [this README](https://github.com/ragnargrootkoerkamp/ensure_simd) for details.
+
 ```sh
 RUSTFLAGS="-C target-cpu=native" cargo build -r
 ./target/release/kloe compress -i path/to/file/of/file -o output/path -d temporary/folder -t 12
@@ -27,7 +29,9 @@ For decompression, run:
 ```sh
 # WHOLE ARCHIVE DECOMPRESSION
 ./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory
 # TARGETED DECOMPRESSION
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST
 ./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST
 ```
 
@@ -70,9 +74,13 @@ When running kloe in compression mode, add "decompress" before any other paramet
 
 #### compressed-dir -c
 Input directory for decompression, the directory where the compressed kloe archive is saved.
+#### compressed-dir -c
+Input directory for decompression, the directory where the compressed kloe archive is saved.
 
 #### Wanted files -Q
 For targeted decompression, a list of files the user wants to decompress from the archive.
 
+#### out-dir -o
+Directory in which the decompressed files should be written to.
 #### out-dir -o
 Directory in which the decompressed files should be written to.
