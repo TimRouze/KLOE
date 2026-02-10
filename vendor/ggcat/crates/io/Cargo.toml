@@ -1,0 +1,40 @@
+[package]
+name = "ggcat_io"
+version = "0.1.0"
+authors = ["Andrea Cracco <guilucand@gmail.com>"]
+edition = "2021"
+categories = []
+description = "GGCAT io crate"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/algbio/ggcat"
+
+[dependencies]
+
+# Config
+config = { package = "ggcat_config", path = "../config" }
+utils = { package = "ggcat_utils", path = "../utils" }
+
+
+# Common libraries
+parallel-processor = "0.1.17"
+streaming-libdeflate-rs = "0.1.5"
+nightly-quirks = "0.1.4"
+
+# Pipeline libraries
+hashes = { package = "ggcat_hashes", path = "../hashes" }
+
+parking_lot = "0.12.3"
+byteorder = "1.5.0"
+lz4 = "1.25.0"
+bincode = "1.3.3"
+serde = "1.0.203"
+flate2 = "1.0.30"
+typenum = "1.17.0"
+bstr = "1.9.1"
+
+[dev-dependencies]
+rand = "0.8.5"
+
+
+[features]
+support_kmer_counters = []

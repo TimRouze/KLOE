@@ -39,12 +39,25 @@ ahash = "0.8"
 xz2 = "0.1"
 tempfile = "3.23.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-genome-graph = "11.0.0"
-libmatchtigs = { package = "matchtigs", version = "2.1.9" }
-traitgraph-algo = { version = "8.1.2", features = ["hashbrown_dijkstra_node_weight_array"] }
+genome-graph = "=9.0.0"
+libmatchtigs = { package = "matchtigs", version = "=2.1.8" }
+traitgraph-algo = { version = "=8.1.0", features = ["hashbrown_dijkstra_node_weight_array"] }
+bigraph = "=5.0.0"
+traitgraph = "=5.0.0"
+traitsequence = "=2.0.0"
+ggcat-api = { path = "vendor/ggcat/crates/api" }
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
+
+[patch.crates-io]
+parallel-processor = { path = "vendor/parallel-processor-rs" }
+
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3
 
 [profile.release]
 debug = true

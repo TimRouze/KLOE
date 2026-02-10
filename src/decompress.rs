@@ -1,21 +1,233 @@
 use core::panic;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
 use zstd::Decoder;
 
 use crate::utils::vec2str;
 
-
 //   =========================================================================================== DECOMPRESSION ==============================================================================
 
 /// High-level decompression entry point.
-pub fn decompress(size_filename: &String, color_id_filename: &String, tigs_filename: &String, positions_filename: &String, filename_id: &String, out_dir: &String, wanted_files_path: &String, input_dir: String) -> std::io::Result<()>{
-    println!("Writing decompressed data in {out_dir}");
+pub fn decompress(
+    size_filename: &String,
+    color_id_filename: &String,
+    tigs_filename: &String,
+    positions_filename: &String,
+    filename_id: &String,
+    out_dir: &String,
+    wanted_files_path: &String,
+    input_dir: String,
+) -> std::io::Result<()> {
+    decompress_with_options(
+        size_filename,
+        color_id_filename,
+        tigs_filename,
+        positions_filename,
+        filename_id,
+        out_dir,
+        wanted_files_path,
+        input_dir,
+        GgcatRebuildConfig::default(),
+    )
+}
 
-    if wanted_files_path != ""{
+#[derive(Clone, Debug)]
+pub struct GgcatRebuildConfig {
+    pub enabled: bool,
+    pub threads: usize,
+    pub memory_gb: usize,
+    pub k: usize,
+    pub temp_dir: String,
+    pub use_unitigs: bool,
+    pub use_matchtigs: bool,
+    pub use_eulertigs: bool,
+}
+
+impl Default for GgcatRebuildConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threads: 1,
+            memory_gb: 8,
+            k: 31,
+            temp_dir: String::new(),
+            use_unitigs: false,
+            use_matchtigs: false,
+            use_eulertigs: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebuildMode {
+    Simplitig,
+    Unitig,
+    Matchtig,
+    Eulertig,
+}
+
+fn resolve_rebuild_mode(
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+) -> RebuildMode {
+    if use_unitigs {
+        RebuildMode::Unitig
+    } else if use_matchtigs {
+        RebuildMode::Matchtig
+    } else if use_eulertigs {
+        RebuildMode::Eulertig
+    } else {
+        RebuildMode::Simplitig
+    }
+}
+
+fn ggcat_extra_elaboration(mode: RebuildMode) -> ExtraElaboration {
+    match mode {
+        RebuildMode::Unitig => ExtraElaboration::None,
+        RebuildMode::Matchtig => ExtraElaboration::GreedyMatchtigs,
+        RebuildMode::Eulertig => ExtraElaboration::Eulertigs,
+        // GGCAT has no explicit "simplitig" mode; Pathtigs is the closest compacted mode.
+        RebuildMode::Simplitig => ExtraElaboration::Pathtigs,
+    }
+}
+
+fn rebuild_mode_name(mode: RebuildMode) -> &'static str {
+    match mode {
+        RebuildMode::Simplitig => "simplitigs",
+        RebuildMode::Unitig => "unitigs",
+        RebuildMode::Matchtig => "matchtigs",
+        RebuildMode::Eulertig => "eulertigs",
+    }
+}
+
+fn normalize_out_dir(out_dir: &str) -> PathBuf {
+    if out_dir.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(out_dir)
+    }
+}
+
+fn ensure_output_dir(out_dir: &str) -> io::Result<PathBuf> {
+    let path = normalize_out_dir(out_dir);
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn dump_output_path(out_dir: &str, source_path: &str) -> PathBuf {
+    let out_dir_path = normalize_out_dir(out_dir);
+    let trunc_filename = Path::new(source_path).file_stem().unwrap_or_default();
+    out_dir_path.join(format!(
+        "Dump_{}.fa",
+        trunc_filename.to_str().unwrap_or("unknown")
+    ))
+}
+
+fn collect_dump_fastas(out_dir: &str) -> std::io::Result<Vec<PathBuf>> {
+    let out_dir_path = normalize_out_dir(out_dir);
+    let mut dump_files = Vec::new();
+    for entry_result in fs::read_dir(&out_dir_path)? {
+        let entry = entry_result?;
+        let path = entry.path();
+        let is_dump = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("Dump_") && name.ends_with(".fa"))
+            .unwrap_or(false);
+        if is_dump {
+            dump_files.push(path);
+        }
+    }
+    dump_files.sort();
+    Ok(dump_files)
+}
+
+fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result<()> {
+    let mode = resolve_rebuild_mode(cfg.use_unitigs, cfg.use_matchtigs, cfg.use_eulertigs);
+    let dump_fastas = collect_dump_fastas(out_dir)?;
+    if dump_fastas.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no Dump_*.fa files found to rebuild with ggcat",
+        ));
+    }
+
+    let out_dir_path = ensure_output_dir(out_dir)?;
+
+    let rebuilt_output = out_dir_path.join(format!("rebuilt_{}.fa", rebuild_mode_name(mode)));
+    let temp_dir = if cfg.temp_dir.is_empty() {
+        out_dir_path.join("ggcat_rebuild_tmp")
+    } else {
+        PathBuf::from(&cfg.temp_dir)
+    };
+    fs::create_dir_all(&temp_dir)?;
+
+    let instance = GGCATInstance::create(GGCATConfig {
+        temp_dir: Some(temp_dir.clone()),
+        memory: cfg.memory_gb.max(1) as f64,
+        prefer_memory: true,
+        total_threads_count: cfg.threads.max(1),
+        intermediate_compression_level: None,
+        stats_file: None,
+    });
+
+    let streams = dump_fastas
+        .iter()
+        .map(|dump| {
+            let resolved = fs::canonicalize(dump).unwrap_or_else(|_| dump.clone());
+            GeneralSequenceBlockData::FASTA((resolved, None))
+        })
+        .collect::<Vec<_>>();
+
+    println!(
+        "Running embedded ggcat rebuild: output={}, mode={}, k={}, threads={}, memory={}GB",
+        rebuilt_output.display(),
+        rebuild_mode_name(mode),
+        cfg.k,
+        cfg.threads.max(1),
+        cfg.memory_gb.max(1)
+    );
+    let graph_path = instance.build_graph(
+        streams,
+        rebuilt_output,
+        None,
+        cfg.k,
+        cfg.threads.max(1),
+        false,
+        None,
+        false,
+        1,
+        ggcat_extra_elaboration(mode),
+    );
+
+    println!(
+        "ggcat rebuild complete: {} (mode={})",
+        graph_path.display(),
+        rebuild_mode_name(mode)
+    );
+    Ok(())
+}
+
+pub fn decompress_with_options(
+    size_filename: &String,
+    color_id_filename: &String,
+    tigs_filename: &String,
+    positions_filename: &String,
+    filename_id: &String,
+    out_dir: &String,
+    wanted_files_path: &String,
+    input_dir: String,
+    ggcat_cfg: GgcatRebuildConfig,
+) -> std::io::Result<()> {
+    println!("Writing decompressed data in {out_dir}");
+    ensure_output_dir(out_dir)?;
+
+    if wanted_files_path != "" {
         let input_file = File::open(input_dir.clone() + filename_id).unwrap();
         let input_reader = BufReader::new(input_file);
         let mut filenames_id_map = HashMap::new();
@@ -59,9 +271,9 @@ pub fn decompress(size_filename: &String, color_id_filename: &String, tigs_filen
         let input_reader = BufReader::new(input_file);
         let mut filenames_id = Vec::new();
         let mut file_id: u32 = 0;
-        for line_result in input_reader.lines(){
+        for line_result in input_reader.lines() {
             let line = line_result?;
-            if let Some((path, _)) = line.split_once(":"){
+            if let Some((path, _)) = line.split_once(":") {
                 filenames_id.push((path.to_owned(), file_id));
             }
             file_id += 1;
@@ -75,6 +287,9 @@ pub fn decompress(size_filename: &String, color_id_filename: &String, tigs_filen
             filenames_id,
             cid_to_id_map,
         );
+    }
+    if ggcat_cfg.enabled {
+        run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
     }
     Ok(())
 }
@@ -96,7 +311,10 @@ fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
         let sizes_pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         positions.push((tigs_pos, sizes_pos));
     }
-    println!("Preloaded {} position entries from {}", num_entries, positions_filename);
+    println!(
+        "Preloaded {} position entries from {}",
+        num_entries, positions_filename
+    );
     Ok(positions)
 }
 
@@ -119,7 +337,7 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
     loop {
         let mut len_buf = [0u8; 8];
         match file.read_exact(&mut len_buf) {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         }
@@ -146,7 +364,11 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
         sizes_map.insert(offset, sizes);
         offset += 8 + compressed_size as u64;
     }
-    println!("Preloaded {} size buckets from {}", sizes_map.len(), size_filename);
+    println!(
+        "Preloaded {} size buckets from {}",
+        sizes_map.len(),
+        size_filename
+    );
     Ok(sizes_map)
 }
 
@@ -154,10 +376,16 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
 ///
 /// Uses preloaded positions and sizes to avoid per-CID file reopens.
 /// Keeps output file handles open in a HashMap to avoid per-unitig open/close.
-fn decompress_all(size_filename: &String, positions_filename: &String, tigs_filename: &String, out_dir: &String, filenames: Vec<(String, u32)>, cid_to_id_map: HashMap<usize, Vec<u32>>) {
-    let mut tigs_file = BufReader::new(
-        File::open(&tigs_filename).expect("Error opening tigs file")
-    );
+fn decompress_all(
+    size_filename: &String,
+    positions_filename: &String,
+    tigs_filename: &String,
+    out_dir: &String,
+    filenames: Vec<(String, u32)>,
+    cid_to_id_map: HashMap<usize, Vec<u32>>,
+) {
+    let mut tigs_file =
+        BufReader::new(File::open(&tigs_filename).expect("Error opening tigs file"));
 
     let total_cids = cid_to_id_map.len();
     println!("nb cid: {}", total_cids);
@@ -178,13 +406,21 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
 
         // Progress logging
         if idx % 1000 == 0 || idx == total_cids - 1 {
-            println!("Processing CID {}/{} ({} unitigs written so far)", idx + 1, total_cids, total_unitigs);
+            println!(
+                "Processing CID {}/{} ({} unitigs written so far)",
+                idx + 1,
+                total_cids,
+                total_unitigs
+            );
         }
 
         // Look up position from preloaded data
         let pos_index = byte_offset_to_position_index(*cid);
         if pos_index >= all_positions.len() {
-            eprintln!("Error: position index {} out of range for CID {}", pos_index, cid);
+            eprintln!(
+                "Error: position index {} out of range for CID {}",
+                pos_index, cid
+            );
             continue;
         }
         let (tigs_pos, sizes_pos) = all_positions[pos_index];
@@ -193,7 +429,10 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
         let sizes = match all_sizes.get(&sizes_pos) {
             Some(s) => s,
             None => {
-                eprintln!("Error: no sizes found at offset {} for CID {}", sizes_pos, cid);
+                eprintln!(
+                    "Error: no sizes found at offset {} for CID {}",
+                    sizes_pos, cid
+                );
                 continue;
             }
         };
@@ -202,7 +441,9 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
             continue;
         }
 
-        tigs_file.seek(std::io::SeekFrom::Start(tigs_pos)).expect("Failed to seek in tigs file");
+        tigs_file
+            .seek(std::io::SeekFrom::Start(tigs_pos))
+            .expect("Failed to seek in tigs file");
 
         for size in sizes {
             if *size < 31 {
@@ -212,15 +453,22 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
 
             let read_size = size.div_ceil(4);
             let mut tig_buffer = vec![0; read_size];
-            tigs_file.read_exact(&mut tig_buffer).expect("Failed to read tig");
+            tigs_file
+                .read_exact(&mut tig_buffer)
+                .expect("Failed to read tig");
 
             let tig = vec2str(&tig_buffer, size);
             for file_id in file_ids {
                 let writer = writers.entry(*file_id).or_insert_with(|| {
                     let curr_filename = &filenames[*file_id as usize];
-                    let trunc_filename = Path::new(&curr_filename.0).file_stem().unwrap();
-                    let output_path = format!("{}Dump_{}.fa", out_dir, trunc_filename.to_str().unwrap());
-                    BufWriter::new(File::options().append(true).create(true).open(output_path).expect("Unable to create file"))
+                    let output_path = dump_output_path(out_dir, &curr_filename.0);
+                    BufWriter::new(
+                        File::options()
+                            .append(true)
+                            .create(true)
+                            .open(output_path)
+                            .expect("Unable to create file"),
+                    )
                 });
                 writeln!(writer, ">").unwrap();
                 writeln!(writer, "{}", tig).unwrap();
@@ -233,12 +481,18 @@ fn decompress_all(size_filename: &String, positions_filename: &String, tigs_file
     for (_, mut writer) in writers {
         writer.flush().unwrap();
     }
-    println!("Decompression complete: {} unitigs written across {} CIDs", total_unitigs, total_cids);
+    println!(
+        "Decompression complete: {} unitigs written across {} CIDs",
+        total_unitigs, total_cids
+    );
 }
 
 /// Read full id->color_id file and build color id -> list of file ids.
-fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>{
-    let mut color_id_file = BufReader::new(File::open(color_id_filename).expect("Error opening color id file, are you sure you gave the right path?"));
+fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>> {
+    let mut color_id_file = BufReader::new(
+        File::open(color_id_filename)
+            .expect("Error opening color id file, are you sure you gave the right path?"),
+    );
     let mut cid_ids_map = HashMap::new();
     let mut counter: u32 = 0;
     println!("Reading CID to ID file: {}", color_id_filename);
@@ -255,7 +509,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
         }
         let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
         let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
-        for cid in temp_cids{
+        for cid in temp_cids {
             if cid != "" {
                 cid_ids_map
                     .entry(cid.parse::<usize>().unwrap())
@@ -272,8 +526,15 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
 }
 
 /// Build cid -> file id mapping for a targeted subset of files.
-fn get_cid_to_id_targeted(color_id_filename: &String, filenames_id_map: &HashMap<String, (u32, u64)>, wanted_files_path: &String) -> std::io::Result<(HashMap<usize, Vec<u32>>, Vec<(String, u32)>)>{
-    let mut color_id_file = BufReader::new(File::open(color_id_filename).expect("Error opening color id file, are you sure you gave the right path?"));
+fn get_cid_to_id_targeted(
+    color_id_filename: &String,
+    filenames_id_map: &HashMap<String, (u32, u64)>,
+    wanted_files_path: &String,
+) -> std::io::Result<(HashMap<usize, Vec<u32>>, Vec<(String, u32)>)> {
+    let mut color_id_file = BufReader::new(
+        File::open(color_id_filename)
+            .expect("Error opening color id file, are you sure you gave the right path?"),
+    );
     let mut cid_ids_map = HashMap::new();
     let mut wanted_filenames = Vec::new();
 
@@ -281,7 +542,7 @@ fn get_cid_to_id_targeted(color_id_filename: &String, filenames_id_map: &HashMap
     let wanted_reader = BufReader::new(wanted_file);
     for line_result in wanted_reader.lines() {
         let line = line_result?;
-        if filenames_id_map.contains_key(&line){
+        if filenames_id_map.contains_key(&line) {
             let entry = filenames_id_map.get(&line).unwrap();
             color_id_file.seek(std::io::SeekFrom::Start(entry.1))?;
             let mut buffer_size = [0; 8];
@@ -318,8 +579,14 @@ fn get_cid_to_id_targeted(color_id_filename: &String, filenames_id_map: &HashMap
 /// Decompress only the wanted files from the archive.
 ///
 /// Uses preloaded positions and sizes. Keeps output file handles open.
-fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &String, cid_to_id_map: HashMap<usize, Vec<u32>>, tigs_filename: &String, size_filename: &String, out_dir: &String) {
-
+fn decompress_wanted(
+    wanted_files: &Vec<(String, u32)>,
+    positions_filename: &String,
+    cid_to_id_map: HashMap<usize, Vec<u32>>,
+    tigs_filename: &String,
+    size_filename: &String,
+    out_dir: &String,
+) {
     let total_cids = cid_to_id_map.len();
     println!("NB COLOR TO DECOMPRESS: {}", total_cids);
     println!("Wanted files:");
@@ -327,9 +594,8 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
         println!("{} : {}", elem.0, elem.1);
     }
 
-    let mut tigs_file = BufReader::new(
-        File::open(&tigs_filename).expect("Error opening tigs file")
-    );
+    let mut tigs_file =
+        BufReader::new(File::open(&tigs_filename).expect("Error opening tigs file"));
 
     // Preload all positions and sizes into memory
     let all_positions = preload_positions(positions_filename).expect("Failed to preload positions");
@@ -342,10 +608,13 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
     let mut writers: HashMap<u32, BufWriter<File>> = HashMap::new();
     // Pre-open all wanted output files
     for wanted_file in wanted_files {
-        let trunc_filename = Path::new(&wanted_file.0).file_stem().unwrap();
-        let output_path = format!("{}Dump_{}.fa", out_dir, trunc_filename.to_str().unwrap());
+        let output_path = dump_output_path(out_dir, &wanted_file.0);
         let writer = BufWriter::new(
-            File::options().append(true).create(true).open(output_path).expect("Unable to create file")
+            File::options()
+                .append(true)
+                .create(true)
+                .open(output_path)
+                .expect("Unable to create file"),
         );
         writers.insert(wanted_file.1, writer);
     }
@@ -359,13 +628,21 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
 
         // Progress logging
         if idx % 1000 == 0 || idx == total_cids - 1 {
-            println!("Processing CID {}/{} ({} unitigs written so far)", idx + 1, total_cids, total_unitigs);
+            println!(
+                "Processing CID {}/{} ({} unitigs written so far)",
+                idx + 1,
+                total_cids,
+                total_unitigs
+            );
         }
 
         // Look up position from preloaded data
         let pos_index = byte_offset_to_position_index(*cid);
         if pos_index >= all_positions.len() {
-            eprintln!("Error: position index {} out of range for CID {}", pos_index, cid);
+            eprintln!(
+                "Error: position index {} out of range for CID {}",
+                pos_index, cid
+            );
             continue;
         }
         let (tigs_pos, sizes_pos) = all_positions[pos_index];
@@ -374,7 +651,10 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
         let sizes = match all_sizes.get(&sizes_pos) {
             Some(s) => s,
             None => {
-                eprintln!("Error: no sizes found at offset {} for CID {}", sizes_pos, cid);
+                eprintln!(
+                    "Error: no sizes found at offset {} for CID {}",
+                    sizes_pos, cid
+                );
                 continue;
             }
         };
@@ -382,7 +662,9 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
         if sizes.is_empty() {
             continue;
         }
-        tigs_file.seek(std::io::SeekFrom::Start(tigs_pos)).expect("Failed to seek in tigs file");
+        tigs_file
+            .seek(std::io::SeekFrom::Start(tigs_pos))
+            .expect("Failed to seek in tigs file");
 
         for size in sizes {
             if *size < 31 {
@@ -392,7 +674,9 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
 
             let read_size = size.div_ceil(4);
             let mut tig_buffer = vec![0; read_size];
-            tigs_file.read_exact(&mut tig_buffer).expect("Failed to read tig");
+            tigs_file
+                .read_exact(&mut tig_buffer)
+                .expect("Failed to read tig");
 
             let tig = vec2str(&tig_buffer, size);
 
@@ -412,5 +696,8 @@ fn decompress_wanted(wanted_files: &Vec<(String, u32)>, positions_filename: &Str
     for (_, mut writer) in writers {
         writer.flush().unwrap();
     }
-    println!("Decompression complete: {} unitigs written across {} CIDs", total_unitigs, total_cids);
+    println!(
+        "Decompression complete: {} unitigs written across {} CIDs",
+        total_unitigs, total_cids
+    );
 }

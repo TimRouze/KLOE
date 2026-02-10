@@ -1,6 +1,5 @@
-fn build_constants() -> miette::Result<()>  {
-    let out_dir: std::path::PathBuf = String::from("src/")
-    .into();
+fn build_constants() -> miette::Result<()> {
+    let out_dir: std::path::PathBuf = String::from("src/").into();
     let mut code = Vec::new();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=K");

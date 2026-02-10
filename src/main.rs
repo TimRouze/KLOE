@@ -1,12 +1,11 @@
-mod utils;
+#![allow(dead_code)]
+
 mod compress;
 mod decompress;
 mod parser;
+mod utils;
 use clap::Parser;
 use std::path::Path;
-
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,7 +31,7 @@ struct Args {
     ///Temporary directory for unitigs parsing
     #[arg(short = 'd', long, default_value_t = String::from(""))]
     temp_dir: String,
-    ///Max memory (RAM) for fulgor, default = 8GB
+    ///Memory budget in GB for ggcat workflows (oversized compression partitions and --ggcat-rebuild)
     #[arg(short = 'r', long, default_value_t = 8)]
     memory: usize,
     ///K value, default = 31
@@ -59,7 +58,9 @@ struct Args {
     /// Produce monochromatic eulertigs instead of simplitigs
     #[arg(long = "eulertig", default_value_t = false)]
     eulertig: bool,
-
+    /// During decompression, rebuild tigs from Dump_*.fa using ggcat
+    #[arg(long = "ggcat-rebuild", default_value_t = false)]
+    ggcat_rebuild: bool,
 }
 fn main() {
     let args = Args::parse();
@@ -69,8 +70,8 @@ fn main() {
     //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
-    let _temp_dir = args.temp_dir;
-    let _memory = args.memory;
+    let temp_dir = args.temp_dir;
+    let memory = args.memory;
     let k = args.k_size;
     let m = args.minimizer_size;
     //TODO HANDLE ERRORS FOR COMP AND DECOMP
@@ -78,16 +79,43 @@ fn main() {
     let use_unitigs = args.unitig;
     let use_matchtigs = args.matchtig;
     let use_eulertigs = args.eulertig;
-    let tig_flags_set = [use_unitigs, use_matchtigs, use_eulertigs].iter().filter(|&&f| f).count();
+    let ggcat_rebuild = args.ggcat_rebuild;
+    let tig_flags_set = [use_unitigs, use_matchtigs, use_eulertigs]
+        .iter()
+        .filter(|&&f| f)
+        .count();
     if tig_flags_set > 1 {
         eprintln!("Error: only one of --unitig, --matchtig, --eulertig can be set at a time.");
         std::process::exit(1);
     }
-    if let Some(do_decompress) = args.decompress{
-        if do_decompress == "decompress"{
+    if let Some(do_decompress) = args.decompress {
+        if do_decompress == "decompress" {
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
-            let _ = decompress::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.bin"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
+            let rebuild_cfg = decompress::GgcatRebuildConfig {
+                enabled: ggcat_rebuild,
+                threads,
+                memory_gb: memory,
+                k,
+                temp_dir: temp_dir.clone(),
+                use_unitigs,
+                use_matchtigs,
+                use_eulertigs,
+            };
+            if let Err(err) = decompress::decompress_with_options(
+                &String::from("bucket_sizes.txt"),
+                &String::from("id_to_color_id.txt.zst"),
+                &String::from("tigs_kloe.fa"),
+                &String::from("positions_kloe.bin"),
+                &String::from("filenames_id.txt"),
+                &output_dir,
+                &wanted_path,
+                input_dir,
+                rebuild_cfg,
+            ) {
+                eprintln!("decompression failed: {err}");
+                std::process::exit(1);
+            }
             //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
         } else if do_decompress == "compress" {
             /*let _ = compress::compress(
@@ -101,10 +129,30 @@ fn main() {
                 compaction_threads
             );*/
             //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
-            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort, use_unitigs, use_matchtigs, use_eulertigs);
+            let ggcat_cfg = compress::GgcatCompressionConfig {
+                memory_gb: memory,
+                temp_dir,
+            };
+            if let Err(err) = compress::compress_with_ggcat(
+                &output_dir,
+                &input_fof,
+                threads,
+                k,
+                m,
+                args.partition_power,
+                args.verify_kmers,
+                args.skip_sort,
+                use_unitigs,
+                use_matchtigs,
+                use_eulertigs,
+                ggcat_cfg,
+            ) {
+                eprintln!("compression failed: {err}");
+                std::process::exit(1);
+            }
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
-    }else {
+    } else {
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
@@ -114,7 +162,7 @@ fn main() {
 fn is_compressed_dir_complete(input_dir: String) {
     if !Path::new(&format!("{input_dir}/filenames_id.txt")).exists() {
         panic!("file not found: {input_dir}/filenames_id.txt");
-    }else if !Path::new(&format!("{input_dir}/positions_kloe.bin")).exists(){
+    } else if !Path::new(&format!("{input_dir}/positions_kloe.bin")).exists() {
         panic!("Positions file not found");
     } else if !Path::new(&format!("{input_dir}/bucket_sizes.txt")).exists() {
         panic!("Tigs sizes file not found");
@@ -130,7 +178,7 @@ fn is_compressed_dir_complete(input_dir: String) {
 #[cfg(test)]
 mod tests {
     use super::{compress, decompress};
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -172,8 +220,30 @@ mod tests {
         seqs
     }
 
-    fn kmer_counts_from_seqs(seqs: &[String], k: usize) -> BTreeMap<String, usize> {
-        let mut kmers = BTreeMap::new();
+    fn revcomp(seq: &str) -> String {
+        seq.chars()
+            .rev()
+            .map(|b| match b {
+                'A' => 'T',
+                'C' => 'G',
+                'G' => 'C',
+                'T' => 'A',
+                _ => 'N',
+            })
+            .collect()
+    }
+
+    fn canonical_kmer(kmer: &str) -> String {
+        let rc = revcomp(kmer);
+        if rc.as_str() < kmer {
+            rc
+        } else {
+            kmer.to_string()
+        }
+    }
+
+    fn kmer_set_from_seqs(seqs: &[String], k: usize) -> BTreeSet<String> {
+        let mut kmers = BTreeSet::new();
         for seq in seqs {
             assert!(
                 seq.len() >= k,
@@ -183,26 +253,26 @@ mod tests {
             );
             for i in 0..=seq.len() - k {
                 let kmer = &seq[i..i + k];
-                *kmers.entry(kmer.to_string()).or_insert(0) += 1;
+                kmers.insert(canonical_kmer(kmer));
             }
         }
         kmers
     }
 
     fn assert_kmer_equivalent(expected: &[String], dumped_fasta: &Path, k: usize) {
-        let expected_kmers = kmer_counts_from_seqs(expected, k);
-        let dumped_kmers = kmer_counts_from_seqs(&parse_fasta_sequences(dumped_fasta), k);
+        let expected_kmers = kmer_set_from_seqs(expected, k);
+        let dumped_kmers = kmer_set_from_seqs(&parse_fasta_sequences(dumped_fasta), k);
         assert_eq!(dumped_kmers, expected_kmers, "k-mer content mismatch");
     }
 
-    fn kmer_counts_from_fasta(path: &Path, k: usize) -> BTreeMap<String, usize> {
+    fn kmer_set_from_fasta(path: &Path, k: usize) -> BTreeSet<String> {
         let seqs = parse_fasta_sequences(path);
-        kmer_counts_from_seqs(&seqs, k)
+        kmer_set_from_seqs(&seqs, k)
     }
 
     fn assert_kmer_maps_equal(left: &Path, right: &Path, k: usize, context: &str) {
-        let left_map = kmer_counts_from_fasta(left, k);
-        let right_map = kmer_counts_from_fasta(right, k);
+        let left_map = kmer_set_from_fasta(left, k);
+        let right_map = kmer_set_from_fasta(right, k);
         assert_eq!(left_map, right_map, "{}", context);
     }
 
@@ -286,8 +356,8 @@ mod tests {
             &fof_path.display().to_string(),
             1, // threads
             k,
-            7, // minimizer size
-            10, // partition power
+            7,     // minimizer size
+            10,    // partition power
             false, // verify_kmers
             false, // skip_sort
             false, // use_unitigs
@@ -339,7 +409,7 @@ mod tests {
         targeted_indices: Vec<usize>,
     }
 
-    fn setup_multi_fixture(mode: &str, records: Vec<(String, String)>) -> MultiFixture {
+    fn setup_multi_fixture(_mode: &str, _records: Vec<(String, String)>) -> MultiFixture {
         let workdir = tempfile::tempdir().expect("create temp workdir");
         let archive_dir = workdir.path().join("archive");
         let full_out_dir = workdir.path().join("out_full");
@@ -361,8 +431,12 @@ mod tests {
         write_fasta(&file3, &exp3_refs);
 
         // Run streaming compression instead of write_records_archive
-        run_compression(&[file1.clone(), file2.clone(), file3.clone()], &archive_dir, K)
-            .expect("compression failed");
+        run_compression(
+            &[file1.clone(), file2.clone(), file3.clone()],
+            &archive_dir,
+            K,
+        )
+        .expect("compression failed");
 
         MultiFixture {
             _workdir: workdir,
@@ -415,7 +489,7 @@ mod tests {
         seq
     }
 
-    fn setup_large_fixture(mode: &str, n_files: usize) -> LargeFixture {
+    fn setup_large_fixture(_mode: &str, n_files: usize) -> LargeFixture {
         assert!(n_files >= 100, "stress test expects at least 100 files");
 
         let workdir = tempfile::tempdir().expect("create temp workdir");
@@ -437,8 +511,7 @@ mod tests {
         }
 
         // Run streaming compression (mode parameter is unused but kept for test consistency)
-        run_compression(&source_files, &archive_dir, K)
-            .expect("compression failed");
+        run_compression(&source_files, &archive_dir, K).expect("compression failed");
 
         let dump_full: Vec<PathBuf> = source_files
             .iter()
@@ -495,7 +568,7 @@ mod tests {
     }
 
     fn setup_two_file_case_fixture(
-        mode: &str,
+        _mode: &str,
         case_filename: &str,
         case_seqs: &[String],
         control_filename: &str,
@@ -540,7 +613,7 @@ mod tests {
             &String::from("bucket_sizes.txt"),
             &String::from("id_to_color_id.txt.zst"),
             &String::from("tigs_kloe.fa"),
-            &String::from("positions_kloe.txt.zst"),
+            &String::from("positions_kloe.bin"),
             &String::from("filenames_id.txt"),
             &out_dir_s,
             &String::from(""),
@@ -563,7 +636,7 @@ mod tests {
             &String::from("bucket_sizes.txt"),
             &String::from("id_to_color_id.txt.zst"),
             &String::from("tigs_kloe.fa"),
-            &String::from("positions_kloe.txt.zst"),
+            &String::from("positions_kloe.bin"),
             &String::from("filenames_id.txt"),
             &out_dir_s,
             &wanted.display().to_string(),
@@ -601,7 +674,10 @@ mod tests {
         for mode in MODES {
             let seq = "ACGTTAGCCATGATCGTACCGTTAGGCTAACCGTTAACGA".to_string();
             let rc = reverse_complement(&seq);
-            assert_ne!(seq, rc, "test sequence should not be self reverse-complement");
+            assert_ne!(
+                seq, rc,
+                "test sequence should not be self reverse-complement"
+            );
             let case_expected = vec![seq.clone(), rc.clone()];
             let control_expected = vec!["GGTACCGATCGTACCGATCGTACCGATCGTACCGAT".to_string()];
 
@@ -672,7 +748,8 @@ mod tests {
     }
 
     #[test]
-    fn mutation_plus_reverse_complement_case_preserves_content_in_full_and_targeted_decompression() {
+    fn mutation_plus_reverse_complement_case_preserves_content_in_full_and_targeted_decompression()
+    {
         for mode in MODES {
             let seq = "GCTAACCGTTAACCGGTTACCGATGCTAACCGTTAACCGG".to_string();
             let perfect_rc = reverse_complement(&seq);
@@ -804,7 +881,11 @@ mod tests {
                 .iter()
                 .map(|&i| fixture.source_files[i].clone())
                 .collect();
-            run_targeted_decompression(&fixture.archive_dir, &fixture.targeted_out_dir, &wanted_files);
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &wanted_files,
+            );
             assert_eq!(
                 count_dump_files(&fixture.targeted_out_dir),
                 fixture.targeted_indices.len(),

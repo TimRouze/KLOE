@@ -1,36 +1,140 @@
+use chrono::Utc;
 use core::panic;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Result, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, BufWriter, Result, Write};
 use std::sync::mpsc;
-use chrono::Utc;
 
 use zstd::Encoder;
 
-use crate::utils::{Converter, Convert};
 use crate::parser;
+use crate::utils::{Convert, Converter};
 
-pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, verify_kmers: bool, skip_sort: bool, use_unitigs: bool, use_matchtigs: bool, use_eulertigs: bool) -> Result<()>{
-    let _overall_start = Utc::now();
+pub fn compress(
+    output_dir: &String,
+    input_fof: &String,
+    threads: usize,
+    k: usize,
+    m: usize,
+    partition_power: u32,
+    verify_kmers: bool,
+    skip_sort: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+) -> Result<()> {
+    compress_with_ggcat(
+        output_dir,
+        input_fof,
+        threads,
+        k,
+        m,
+        partition_power,
+        verify_kmers,
+        skip_sort,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
+        GgcatCompressionConfig::default(),
+    )
+}
 
-    // Start parser in streaming mode: Steps 1+2 run synchronously,
-    // Step 3 (merge) runs in a background thread sending records via channel.
-    let (record_rx, merge_handle, dataset_count) = parser::run_parser_streaming(
-        PathBuf::from(input_fof),
-        PathBuf::from(output_dir),
-        k, m, partition_power, threads, verify_kmers, skip_sort,
-        use_unitigs, use_matchtigs, use_eulertigs,
-    ).expect("run_parser_streaming failed");
+#[derive(Clone, Debug)]
+pub struct GgcatCompressionConfig {
+    pub memory_gb: usize,
+    pub temp_dir: String,
+}
 
-    println!("Simplitigs created, processing sequences (streaming)");
-    let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
-    let mut filename = String::new();
+impl Default for GgcatCompressionConfig {
+    fn default() -> Self {
+        Self {
+            memory_gb: 8,
+            temp_dir: String::new(),
+        }
+    }
+}
+
+fn read_input_fof_filenames(input_fof: &str) -> Result<Vec<String>> {
+    let input_fof_reader = BufReader::new(File::open(input_fof)?);
     let mut filenames = Vec::new();
-    while input_fof_reader.read_line(&mut filename)? != 0{
-        filename.pop();
-        filenames.push(filename.clone());
-        filename.clear();
+    for line_result in input_fof_reader.lines() {
+        let line = line_result?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            filenames.push(trimmed.to_string());
+        }
+    }
+    Ok(filenames)
+}
+
+fn write_filenames_id_offsets(
+    output_dir: &str,
+    filenames: &[String],
+    id_cid_line_sizes: &[usize],
+) -> Result<()> {
+    if filenames.len() != id_cid_line_sizes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "filenames count ({}) differs from id->cid offsets count ({})",
+                filenames.len(),
+                id_cid_line_sizes.len()
+            ),
+        ));
+    }
+
+    let mut fof_id = BufWriter::new(File::create(output_dir.to_owned() + "filenames_id.txt")?);
+    for (filename, offset) in filenames.iter().zip(id_cid_line_sizes.iter()) {
+        fof_id.write_all(format!("{filename}:{offset}\n").as_bytes())?;
+    }
+    fof_id.flush()?;
+    Ok(())
+}
+
+pub fn compress_with_ggcat(
+    output_dir: &String,
+    input_fof: &String,
+    threads: usize,
+    k: usize,
+    m: usize,
+    partition_power: u32,
+    verify_kmers: bool,
+    skip_sort: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+    ggcat_cfg: GgcatCompressionConfig,
+) -> Result<()> {
+    let _overall_start = Utc::now();
+    let filenames = read_input_fof_filenames(input_fof)?;
+    println!("Compression backend: native KLOE parser (ggcat only for oversized partitions)");
+    let parser_ggcat_cfg = parser::PartitionGgcatConfig {
+        memory_gb: ggcat_cfg.memory_gb,
+        temp_dir: ggcat_cfg.temp_dir.clone(),
+        ..parser::PartitionGgcatConfig::default()
+    };
+    let (record_rx, merge_handle, dataset_count) = parser::run_parser_streaming(
+        std::path::PathBuf::from(input_fof),
+        std::path::PathBuf::from(output_dir),
+        k,
+        m,
+        partition_power,
+        threads,
+        verify_kmers,
+        skip_sort,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
+        parser_ggcat_cfg,
+    )
+    .expect("run_parser_streaming failed");
+
+    if dataset_count != filenames.len() {
+        eprintln!(
+            "Warning: parser dataset count ({}) differs from input file count ({})",
+            dataset_count,
+            filenames.len()
+        );
     }
 
     println!("Compressing sequences from stream by color bucket");
@@ -38,20 +142,13 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
     let id_cid_line_sizes = sort_by_bucket_streaming(output_dir, dataset_count as u32, record_rx);
     parser::log_checkpoint("Compression took:", sort_time);
 
-    // Wait for merge thread to finish
     match merge_handle.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("Merge thread error: {:#}", e),
         Err(_) => eprintln!("Merge thread panicked"),
     }
 
-    let mut fof_id = BufWriter::new(File::create(output_dir.clone() + "filenames_id.txt").expect("Failed to create fof file"));
-    let mut file_cpt: usize = 0;
-    for filename in filenames{
-        println!("a{}a", filename);
-        fof_id.write_all((filename + ":" + id_cid_line_sizes.get(file_cpt).unwrap().to_string().as_str() + "\n").as_bytes())?;
-        file_cpt += 1;
-    }
+    write_filenames_id_offsets(output_dir, &filenames, &id_cid_line_sizes)?;
     Ok(())
 }
 
@@ -68,11 +165,11 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
 /// RETURNS
 /// - Vector of sizes (cursor positions) per input file used to annotate filenames,
 ///   the position of cid list in id to cid file for each id (used later during decompression).
-pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
+pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize> {
     let write_time = Utc::now();
     // PROCESS AND COMPRESS UNITIGS
     println!("Starting writing compressed sequences.");
-    let pair = match write_compressed(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files){
+    let pair = match write_compressed(output_dir.clone() + "tigs_kloe.fa", output_dir, nb_files) {
         Ok(res_pair) => res_pair,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
@@ -82,14 +179,21 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     let id_to_color_vec = pair.1;
 
     println!("Starting to write positions");
-    let cursor_positions = match write_positions(pos_nb_unitig, String::from(output_dir.clone()+"positions_kloe.bin")){
+    let cursor_positions = match write_positions(
+        pos_nb_unitig,
+        String::from(output_dir.clone() + "positions_kloe.bin"),
+    ) {
         Ok(vec) => vec,
         Err(e) => panic!("Error writting positions: {e:?}"),
     };
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
     // WRITE FILE ID TO COLOR ID FILE
-    let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
+    let write_id_cid = match write_id_to_color_id(
+        output_dir.clone() + "id_to_color_id.txt.zst",
+        id_to_color_vec,
+        cursor_positions,
+    ) {
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
@@ -99,10 +203,19 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
 }
 
 /// Streaming variant: consumes records from a channel instead of reading from a file.
-fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc::Receiver<parser::SimplitigRecord>) -> Vec<usize>{
+fn sort_by_bucket_streaming(
+    output_dir: &String,
+    nb_files: u32,
+    record_rx: mpsc::Receiver<parser::SimplitigRecord>,
+) -> Vec<usize> {
     let write_time = Utc::now();
     println!("Starting writing compressed sequences (streaming).");
-    let pair = match write_compressed_from_stream(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files, record_rx){
+    let pair = match write_compressed_from_stream(
+        output_dir.clone() + "tigs_kloe.fa",
+        output_dir,
+        nb_files,
+        record_rx,
+    ) {
         Ok(res_pair) => res_pair,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
@@ -112,13 +225,20 @@ fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc:
     let id_to_color_vec = pair.1;
 
     println!("Starting to write positions");
-    let cursor_positions = match write_positions(pos_nb_unitig, String::from(output_dir.clone()+"positions_kloe.bin")){
+    let cursor_positions = match write_positions(
+        pos_nb_unitig,
+        String::from(output_dir.clone() + "positions_kloe.bin"),
+    ) {
         Ok(vec) => vec,
         Err(e) => panic!("Error writting positions: {e:?}"),
     };
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
-    let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
+    let write_id_cid = match write_id_to_color_id(
+        output_dir.clone() + "id_to_color_id.txt.zst",
+        id_to_color_vec,
+        cursor_positions,
+    ) {
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
@@ -154,9 +274,9 @@ fn write_compressed_from_stream(
     for record in record_rx {
         // Parse IDs from header (format: ">ids:1,3,5")
         let header_str = std::str::from_utf8(&record.header).unwrap_or("");
-        let ids_str = header_str.strip_prefix(">ids:").unwrap_or(
-            header_str.strip_prefix("ids:").unwrap_or("")
-        );
+        let ids_str = header_str
+            .strip_prefix(">ids:")
+            .unwrap_or(header_str.strip_prefix("ids:").unwrap_or(""));
         let ids: Vec<usize> = ids_str
             .split(',')
             .filter(|s| !s.is_empty())
@@ -215,7 +335,7 @@ fn write_compressed_from_stream(
     }
 
     if let Some(current) = current_ids {
-        for elem in &buffer_encoded_seq{
+        for elem in &buffer_encoded_seq {
             omni_file.write_all(elem)?;
             prev_tigs_size += elem.len() as u64;
         }
@@ -237,14 +357,20 @@ fn write_compressed_from_stream(
     omni_file.flush()?;
     size_file.flush()?;
 
-    println!("Completed compression: total tigs={}, total sizes={}", prev_tigs_size, prev_bucket_pos);
+    println!(
+        "Completed compression: total tigs={}, total sizes={}",
+        prev_tigs_size, prev_bucket_pos
+    );
     Ok((pos_nb_unitig, id_to_color_vec))
 }
 
-
 /// Read unitigs from file, group them by color bucket then compress.
 /// (Legacy path, kept for sort_by_bucket which is used by the non-streaming code path)
-fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u32) -> Result<(Vec<(u64, u64)>, Vec<Vec<usize>>)>{
+fn write_compressed(
+    unitigs_file_path: String,
+    output_dir: &String,
+    nb_files: u32,
+) -> Result<(Vec<(u64, u64)>, Vec<Vec<usize>>)> {
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
     let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
 
@@ -328,12 +454,11 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     }
 
     if let Some(current) = current_ids {
-        for elem in &buffer_encoded_seq{
+        for elem in &buffer_encoded_seq {
             omni_file.write_all(elem)?;
             prev_tigs_size += elem.len() as u64;
         }
         buffer_encoded_seq.clear();
-
 
         if let Some(encoder) = group_encoder.take() {
             encoder.finish()?;
@@ -351,10 +476,12 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     omni_file.flush()?;
     size_file.flush()?;
 
-    println!("Completed compression: total tigs={}, total sizes={}", prev_tigs_size, prev_bucket_pos);
+    println!(
+        "Completed compression: total tigs={}, total sizes={}",
+        prev_tigs_size, prev_bucket_pos
+    );
     Ok((pos_nb_unitig, id_to_color_vec))
 }
-
 
 /// Write position pairs (tigs cursor, sizes cursor) on disk as raw bytes.
 ///
@@ -368,7 +495,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
 ///
 /// RETURNS
 /// - Vec<usize> of starting byte offsets in positions file (simply i*16).
-fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<Vec<usize>>{
+fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<Vec<usize>> {
     let mut pos_file = BufWriter::new(File::create(filepath).expect("unable to create file"));
     let mut vec_cursor_position = Vec::with_capacity(pos_nb_unitigs.len());
     for (i, elem) in pos_nb_unitigs.iter().enumerate() {
@@ -380,8 +507,11 @@ fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<
     Ok(vec_cursor_position)
 }
 
-
-fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>, cursor_positions: Vec<usize>) -> std::io::Result<Vec<usize>>{
+fn write_id_to_color_id(
+    cid_file_path: String,
+    id_to_color_vec: Vec<Vec<usize>>,
+    cursor_positions: Vec<usize>,
+) -> std::io::Result<Vec<usize>> {
     let mut cid_file = BufWriter::new(File::create(&cid_file_path)?);
     let mut id_cid_line_sizes = Vec::with_capacity(id_to_color_vec.len());
     let mut tot_size = 0;

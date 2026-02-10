@@ -2,21 +2,21 @@ use anyhow::{bail, Context, Result};
 use bio::io::fasta;
 use chrono::{DateTime, Duration, Utc};
 use flate2::read::GzDecoder;
+use genome_graph::bigraph::implementation::node_bigraph_wrapper::NodeBigraphWrapper;
 use genome_graph::bigraph::interface::BidirectedData;
 use genome_graph::bigraph::traitgraph::implementation::petgraph_impl::PetGraph;
 use genome_graph::bigraph::traitgraph::interface::{DynamicGraph, ImmutableGraphContainer};
 use genome_graph::bigraph::traitgraph::traitsequence::interface::Sequence;
 use genome_graph::bigraph::traitgraph::walks::VecEdgeWalk;
-use genome_graph::bigraph::implementation::node_bigraph_wrapper::NodeBigraphWrapper;
-use genome_graph::compact_genome::implementation::{
-    alphabets::dna_alphabet::DnaAlphabet, DefaultGenome, DefaultSequenceStore,
-};
+use genome_graph::compact_genome::implementation::{DefaultGenome, DefaultSequenceStore};
+use genome_graph::compact_genome::interface::alphabet::dna_alphabet::DnaAlphabet;
 use genome_graph::compact_genome::interface::alphabet::Alphabet;
 use genome_graph::compact_genome::interface::sequence::{GenomeSequence, OwnedGenomeSequence};
 use genome_graph::compact_genome::interface::sequence_store::{HandleWithLength, SequenceStore};
 use genome_graph::io::fasta::{read_bigraph_from_fasta_as_edge_centric, FastaNodeData};
 use genome_graph::io::SequenceData;
 use hashbrown::{hash_map::Entry, HashMap};
+use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
 use libmatchtigs::{
     EulertigAlgorithm, EulertigAlgorithmConfiguration, GreedytigAlgorithm,
     GreedytigAlgorithmConfiguration, MatchtigEdgeData, NodeWeightArrayType, TigAlgorithm,
@@ -46,6 +46,54 @@ const WRITE_BUFFER_TARGET: usize = 8 * 1024 * 1024;
 const ZSTD_LEVEL_FAST: i32 = -4; // zstd "fast=4" mode for high speed
 const PAR_SORT_THRESHOLD: usize = 200_000;
 const BUCKET_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
+const GGCAT_PARTITION_SIZE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn parse_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+#[derive(Clone, Debug)]
+pub struct PartitionGgcatConfig {
+    pub memory_gb: usize,
+    pub temp_dir: String,
+    pub partition_size_threshold_bytes: u64,
+}
+
+impl Default for PartitionGgcatConfig {
+    fn default() -> Self {
+        // Backward-compatible env var name kept from the previous global fallback.
+        let threshold_mb = parse_env_u64("KLOE_AUTO_GGCAT_PARTITION_MB")
+            .or_else(|| parse_env_u64("KLOE_AUTO_GGCAT_PARTITION_AVG_MB"))
+            .unwrap_or(GGCAT_PARTITION_SIZE_THRESHOLD_BYTES / (1024 * 1024));
+        Self {
+            memory_gb: 8,
+            temp_dir: String::new(),
+            partition_size_threshold_bytes: threshold_mb * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartitionCompactionBackend {
+    Native,
+    Ggcat,
+}
+
+fn partition_mode_extra_elaboration(
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+) -> ExtraElaboration {
+    if use_unitigs {
+        ExtraElaboration::None
+    } else if use_matchtigs {
+        ExtraElaboration::GreedyMatchtigs
+    } else if use_eulertigs {
+        ExtraElaboration::Eulertigs
+    } else {
+        ExtraElaboration::Pathtigs
+    }
+}
 fn remove_intermediate_file_best_effort(path: &Path) {
     if let Err(err) = fs::remove_file(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
@@ -233,8 +281,7 @@ impl KmerEntry {
     #[inline(always)]
     fn merge_predecessor(&mut self, prev_bits: u8) {
         if self.flags & Self::HAS_PRED == 0 {
-            self.flags |=
-                Self::HAS_PRED | ((prev_bits as u32 & 0b11) << Self::PRED_BASE_SHIFT);
+            self.flags |= Self::HAS_PRED | ((prev_bits as u32 & 0b11) << Self::PRED_BASE_SHIFT);
         } else if ((self.flags & Self::PRED_BASE_MASK) >> Self::PRED_BASE_SHIFT) as u8 != prev_bits
         {
             self.flags |= Self::PRED_AMBIG;
@@ -479,7 +526,6 @@ fn flush_all_buffers(
     Ok(())
 }
 
-
 fn assemble_simplitigs_bidirected(
     kmer_map: &mut HashMap<u64, KmerEntry>,
     arena: &[u64],
@@ -551,7 +597,9 @@ fn assemble_simplitigs_bidirected(
                         cur_right_hint = if nf {
                             ent.successor().filter(|_| !ent.succ_ambig())
                         } else {
-                            ent.predecessor().map(complement_bits).filter(|_| !ent.pred_ambig())
+                            ent.predecessor()
+                                .map(complement_bits)
+                                .filter(|_| !ent.pred_ambig())
                         };
                         seq_bits = nb;
                         rv_bits = nr;
@@ -565,8 +613,7 @@ fn assemble_simplitigs_bidirected(
                 let mut fallback_found = false;
                 for base in 0u8..4u8 {
                     let nb = ((seq_bits << 2) & mask) | base as u64;
-                    let nr =
-                        (rv_bits >> 2) | ((complement_bits(base) as u64) << rc_high_shift);
+                    let nr = (rv_bits >> 2) | ((complement_bits(base) as u64) << rc_high_shift);
                     let nc = if nb <= nr { nb } else { nr };
                     if let Some(ent) = kmer_map.get_mut(&nc) {
                         if !ent.visited() && entry_ids(ent, arena, words) == ids_slice {
@@ -613,8 +660,7 @@ fn assemble_simplitigs_bidirected(
 
             // Try hinted base first
             if let Some(hint_base) = cur_left_hint {
-                let pb =
-                    (((hint_base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
+                let pb = (((hint_base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
                 let pr = ((left_rev << 2) | complement_bits(hint_base) as u64) & mask;
                 let pc = if pb <= pr { pb } else { pr };
                 if let Some(ent) = kmer_map.get_mut(&pc) {
@@ -625,7 +671,9 @@ fn assemble_simplitigs_bidirected(
                         cur_left_hint = if pf {
                             ent.predecessor().filter(|_| !ent.pred_ambig())
                         } else {
-                            ent.successor().map(complement_bits).filter(|_| !ent.succ_ambig())
+                            ent.successor()
+                                .map(complement_bits)
+                                .filter(|_| !ent.succ_ambig())
                         };
                         left_bits = pb;
                         left_rev = pr;
@@ -638,8 +686,7 @@ fn assemble_simplitigs_bidirected(
             if !found {
                 let mut fallback_found = false;
                 for base in 0u8..4u8 {
-                    let pb =
-                        (((base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
+                    let pb = (((base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
                     let pr = ((left_rev << 2) | complement_bits(base) as u64) & mask;
                     let pc = if pb <= pr { pb } else { pr };
                     if let Some(ent) = kmer_map.get_mut(&pc) {
@@ -868,10 +915,10 @@ impl SequenceData<DnaAlphabet, DnaStore> for CliEdgeData<DnaHandle> {
         &self.sequence_handle
     }
 
-    fn sequence_ref<'this: 'result, 'store: 'result, 'result>(
-        &'this self,
-        source_sequence_store: &'store DnaStore,
-    ) -> Option<&'result <DnaStore as SequenceStore<DnaAlphabet>>::SequenceRef> {
+    fn sequence_ref<'a>(
+        &self,
+        source_sequence_store: &'a DnaStore,
+    ) -> Option<&'a <DnaStore as SequenceStore<DnaAlphabet>>::SequenceRef> {
         if self.forward {
             let handle = <Self as SequenceData<DnaAlphabet, DnaStore>>::sequence_handle(self);
             Some(source_sequence_store.get(handle))
@@ -933,7 +980,10 @@ impl<SequenceHandle> From<FastaNodeData<SequenceHandle>> for CliEdgeData<Sequenc
     }
 }
 
-fn compute_edge_weights<NodeData, Graph: DynamicGraph<NodeData = NodeData, EdgeData = CliEdgeData<DnaHandle>>>(
+fn compute_edge_weights<
+    NodeData,
+    Graph: DynamicGraph<NodeData = NodeData, EdgeData = CliEdgeData<DnaHandle>>,
+>(
     graph: &mut Graph,
     k: usize,
 ) {
@@ -951,7 +1001,8 @@ fn collect_walks_sequences(
     k: usize,
 ) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(walks.len());
-    for walk in walks {
+    for walk in walks.iter() {
+        let walk: &VecEdgeWalk<DnaGraph> = walk;
         if walk.is_empty() {
             continue;
         }
@@ -980,10 +1031,13 @@ fn collect_walks_sequences(
                 k - 1 - previous_data.weight()
             };
 
-            if let Some(current_sequence) = current_data.sequence_ref(source_sequence_store) {
+            let current_sequence_opt: Option<
+                &<DnaStore as SequenceStore<DnaAlphabet>>::SequenceRef,
+            > = current_data.sequence_ref(source_sequence_store);
+            if let Some(current_sequence) = current_sequence_opt {
                 let current_sequence = &current_sequence[offset..current_sequence.len()];
                 for character in current_sequence.iter() {
-                    seq.push(DnaAlphabet::character_to_ascii(character.clone()));
+                    seq.push(DnaAlphabet::character_to_ascii(*character));
                 }
             } else {
                 let handle = current_data.sequence_handle();
@@ -1027,8 +1081,9 @@ fn build_graph_from_unitigs(
     let cursor = std::io::Cursor::new(fasta_buf);
     let reader = BufReader::new(cursor);
     let mut sequence_store = DnaStore::default();
-    let graph: DnaGraph = read_bigraph_from_fasta_as_edge_centric(reader, &mut sequence_store, k)
-        .context("read unitig fasta for matchtigs/eulertigs")?;
+    let graph: DnaGraph =
+        read_bigraph_from_fasta_as_edge_centric(reader, &mut sequence_store, k)
+            .map_err(|e| anyhow::anyhow!("read unitig fasta for matchtigs/eulertigs: {e}"))?;
     Ok((graph, sequence_store))
 }
 
@@ -1107,7 +1162,12 @@ impl FlatKmerTable {
                 idx = (idx + 1) & mask;
             }
         }
-        Self { keys, values, mask, hasher }
+        Self {
+            keys,
+            values,
+            mask,
+            hasher,
+        }
     }
 
     #[inline(always)]
@@ -1122,13 +1182,27 @@ impl FlatKmerTable {
             let val_ptr = self.values.as_ptr().add(bucket) as *const u8;
             #[cfg(target_arch = "x86_64")]
             {
-                std::arch::x86_64::_mm_prefetch(key_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                std::arch::x86_64::_mm_prefetch(val_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                std::arch::x86_64::_mm_prefetch(
+                    key_ptr as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+                std::arch::x86_64::_mm_prefetch(
+                    val_ptr as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
             }
             #[cfg(target_arch = "aarch64")]
             {
-                std::arch::aarch64::_prefetch(key_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
-                std::arch::aarch64::_prefetch(val_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                std::arch::aarch64::_prefetch(
+                    key_ptr as *const i8,
+                    std::arch::aarch64::_PREFETCH_READ,
+                    std::arch::aarch64::_PREFETCH_LOCALITY3,
+                );
+                std::arch::aarch64::_prefetch(
+                    val_ptr as *const i8,
+                    std::arch::aarch64::_PREFETCH_READ,
+                    std::arch::aarch64::_PREFETCH_LOCALITY3,
+                );
             }
         }
     }
@@ -1222,7 +1296,9 @@ fn assemble_simplitigs_flat(
                         cur_right_hint = if nf {
                             ent.successor().filter(|_| !ent.succ_ambig())
                         } else {
-                            ent.predecessor().map(complement_bits).filter(|_| !ent.pred_ambig())
+                            ent.predecessor()
+                                .map(complement_bits)
+                                .filter(|_| !ent.pred_ambig())
                         };
                         seq_bits = nb;
                         rv_bits = nr;
@@ -1238,8 +1314,7 @@ fn assemble_simplitigs_flat(
                 let mut candidates: [(u64, u64, u64, usize); 4] = [(0, 0, 0, 0); 4];
                 for base in 0u8..4u8 {
                     let nb = ((seq_bits << 2) & mask) | base as u64;
-                    let nr =
-                        (rv_bits >> 2) | ((complement_bits(base) as u64) << rc_high_shift);
+                    let nr = (rv_bits >> 2) | ((complement_bits(base) as u64) << rc_high_shift);
                     let nc = if nb <= nr { nb } else { nr };
                     let bucket = flat.bucket(nc, &hasher);
                     candidates[base as usize] = (nb, nr, nc, bucket);
@@ -1291,8 +1366,7 @@ fn assemble_simplitigs_flat(
             let mut found = false;
 
             if let Some(hint_base) = cur_left_hint {
-                let pb =
-                    (((hint_base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
+                let pb = (((hint_base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
                 let pr = ((left_rev << 2) | complement_bits(hint_base) as u64) & mask;
                 let pc = if pb <= pr { pb } else { pr };
                 if let Some(ent) = flat.get_mut(pc, &hasher) {
@@ -1303,7 +1377,9 @@ fn assemble_simplitigs_flat(
                         cur_left_hint = if pf {
                             ent.predecessor().filter(|_| !ent.pred_ambig())
                         } else {
-                            ent.successor().map(complement_bits).filter(|_| !ent.succ_ambig())
+                            ent.successor()
+                                .map(complement_bits)
+                                .filter(|_| !ent.succ_ambig())
                         };
                         left_bits = pb;
                         left_rev = pr;
@@ -1317,8 +1393,7 @@ fn assemble_simplitigs_flat(
                 let mut fallback_found = false;
                 let mut candidates: [(u64, u64, u64, usize); 4] = [(0, 0, 0, 0); 4];
                 for base in 0u8..4u8 {
-                    let pb =
-                        (((base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
+                    let pb = (((base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
                     let pr = ((left_rev << 2) | complement_bits(base) as u64) & mask;
                     let pc = if pb <= pr { pb } else { pr };
                     let bucket = flat.bucket(pc, &hasher);
@@ -1979,7 +2054,35 @@ fn build_kmer_map_reuse(
     Ok(words)
 }
 
-fn write_partition_simplitigs(
+fn write_partition_records_output(
+    mut records: Vec<SimplitigRecord>,
+    output_path: &Path,
+    threads: usize,
+    sort_records: bool,
+) -> Result<()> {
+    let mut encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
+    if sort_records {
+        write_sorted_chunk(&mut records, &mut encoder)?;
+    } else {
+        let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+        for record in records.iter() {
+            write_simplitig_record_to_buf(record, &mut buffer);
+            if buffer.len() >= WRITE_BUFFER_TARGET {
+                encoder.write_all(&buffer)?;
+                buffer.clear();
+            }
+        }
+        if !buffer.is_empty() {
+            encoder.write_all(&buffer)?;
+        }
+    }
+    encoder
+        .finish()
+        .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
+    Ok(())
+}
+
+fn write_partition_simplitigs_native(
     partition_path: &Path,
     k: usize,
     dataset_count: usize,
@@ -2009,7 +2112,11 @@ fn write_partition_simplitigs(
         let header = build_simplitig_header(&ids);
         let key = build_simplitig_key(&ids, width);
         for seq in seqs {
-            records.push(SimplitigRecord { header: header.clone(), key: key.clone(), seq });
+            records.push(SimplitigRecord {
+                header: header.clone(),
+                key: key.clone(),
+                seq,
+            });
         }
     } else if use_eulertigs {
         let seqs = build_eulertig_sequences_from_kmers(&mut map, &arena, words, k)?;
@@ -2024,7 +2131,11 @@ fn write_partition_simplitigs(
         let header = build_simplitig_header(&ids);
         let key = build_simplitig_key(&ids, width);
         for seq in seqs {
-            records.push(SimplitigRecord { header: header.clone(), key: key.clone(), seq });
+            records.push(SimplitigRecord {
+                header: header.clone(),
+                key: key.clone(),
+                seq,
+            });
         }
     } else if use_unitigs {
         assemble_unitigs_bidirected(&mut map, &arena, words, k, |seq, ids_bits| {
@@ -2058,27 +2169,246 @@ fn write_partition_simplitigs(
         }
     }
 
-    let mut encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
-    if sort_records {
-        write_sorted_chunk(&mut records, &mut encoder)?;
-    } else {
-        let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
-        for record in records.iter() {
-            write_simplitig_record_to_buf(record, &mut buffer);
-            if buffer.len() >= WRITE_BUFFER_TARGET {
-                encoder.write_all(&buffer)?;
-                buffer.clear();
+    write_partition_records_output(records, output_path, threads, sort_records)
+}
+
+fn split_partition_records_for_ggcat(
+    partition_path: &Path,
+    split_dir: &Path,
+    dataset_count: usize,
+    k: usize,
+) -> Result<Vec<(usize, PathBuf)>> {
+    let file =
+        File::open(partition_path).with_context(|| format!("open partition {}", partition_path.display()))?;
+    let decoder = ZstdDecoder::new(file)
+        .with_context(|| format!("create zstd decoder for {}", partition_path.display()))?;
+    let reader = fasta::Reader::from_bufread(BufReader::new(decoder));
+
+    let mut dataset_files: HashMap<usize, PathBuf> = HashMap::new();
+    let mut dataset_writers: HashMap<usize, BufWriter<File>> = HashMap::new();
+    let mut records_per_dataset = vec![0u64; dataset_count + 1];
+
+    for record in reader.records() {
+        let record =
+            record.with_context(|| format!("read partition record in {}", partition_path.display()))?;
+        let seq = record.seq();
+        if seq.len() < k {
+            continue;
+        }
+        let dataset_id: usize = record
+            .id()
+            .parse()
+            .with_context(|| format!("parse dataset id in {}", partition_path.display()))?;
+        if dataset_id == 0 || dataset_id > dataset_count {
+            bail!(
+                "dataset id {} invalid for dataset count {}",
+                dataset_id,
+                dataset_count
+            );
+        }
+        let writer = match dataset_writers.entry(dataset_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let split_path = split_dir.join(format!("dataset-{dataset_id}.fa"));
+                let split_file = File::create(&split_path)
+                    .with_context(|| format!("create ggcat split {}", split_path.display()))?;
+                dataset_files.insert(dataset_id, split_path);
+                entry.insert(BufWriter::new(split_file))
             }
-        }
-        if !buffer.is_empty() {
-            encoder.write_all(&buffer)?;
-        }
+        };
+        records_per_dataset[dataset_id] += 1;
+        writeln!(writer, ">r{}", records_per_dataset[dataset_id])?;
+        writer.write_all(seq)?;
+        writer.write_all(b"\n")?;
     }
 
-    encoder
-        .finish()
-        .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
-    Ok(())
+    for writer in dataset_writers.values_mut() {
+        writer.flush()?;
+    }
+
+    let mut dataset_ids: Vec<usize> = dataset_files.keys().copied().collect();
+    dataset_ids.sort_unstable();
+    let mut dataset_inputs = Vec::with_capacity(dataset_ids.len());
+    for dataset_id in dataset_ids {
+        let split_path = dataset_files
+            .remove(&dataset_id)
+            .expect("dataset path must exist");
+        dataset_inputs.push((dataset_id, split_path));
+    }
+    Ok(dataset_inputs)
+}
+
+fn write_partition_simplitigs_ggcat(
+    partition_path: &Path,
+    k: usize,
+    dataset_count: usize,
+    output_path: &Path,
+    threads: usize,
+    sort_records: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+    ggcat_cfg: &PartitionGgcatConfig,
+) -> Result<()> {
+    let output_parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let ggcat_root = if ggcat_cfg.temp_dir.is_empty() {
+        output_parent.join("ggcat_partition_tmp")
+    } else {
+        PathBuf::from(&ggcat_cfg.temp_dir)
+    };
+    fs::create_dir_all(&ggcat_root)
+        .with_context(|| format!("create ggcat temp root {}", ggcat_root.display()))?;
+    let partition_tmp = TempBuilder::new()
+        .prefix("kloe-ggcat-part-")
+        .tempdir_in(&ggcat_root)
+        .with_context(|| format!("create ggcat temp dir in {}", ggcat_root.display()))?;
+
+    let split_dir = partition_tmp.path().join("split_inputs");
+    fs::create_dir_all(&split_dir)
+        .with_context(|| format!("create split dir {}", split_dir.display()))?;
+    let dataset_inputs =
+        split_partition_records_for_ggcat(partition_path, &split_dir, dataset_count, k)?;
+    if dataset_inputs.is_empty() {
+        return write_partition_records_output(Vec::new(), output_path, threads, sort_records);
+    }
+
+    let ggcat_work_dir = partition_tmp.path().join("work");
+    fs::create_dir_all(&ggcat_work_dir)
+        .with_context(|| format!("create ggcat work dir {}", ggcat_work_dir.display()))?;
+    let instance = GGCATInstance::create(GGCATConfig {
+        temp_dir: Some(ggcat_work_dir),
+        memory: ggcat_cfg.memory_gb.max(1) as f64,
+        prefer_memory: true,
+        total_threads_count: threads.max(1),
+        intermediate_compression_level: None,
+        stats_file: None,
+    });
+
+    let streams = dataset_inputs
+        .iter()
+        .map(|(_, file)| {
+            let resolved = fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+            GeneralSequenceBlockData::FASTA((resolved, None))
+        })
+        .collect::<Vec<_>>();
+    let color_names = dataset_inputs
+        .iter()
+        .map(|(dataset_id, _)| dataset_id.to_string())
+        .collect::<Vec<_>>();
+    let graph_path = partition_tmp.path().join("partition_compacted.fa");
+    let graph_path = instance.build_graph(
+        streams,
+        graph_path,
+        Some(&color_names),
+        k,
+        threads.max(1),
+        false,
+        None,
+        true,
+        1,
+        partition_mode_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
+    );
+    let dumped_color_names =
+        GGCATInstance::dump_colors(GGCATInstance::get_colormap_file(&graph_path))
+            .collect::<Vec<_>>();
+
+    let width = id_width(dataset_count);
+    let records = Mutex::new(Vec::<SimplitigRecord>::new());
+    let dump_error = Mutex::new(None::<String>);
+    instance.dump_unitigs(
+        &graph_path,
+        k,
+        None,
+        true,
+        threads.max(1),
+        true,
+        |seq, colors, _same_colors| {
+            if dump_error.lock().is_some() {
+                return;
+            }
+            if colors.is_empty() {
+                return;
+            }
+            let mut ids = Vec::with_capacity(colors.len());
+            for color_idx in colors {
+                let idx = *color_idx as usize;
+                let Some(color_name) = dumped_color_names.get(idx) else {
+                    *dump_error.lock() =
+                        Some(format!("ggcat returned color index {} out of range", idx));
+                    return;
+                };
+                let parsed_id = color_name
+                    .parse::<usize>()
+                    .ok()
+                    .or_else(|| dataset_inputs.get(idx).map(|(dataset_id, _)| *dataset_id))
+                    .unwrap_or(idx + 1);
+                if parsed_id == 0 || parsed_id > dataset_count {
+                    *dump_error.lock() = Some(format!(
+                        "ggcat returned dataset id {} outside [1, {}]",
+                        parsed_id, dataset_count
+                    ));
+                    return;
+                }
+                ids.push(parsed_id);
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            let header = build_simplitig_header(&ids);
+            let key = build_simplitig_key(&ids, width);
+            records.lock().push(SimplitigRecord {
+                header,
+                key,
+                seq: seq.to_vec(),
+            });
+        },
+    );
+    if let Some(err) = dump_error.into_inner() {
+        bail!("{err}");
+    }
+    write_partition_records_output(records.into_inner(), output_path, threads, sort_records)
+}
+
+fn write_partition_simplitigs(
+    partition_path: &Path,
+    partition_size_bytes: u64,
+    k: usize,
+    dataset_count: usize,
+    output_path: &Path,
+    threads: usize,
+    sort_records: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+    ggcat_cfg: &PartitionGgcatConfig,
+) -> Result<PartitionCompactionBackend> {
+    if partition_size_bytes >= ggcat_cfg.partition_size_threshold_bytes {
+        write_partition_simplitigs_ggcat(
+            partition_path,
+            k,
+            dataset_count,
+            output_path,
+            threads,
+            sort_records,
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+            ggcat_cfg,
+        )?;
+        Ok(PartitionCompactionBackend::Ggcat)
+    } else {
+        write_partition_simplitigs_native(
+            partition_path,
+            k,
+            dataset_count,
+            output_path,
+            threads,
+            sort_records,
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+        )?;
+        Ok(PartitionCompactionBackend::Native)
+    }
 }
 
 struct SeqRunReader {
@@ -2088,8 +2418,8 @@ struct SeqRunReader {
 
 impl SeqRunReader {
     fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("open sequence run {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("open sequence run {}", path.display()))?;
         Ok(Self {
             reader: BufReader::new(file),
             buf: Vec::new(),
@@ -2256,8 +2586,13 @@ fn chain_and_write_sorted_records(
         encoder
             .finish()
             .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
-        if current_key.is_some() { groups_written += 1; }
-        eprintln!("  stream+write complete: {} color groups written", groups_written);
+        if current_key.is_some() {
+            groups_written += 1;
+        }
+        eprintln!(
+            "  stream+write complete: {} color groups written",
+            groups_written
+        );
         return Ok(());
     }
 
@@ -2330,7 +2665,10 @@ fn chain_and_write_sorted_records(
         .finish()
         .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
 
-    eprintln!("  sort+write complete: {} color groups written", groups_written);
+    eprintln!(
+        "  sort+write complete: {} color groups written",
+        groups_written
+    );
     Ok(())
 }
 
@@ -2371,7 +2709,11 @@ fn flush_group_sorted<W: Write>(
     for (idx, reader) in readers.iter_mut().enumerate() {
         if let Some(seq) = reader.next_seq()? {
             let len = seq.len();
-            heap.push(Reverse(SeqHeapItem { run_idx: idx, len, seq }));
+            heap.push(Reverse(SeqHeapItem {
+                run_idx: idx,
+                len,
+                seq,
+            }));
         }
     }
 
@@ -2386,7 +2728,11 @@ fn flush_group_sorted<W: Write>(
         }
         if let Some(seq) = readers[item.run_idx].next_seq()? {
             let len = seq.len();
-            heap.push(Reverse(SeqHeapItem { run_idx: item.run_idx, len, seq }));
+            heap.push(Reverse(SeqHeapItem {
+                run_idx: item.run_idx,
+                len,
+                seq,
+            }));
         }
     }
 
@@ -2594,7 +2940,13 @@ fn parallel_streaming_merge(
 ) -> Result<()> {
     let threads = threads.max(1);
     if threads <= 1 || partition_paths.len() <= 1 {
-        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k);
+        return kway_merge_sorted_partitions(
+            partition_paths,
+            output_path,
+            threads,
+            dataset_count,
+            k,
+        );
     }
 
     // ZSTD at level -4 (fast mode) is I/O-bound, not CPU-bound — 1 encoder thread
@@ -2605,7 +2957,13 @@ fn parallel_streaming_merge(
     let worker_threads = threads.saturating_sub(encoder_threads).max(1);
     let group_count = worker_threads.min(partition_paths.len()).max(1);
     if group_count <= 1 {
-        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k);
+        return kway_merge_sorted_partitions(
+            partition_paths,
+            output_path,
+            threads,
+            dataset_count,
+            k,
+        );
     }
 
     let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
@@ -2624,12 +2982,7 @@ fn parallel_streaming_merge(
         }));
     }
 
-    let merge_result = merge_sorted_streams_to_output(
-        receivers,
-        output_path,
-        encoder_threads,
-        k,
-    );
+    let merge_result = merge_sorted_streams_to_output(receivers, output_path, encoder_threads, k);
 
     let mut first_worker_err: Option<anyhow::Error> = None;
     for handle in handles {
@@ -2867,7 +3220,8 @@ fn finalize_encoders(encoders: &SharedEncoders) -> Result<()> {
     for pw in encoders.iter() {
         let encoder = pw.encoder.lock().take();
         if let Some(enc) = encoder {
-            let file = enc.finish()
+            let file = enc
+                .finish()
                 .with_context(|| format!("finish partition writer {}", pw.path.display()))?;
             file.sync_all()
                 .with_context(|| format!("sync partition file {}", pw.path.display()))?;
@@ -3001,6 +3355,9 @@ pub fn run_parser(
     let compaction_start = Utc::now();
     let output_simplitigs = output_dir.join("simplitigs.fa.zst");
     let partition_outputs = Arc::new(Mutex::new(Vec::new()));
+    let ggcat_cfg = PartitionGgcatConfig::default();
+    let native_partition_count = Arc::new(AtomicU64::new(0));
+    let ggcat_partition_count = Arc::new(AtomicU64::new(0));
     // Sort partitions largest-first so the biggest ones start early and don't
     // become stragglers at the end of the parallel loop.
     let mut partition_indices: Vec<(usize, u64)> = encoders
@@ -3019,39 +3376,56 @@ pub fn run_parser(
             .build()
             .context("failed to build compaction thread pool")?;
         compaction_pool.install(|| {
-            partition_indices
-                .par_iter()
-                .for_each(|&(idx, _size)| {
-                    let pw = &encoders[idx];
-                    let partition_path = pw.path.clone();
-                    let part_output =
-                        output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
-                    let result = write_partition_simplitigs(
-                        &partition_path,
-                        k,
-                        dataset_count,
-                        &part_output,
-                        1,
-                        !skip_sort,
-                        use_unitigs,
-                        use_matchtigs,
-                        use_eulertigs,
-                    );
-                    match result {
-                        Ok(_) => partition_outputs.lock().push(part_output.clone()),
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to assemble simplitigs for {}: {:#}",
-                                partition_path.display(),
-                                e
-                            );
-                            remove_intermediate_file_best_effort(&part_output);
+            partition_indices.par_iter().for_each(|&(idx, size)| {
+                let pw = &encoders[idx];
+                let partition_path = pw.path.clone();
+                let part_output = output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
+                let result = write_partition_simplitigs(
+                    &partition_path,
+                    size,
+                    k,
+                    dataset_count,
+                    &part_output,
+                    1,
+                    !skip_sort,
+                    use_unitigs,
+                    use_matchtigs,
+                    use_eulertigs,
+                    &ggcat_cfg,
+                );
+                match result {
+                    Ok(backend) => {
+                        match backend {
+                            PartitionCompactionBackend::Native => {
+                                native_partition_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            PartitionCompactionBackend::Ggcat => {
+                                ggcat_partition_count.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
+                        partition_outputs.lock().push(part_output.clone())
                     }
-                    remove_intermediate_file_best_effort(&partition_path);
-                });
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to assemble simplitigs for {}: {:#}",
+                            partition_path.display(),
+                            e
+                        );
+                        remove_intermediate_file_best_effort(&part_output);
+                    }
+                }
+                remove_intermediate_file_best_effort(&partition_path);
+            });
         });
     }
+    println!(
+        "Step 2 backend usage: native={} ggcat={} (ggcat threshold {} bytes)",
+        native_partition_count.load(Ordering::Relaxed).to_formatted_string(&loc),
+        ggcat_partition_count.load(Ordering::Relaxed).to_formatted_string(&loc),
+        ggcat_cfg
+            .partition_size_threshold_bytes
+            .to_formatted_string(&loc)
+    );
     log_checkpoint("Step 2 - simplitig compaction", compaction_start);
     let mut partition_paths = partition_outputs.lock().clone();
     partition_paths.sort();
@@ -3113,6 +3487,7 @@ pub fn run_parser_streaming(
     use_unitigs: bool,
     use_matchtigs: bool,
     use_eulertigs: bool,
+    ggcat_cfg: PartitionGgcatConfig,
 ) -> Result<(
     mpsc::Receiver<SimplitigRecord>,
     thread::JoinHandle<Result<()>>,
@@ -3207,6 +3582,8 @@ pub fn run_parser_streaming(
     println!("Starting per-partition simplitig compaction...");
     let compaction_start = Utc::now();
     let partition_outputs = Arc::new(Mutex::new(Vec::new()));
+    let native_partition_count = Arc::new(AtomicU64::new(0));
+    let ggcat_partition_count = Arc::new(AtomicU64::new(0));
     let mut partition_indices: Vec<(usize, u64)> = encoders
         .iter()
         .enumerate()
@@ -3223,39 +3600,56 @@ pub fn run_parser_streaming(
             .build()
             .context("failed to build compaction thread pool")?;
         compaction_pool.install(|| {
-            partition_indices
-                .par_iter()
-                .for_each(|&(idx, _size)| {
-                    let pw = &encoders[idx];
-                    let partition_path = pw.path.clone();
-                    let part_output =
-                        output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
-                    let result = write_partition_simplitigs(
-                        &partition_path,
-                        k,
-                        dataset_count,
-                        &part_output,
-                        1,
-                        !skip_sort,
-                        use_unitigs,
-                        use_matchtigs,
-                        use_eulertigs,
-                    );
-                    match result {
-                        Ok(_) => partition_outputs.lock().push(part_output.clone()),
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to assemble simplitigs for {}: {:#}",
-                                partition_path.display(),
-                                e
-                            );
-                            remove_intermediate_file_best_effort(&part_output);
+            partition_indices.par_iter().for_each(|&(idx, size)| {
+                let pw = &encoders[idx];
+                let partition_path = pw.path.clone();
+                let part_output = output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
+                let result = write_partition_simplitigs(
+                    &partition_path,
+                    size,
+                    k,
+                    dataset_count,
+                    &part_output,
+                    1,
+                    !skip_sort,
+                    use_unitigs,
+                    use_matchtigs,
+                    use_eulertigs,
+                    &ggcat_cfg,
+                );
+                match result {
+                    Ok(backend) => {
+                        match backend {
+                            PartitionCompactionBackend::Native => {
+                                native_partition_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            PartitionCompactionBackend::Ggcat => {
+                                ggcat_partition_count.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
+                        partition_outputs.lock().push(part_output.clone())
                     }
-                    remove_intermediate_file_best_effort(&partition_path);
-                });
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to assemble simplitigs for {}: {:#}",
+                            partition_path.display(),
+                            e
+                        );
+                        remove_intermediate_file_best_effort(&part_output);
+                    }
+                }
+                remove_intermediate_file_best_effort(&partition_path);
+            });
         });
     }
+    println!(
+        "Step 2 backend usage: native={} ggcat={} (ggcat threshold {} bytes)",
+        native_partition_count.load(Ordering::Relaxed).to_formatted_string(&loc),
+        ggcat_partition_count.load(Ordering::Relaxed).to_formatted_string(&loc),
+        ggcat_cfg
+            .partition_size_threshold_bytes
+            .to_formatted_string(&loc)
+    );
     log_checkpoint("Step 2 - simplitig compaction", compaction_start);
 
     let mut partition_paths = partition_outputs.lock().clone();
