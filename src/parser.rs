@@ -2931,6 +2931,111 @@ fn merge_sorted_streams_to_output(
     )
 }
 
+fn merge_sorted_streams_to_channel(
+    receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>>,
+    sender: mpsc::SyncSender<SimplitigRecord>,
+) -> Result<()> {
+    let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
+
+    let mut streams: Vec<BatchedRecordStream> = receivers
+        .into_iter()
+        .map(|receiver| BatchedRecordStream {
+            receiver,
+            buffer: Vec::new(),
+        })
+        .collect();
+
+    for (idx, stream) in streams.iter_mut().enumerate() {
+        if let Some(record) = stream.next_record() {
+            heap.push(Reverse(HeapItem {
+                run_idx: idx,
+                record,
+            }));
+        }
+    }
+
+    let mut records_sent = 0u64;
+    while let Some(Reverse(item)) = heap.pop() {
+        let stream_idx = item.run_idx;
+        if sender.send(item.record).is_err() {
+            break;
+        }
+        records_sent += 1;
+        if records_sent % 1_000_000 == 0 {
+            eprintln!("  merge: sent {} records so far", records_sent);
+        }
+        if let Some(record) = streams[stream_idx].next_record() {
+            heap.push(Reverse(HeapItem {
+                run_idx: stream_idx,
+                record,
+            }));
+        }
+    }
+    drop(sender);
+    eprintln!("  merge complete: {} records sent", records_sent);
+    Ok(())
+}
+
+fn parallel_merge_to_channel(
+    partition_paths: &[PathBuf],
+    sender: mpsc::SyncSender<SimplitigRecord>,
+    threads: usize,
+    dataset_count: usize,
+) -> Result<()> {
+    let threads = threads.max(1);
+    if threads <= 1 || partition_paths.len() <= 1 {
+        return merge_to_channel(partition_paths, sender, dataset_count, 0);
+    }
+
+    // Keep one coordinator thread for final k-way merge, use remaining workers
+    // to pre-merge partition groups in parallel.
+    let worker_threads = threads.saturating_sub(1).max(1);
+    let group_count = worker_threads.min(partition_paths.len()).max(1);
+    if group_count <= 1 {
+        return merge_to_channel(partition_paths, sender, dataset_count, 0);
+    }
+
+    let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
+    let channel_capacity = 16usize;
+    let width = id_width(dataset_count);
+
+    let mut receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>> = Vec::new();
+    let mut handles = Vec::new();
+
+    for chunk in partition_paths.chunks(chunk_size) {
+        let (tx, rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(channel_capacity);
+        receivers.push(rx);
+        let group: Vec<PathBuf> = chunk.to_vec();
+        handles.push(thread::spawn(move || {
+            merge_partition_group_to_channel(group, tx, width)
+        }));
+    }
+
+    let merge_result = merge_sorted_streams_to_channel(receivers, sender);
+
+    let mut first_worker_err: Option<anyhow::Error> = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_worker_err.is_none() {
+                    first_worker_err = Some(e);
+                }
+            }
+            Err(_) => {
+                if first_worker_err.is_none() {
+                    first_worker_err = Some(anyhow::anyhow!("merge worker thread panicked"));
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_worker_err {
+        return Err(err);
+    }
+    merge_result
+}
+
 fn parallel_streaming_merge(
     partition_paths: &[PathBuf],
     output_path: &Path,
@@ -3668,8 +3773,8 @@ pub fn run_parser_streaming(
         }
 
         if sort_records {
-            // k-way merge sending records to channel
-            merge_to_channel(&partition_paths, record_tx, dataset_count, k)?;
+            // parallel grouped k-way merge sending records to channel
+            parallel_merge_to_channel(&partition_paths, record_tx, threads, dataset_count)?;
         } else {
             // No sorting: just stream records from each partition
             let width = id_width(dataset_count);
