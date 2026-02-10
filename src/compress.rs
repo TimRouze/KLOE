@@ -1,4 +1,3 @@
-
 use core::panic;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
@@ -6,7 +5,6 @@ use std::io::{BufRead, BufReader, BufWriter, Result, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use chrono::Utc;
-
 
 use zstd::Encoder;
 
@@ -70,7 +68,7 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
 /// RETURNS
 /// - Vector of sizes (cursor positions) per input file used to annotate filenames,
 ///   the position of cid list in id to cid file for each id (used later during decompression).
-pub fn sort_by_bucket(output_dir: &String, nb_files: u32, sequence_type: String) -> Vec<usize>{
+pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
     let write_time = Utc::now();
     // PROCESS AND COMPRESS UNITIGS
     println!("Starting writing compressed sequences.");
@@ -91,7 +89,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32, sequence_type: String)
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
     // WRITE FILE ID TO COLOR ID FILE
-    let write_id_cid = match write_id_to_color_id_test(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
+    let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
@@ -120,7 +118,7 @@ fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc:
     };
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
-    let write_id_cid = match write_id_to_color_id_test(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
+    let write_id_cid = match write_id_to_color_id(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
     };
@@ -250,7 +248,7 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
     let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
 
-    let unitigs_file = File::open(output_dir.clone() + &sequence_type + ".fa.zst")?;
+    let unitigs_file = File::open(output_dir.clone() + "simplitigs.fa.zst")?;
     let decoder = zstd::Decoder::new(unitigs_file)?;
     let reader: Box<dyn BufRead> = Box::new(BufReader::new(decoder));
     let fa_reader = bio::io::fasta::Reader::from_bufread(reader);
@@ -262,13 +260,11 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
     let mut prev_bucket_pos: u64 = 0;
     let mut cid = 0_usize;
 
-    let mut has_current_bucket = false;
-    let mut current_header = String::new();
-    let mut current_ids: Vec<usize> = Vec::new();
+    let mut current_ids: Option<Vec<usize>> = None;
     let mut prev_size: usize = 0;
-
-    let mut size_encoder = Encoder::new(Vec::with_capacity(64 * 1024), 4)?;
-    let mut encoded_seq_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut group_sizes_buffer: Vec<u8> = Vec::new();
+    let mut group_encoder: Option<Encoder<&mut Vec<u8>>> = None;
+    let mut buffer_encoded_seq: Vec<Vec<u8>> = Vec::new();
 
     for record_result in fa_reader.records() {
         let record = record_result?;
@@ -297,17 +293,17 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
                 }
                 prev_bucket_pos += (8 + group_sizes_buffer.len()) as u64;
                 pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
-                size_file.write_all(&(encoded_sizes.len() as u64).to_le_bytes())?;
-                size_file.write_all(&encoded_sizes)?;
+                size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
+                size_file.write_all(&group_sizes_buffer)?;
 
-                for &id in &current_ids {
-                    id_to_color_vec[id].push(cid);
+                for id in current {
+                    id_to_color_vec[*id].push(cid);
                 }
                 cid += 1;
                 prev_size = 0;
-
-                encoded_sizes.clear();
-                size_encoder = Encoder::new(encoded_sizes, 4)?;
+                group_sizes_buffer.clear();
+                current_ids = Some(ids);
+                group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 1)?);
             }
         } else {
             current_ids = Some(ids);
@@ -325,7 +321,9 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         }
 
         let delta = size - prev_size;
-        size_encoder.write_all(&delta.to_le_bytes())?;
+        if let Some(ref mut encoder) = group_encoder {
+            encoder.write_all(&delta.to_le_bytes())?;
+        }
         prev_size = size;
     }
 
@@ -342,10 +340,10 @@ fn write_compressed(unitigs_file_path: String, output_dir: &String, nb_files: u3
         }
         prev_bucket_pos += (8 + group_sizes_buffer.len()) as u64;
         pos_nb_unitig.push((prev_tigs_size, prev_bucket_pos));
-        size_file.write_all(&(encoded_sizes.len() as u64).to_le_bytes())?;
-        size_file.write_all(&encoded_sizes)?;
+        size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
+        size_file.write_all(&group_sizes_buffer)?;
 
-        for &id in &current_ids {
+        for id in current {
             id_to_color_vec[id].push(cid);
         }
     }
@@ -383,7 +381,7 @@ fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<
 }
 
 
-fn write_id_to_color_id_test(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>, cursor_positions: Vec<usize>) -> std::io::Result<Vec<usize>>{
+fn write_id_to_color_id(cid_file_path: String, id_to_color_vec: Vec<Vec<usize>>, cursor_positions: Vec<usize>) -> std::io::Result<Vec<usize>>{
     let mut cid_file = BufWriter::new(File::create(&cid_file_path)?);
     let mut id_cid_line_sizes = Vec::with_capacity(id_to_color_vec.len());
     let mut tot_size = 0;
@@ -396,7 +394,7 @@ fn write_id_to_color_id_test(cid_file_path: String, id_to_color_vec: Vec<Vec<usi
             if i > 0 {
                 to_write.push(',');
             }
-            to_write.push_str(&pos.to_string());
+            write!(&mut to_write, "{}", pos).unwrap();
         }
 
         let mut buffer = Vec::new();

@@ -297,55 +297,6 @@ fn id_width(dataset_count: usize) -> usize {
     width
 }
 
-fn ids_match(a: &[u64], b: &[u64]) -> bool {
-    a.is_empty() || b.is_empty() || a == b
-}
-
-fn matchtig_threading(available: usize) -> (usize, usize) {
-    let available = available.max(1);
-    (available, 1)
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Parse FASTA files into superkmers grouped by minimizer"
-)]
-struct Args {
-    #[arg(short = 'i', long = "input-fof")]
-    input_fof: PathBuf,
-    #[arg(short = 'o', long = "output-dir")]
-    output_dir: PathBuf,
-    #[arg(short = 'k', long = "kmer", default_value_t = 31)]
-    k: usize,
-    #[arg(short = 'm', long = "minimizer", default_value_t = 9)]
-    m: usize,
-    /// Number of partitions is 2^partition_power (default 1024 partitions)
-    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
-    partition_power: u32,
-    #[arg(short = 't', long = "threads", default_value_t = 32)]
-    threads: usize,
-    /// Concurrency for the compaction phase (per-partition simplitigs)
-    #[arg(long = "compaction-threads", default_value_t = num_cpus::get())]
-    compaction_threads: usize,
-    /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
-    #[arg(long = "verify-kmers", default_value_t = false)]
-    verify_kmers: bool,
-    /// Output greedy matchtigs instead of simplitigs
-    #[arg(long = "matchtig", default_value_t = false)]
-    matchtig: bool,
-    /// Output eulertigs instead of simplitigs
-    #[arg(long = "eulertig", default_value_t = false)]
-    eulertig: bool,
-    /// Output unitigs (maximal non-branching paths) instead of simplitigs
-    #[arg(long = "unitig", default_value_t = false)]
-    unitig: bool,
-    /// Skip sorting within partitions and during final merge (output will not be globally sorted)
-    #[arg(long = "skip-sort", default_value_t = false)]
-    skip_sort: bool,
-}
-
 fn ensure_nofile_limit(required: u64) -> Result<()> {
     let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
     if soft >= required {
@@ -1833,10 +1784,9 @@ fn process_file(
     file_id: usize,
     encoders: &SharedEncoders,
     k: usize,
-    m: usize,
+    _m: usize,
     window_kmers: usize,
-    _partitions: u64,
-    partition_mask: u64,
+    partitions: u64,
     stats: &Arc<Stats>,
     dataset_count: usize,
 ) -> Result<()> {
@@ -1872,8 +1822,9 @@ fn process_file(
         let effective_window = window_kmers.min(kmers_in_seq).max(1);
         let minimizer_values: Vec<u64> = simd_minimizers::minimizers(k, effective_window)
             .super_kmers(&mut superkmer_starts)
-            .run(packed_slice, &mut minimizer_positions);
-        minimizer_values.extend(output.values_u64());
+            .run(packed_slice, &mut minimizer_positions)
+            .values_u64()
+            .collect();
         if superkmer_starts.is_empty() {
             continue;
         }
@@ -1896,8 +1847,7 @@ fn process_file(
             }
 
             let superkmer_slice = &seq[start..end];
-            let partition_id =
-                (min_val.wrapping_mul(PARTITION_HASH_MUL) & partition_mask) as usize;
+            let partition_id = (min_val.wrapping_mul(0x9e3779b97f4a7c15) % partitions) as usize;
             let buffer = local_buffers
                 .entry(partition_id)
                 .or_insert_with(|| Vec::with_capacity(BUFFER_TARGET));
@@ -2455,9 +2405,6 @@ fn merge_sorted_partitions(
     sort_records: bool,
     dataset_count: usize,
     k: usize,
-    use_unitigs: bool,
-    use_matchtigs: bool,
-    use_eulertigs: bool,
 ) -> Result<()> {
     if !sort_records {
         concatenate_zstd_frames(partition_paths, output_path, threads)?;
@@ -2469,28 +2416,10 @@ fn merge_sorted_partitions(
     // streams (far fewer inputs) while writing the final output.
     let threads = threads.max(1);
     if threads > 1 && partition_paths.len() > 8 {
-        return parallel_streaming_merge(
-            partition_paths,
-            output_path,
-            threads,
-            dataset_count,
-            k,
-            use_unitigs,
-            use_matchtigs,
-            use_eulertigs,
-        );
+        return parallel_streaming_merge(partition_paths, output_path, threads, dataset_count, k);
     }
 
-    kway_merge_sorted_partitions(
-        partition_paths,
-        output_path,
-        threads,
-        dataset_count,
-        k,
-        use_unitigs,
-        use_matchtigs,
-        use_eulertigs,
-    )
+    kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k)
 }
 
 fn kway_merge_sorted_partitions(
@@ -2499,9 +2428,6 @@ fn kway_merge_sorted_partitions(
     threads: usize,
     dataset_count: usize,
     k: usize,
-    use_unitigs: bool,
-    use_matchtigs: bool,
-    use_eulertigs: bool,
 ) -> Result<()> {
     let width = id_width(dataset_count);
     let mut readers: Vec<PartitionReader> = Vec::new();
@@ -2665,22 +2591,10 @@ fn parallel_streaming_merge(
     threads: usize,
     dataset_count: usize,
     k: usize,
-    use_unitigs: bool,
-    use_matchtigs: bool,
-    use_eulertigs: bool,
 ) -> Result<()> {
     let threads = threads.max(1);
     if threads <= 1 || partition_paths.len() <= 1 {
-        return kway_merge_sorted_partitions(
-            partition_paths,
-            output_path,
-            threads,
-            dataset_count,
-            k,
-            use_unitigs,
-            use_matchtigs,
-            use_eulertigs,
-        );
+        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k);
     }
 
     // ZSTD at level -4 (fast mode) is I/O-bound, not CPU-bound — 1 encoder thread
@@ -2691,16 +2605,7 @@ fn parallel_streaming_merge(
     let worker_threads = threads.saturating_sub(encoder_threads).max(1);
     let group_count = worker_threads.min(partition_paths.len()).max(1);
     if group_count <= 1 {
-        return kway_merge_sorted_partitions(
-            partition_paths,
-            output_path,
-            threads,
-            dataset_count,
-            k,
-            use_unitigs,
-            use_matchtigs,
-            use_eulertigs,
-        );
+        return kway_merge_sorted_partitions(partition_paths, output_path, threads, dataset_count, k);
     }
 
     let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
@@ -2719,11 +2624,6 @@ fn parallel_streaming_merge(
         }));
     }
 
-    let (assembly_threads, matchtig_threads) = if use_matchtigs {
-        matchtig_threading(worker_threads)
-    } else {
-        (worker_threads.max(1), 1usize)
-    };
     let merge_result = merge_sorted_streams_to_output(
         receivers,
         output_path,
@@ -2931,9 +2831,6 @@ fn parallel_merge_sorted_partitions(
     sort_records: bool,
     dataset_count: usize,
     k: usize,
-    use_unitigs: bool,
-    use_matchtigs: bool,
-    use_eulertigs: bool,
 ) -> Result<()> {
     if partition_paths.is_empty() {
         let encoder = zstd_encoder_mt(output_path, ZSTD_LEVEL_FAST, threads)?;
@@ -2963,9 +2860,6 @@ fn parallel_merge_sorted_partitions(
         sort_records,
         dataset_count,
         k,
-        use_unitigs,
-        use_matchtigs,
-        use_eulertigs,
     )
 }
 
@@ -3016,28 +2910,13 @@ pub fn run_parser(
     if k < m {
         bail!("k-mer length ({}) must be >= minimizer length ({})", k, m);
     }
-    if matchtig && skip_sort {
-        bail!("--matchtig requires sorting enabled (do not use --skip-sort)");
-    }
-    if eulertig && skip_sort {
-        bail!("--eulertig requires sorting enabled (do not use --skip-sort)");
-    }
-    if unitig && skip_sort {
-        bail!("--unitig requires sorting enabled (do not use --skip-sort)");
-    }
-    let mode_count = matchtig as u8 + unitig as u8 + eulertig as u8;
-    if mode_count > 1 {
-        bail!("--matchtig, --eulertig and --unitig are mutually exclusive");
-    }
     let overall_start = Utc::now();
     let partitions = 1u64
         .checked_shl(partition_power)
         .context("partition power too large")?;
-    let partition_mask = partitions - 1;
     let window = k
         .checked_sub(m)
-        .and_then(|v| v.checked_add(1))
-        .context("failed to compute window size; ensure k >= m")?;
+        .context("failed to compute window size; ensure k > m")?;
     let required_limit = partitions + 64;
 
     ensure_nofile_limit(required_limit)?;
@@ -3060,26 +2939,24 @@ pub fn run_parser(
     let pool = ThreadPool::new(threads);
     for (idx, file_path) in file_paths.iter().enumerate() {
         let encoders = Arc::clone(&encoders);
-            let partitions = partitions;
-            let partition_mask = partition_mask;
-            let k = k;
-            let m = m;
-            let stats = Arc::clone(&stats);
-            let dataset_count = dataset_count;
-            let file_path = file_path.clone();
-            pool.execute(move || {
-                if let Err(err) = process_file(
-                    &file_path,
-                    idx + 1,
-                    &encoders,
-                    k,
-                    m,
-                    window,
-                    partitions,
-                    partition_mask,
-                    &stats,
-                    dataset_count,
-                ) {
+        let partitions = partitions;
+        let k = k;
+        let m = m;
+        let stats = Arc::clone(&stats);
+        let dataset_count = dataset_count;
+        let file_path = file_path.clone();
+        pool.execute(move || {
+            if let Err(err) = process_file(
+                &file_path,
+                idx + 1,
+                &encoders,
+                k,
+                m,
+                window,
+                partitions,
+                &stats,
+                dataset_count,
+            ) {
                 eprintln!("Failed to process {}: {err}", file_path.display());
             }
         });
@@ -3122,15 +2999,7 @@ pub fn run_parser(
     // reusing HashMap/arena allocations across partitions.
     println!("Starting per-partition simplitig compaction...");
     let compaction_start = Utc::now();
-    let output_sequences = if matchtig {
-        output_dir.join("matchtigs.fa.zst")
-    } else if eulertig {
-        output_dir.join("eulertigs.fa.zst")
-    } else if unitig {
-        output_dir.join("unitigs.fa.zst")
-    } else {
-        output_dir.join("simplitigs.fa.zst")
-    };
+    let output_simplitigs = output_dir.join("simplitigs.fa.zst");
     let partition_outputs = Arc::new(Mutex::new(Vec::new()));
     // Sort partitions largest-first so the biggest ones start early and don't
     // become stragglers at the end of the parallel loop.
@@ -3194,30 +3063,16 @@ pub fn run_parser(
         !skip_sort,
         dataset_count,
         k,
-        unitig,
-        matchtig,
-        eulertig,
     );
     for path in &partition_paths {
         remove_intermediate_file_best_effort(path);
     }
     merge_result?;
-    log_checkpoint(
-        if matchtig {
-            "Step 3 - matchtig merge/sort"
-        } else if eulertig {
-            "Step 3 - eulertig merge/sort"
-        } else if unitig {
-            "Step 3 - unitig merge/sort"
-        } else {
-            "Step 3 - simplitig merge/sort"
-        },
-        merge_start,
-    );
+    log_checkpoint("Step 3 - simplitig merge/sort", merge_start);
 
     if verify_kmers {
         println!("Verifying k-mer preservation...");
-        let output_map = build_output_kmer_map(&output_sequences, k, dataset_count)?;
+        let output_map = build_output_kmer_map(&output_simplitigs, k, dataset_count)?;
         let input_map = build_kmer_map_from_inputs(&file_paths, k)?;
         verify_kmer_maps(&input_map, &output_map, k)?;
         println!(
@@ -3229,17 +3084,8 @@ pub fn run_parser(
     }
 
     println!(
-        "{} compaction complete. Output: {}",
-        if matchtig {
-            "Matchtig"
-        } else if eulertig {
-            "Eulertig"
-        } else if unitig {
-            "Unitig"
-        } else {
-            "Simplitig"
-        },
-        output_sequences.display()
+        "Simplitig compaction complete. Output: {}",
+        output_simplitigs.display()
     );
     println!(
         "Total wall time: {}",

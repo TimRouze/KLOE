@@ -1,7 +1,7 @@
 mod utils;
+mod compress;
 mod decompress;
 mod parser;
-mod utils;
 use clap::Parser;
 use std::path::Path;
 
@@ -105,51 +105,6 @@ fn main() {
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
         }
     }else {
-        //parser::run_parser(PathBuf::from(input_fof), PathBuf::from(output_dir), k, m, 10_u32, threads, compaction_threads, false, false);
-
-        let mut input_fof_reader =
-            BufReader::new(File::open(input_fof).expect("unable to open fof"));
-        let mut filename = String::new();
-        let mut filenames = Vec::new();
-        while input_fof_reader.read_line(&mut filename).unwrap() != 0 {
-            filename.pop();
-            filenames.push(filename.clone());
-            filename.clear();
-        }
-        let mut sequence_type;
-        if args.unitigs {
-            sequence_type = String::from("unitigs");
-        } else if args.matchtigs {
-            sequence_type = String::from("matchtigs");
-        } else if args.eulertigs {
-            sequence_type = String::from("eulertigs");
-        } else {
-            sequence_type = String::from("simplitigs");
-        }
-        let id_cid_line_sizes = compress::sort_by_bucket(&output_dir, 256, sequence_type);
-        let mut fof_id = BufWriter::new(
-            File::create(output_dir.clone() + "filenames_id.txt")
-                .expect("Failed to create fof file"),
-        );
-        let mut file_cpt: usize = 0;
-        for filename in filenames {
-            println!("a{}a", filename);
-            fof_id
-                .write_all(
-                    (filename
-                        + ":"
-                        + id_cid_line_sizes
-                            .get(file_cpt)
-                            .unwrap()
-                            .to_string()
-                            .as_str()
-                        + "\n")
-                        .as_bytes(),
-                )
-                .unwrap();
-            file_cpt += 1;
-        }
-
         println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
@@ -311,28 +266,35 @@ mod tests {
         ]
     }
 
-    fn write_records_archive(
-        archive_dir: &Path,
-        mode: &str,
-        records: &[(String, String)],
-        nb_files: u32,
-    ) -> Vec<usize> {
-        let mut encoder = zstd::Encoder::new(
-            File::create(mode_archive_path(archive_dir, mode)).expect("create mode archive"),
-            1,
-        )
-        .expect("create zstd encoder");
-        let mut payload = String::new();
-        for (ids, seq) in records {
-            payload.push_str(&format!(">ids:{ids}\n{seq}\n"));
+    fn run_compression(
+        input_files: &[PathBuf],
+        output_dir: &Path,
+        k: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Create a file-of-files list
+        let fof_path = output_dir.join("input.fof");
+        let mut fof = File::create(&fof_path)?;
+        for file in input_files {
+            writeln!(fof, "{}", file.display())?;
         }
-        encoder
-            .write_all(payload.as_bytes())
-            .expect("write compressed records payload");
-        encoder.finish().expect("finalize zstd stream");
+        drop(fof);
 
-        let archive_dir_s = format!("{}/", archive_dir.display());
-        compress::sort_by_bucket(&archive_dir_s, nb_files, mode.to_string())
+        // Run the streaming compression
+        let output_dir_str = output_dir.display().to_string() + "/";
+        compress::compress(
+            &output_dir_str,
+            &fof_path.display().to_string(),
+            1, // threads
+            k,
+            7, // minimizer size
+            10, // partition power
+            false, // verify_kmers
+            false, // skip_sort
+            false, // use_unitigs
+            false, // use_matchtigs
+            false, // use_eulertigs
+        )?;
+        Ok(())
     }
 
     fn write_filenames_id(path: &Path, files: &[PathBuf], offsets: &[usize]) {
@@ -398,13 +360,9 @@ mod tests {
         write_fasta(&file2, &exp2_refs);
         write_fasta(&file3, &exp3_refs);
 
-        let offsets = write_records_archive(&archive_dir, mode, &records, 3);
-        assert_eq!(offsets.len(), 3, "expected three file-id offsets");
-        write_filenames_id(
-            &archive_dir.join("filenames_id.txt"),
-            &[file1.clone(), file2.clone(), file3.clone()],
-            &offsets,
-        );
+        // Run streaming compression instead of write_records_archive
+        run_compression(&[file1.clone(), file2.clone(), file3.clone()], &archive_dir, K)
+            .expect("compression failed");
 
         MultiFixture {
             _workdir: workdir,
@@ -470,18 +428,17 @@ mod tests {
 
         let mut source_files = Vec::with_capacity(n_files);
         let mut expected_seqs = Vec::with_capacity(n_files);
-        let mut records = Vec::with_capacity(n_files);
         for i in 0..n_files {
             let source = workdir.path().join(format!("sample_{i:05}.fa"));
-            source_files.push(source);
             let seq = generate_len100_sequence(i);
             expected_seqs.push(seq.clone());
-            records.push((format!("{}", i + 1), seq));
+            write_fasta(&source, &[seq.as_str()]);
+            source_files.push(source);
         }
 
-        let offsets = write_records_archive(&archive_dir, mode, &records, n_files as u32);
-        assert_eq!(offsets.len(), n_files, "expected one offset per file");
-        write_filenames_id(&archive_dir.join("filenames_id.txt"), &source_files, &offsets);
+        // Run streaming compression (mode parameter is unused but kept for test consistency)
+        run_compression(&source_files, &archive_dir, K)
+            .expect("compression failed");
 
         let dump_full: Vec<PathBuf> = source_files
             .iter()
@@ -559,20 +516,9 @@ mod tests {
         write_fasta(&case_file, &case_refs);
         write_fasta(&control_file, &control_refs);
 
-        let mut records: Vec<(String, String)> = Vec::new();
-        for seq in case_seqs {
-            records.push(("1".to_string(), seq.clone()));
-        }
-        for seq in control_seqs {
-            records.push(("2".to_string(), seq.clone()));
-        }
-        let offsets = write_records_archive(&archive_dir, mode, &records, 2);
-        assert_eq!(offsets.len(), 2, "expected two file-id offsets");
-        write_filenames_id(
-            &archive_dir.join("filenames_id.txt"),
-            &[case_file.clone(), control_file.clone()],
-            &offsets,
-        );
+        // Run streaming compression instead of write_records_archive
+        run_compression(&[case_file.clone(), control_file.clone()], &archive_dir, K)
+            .expect("compression failed");
 
         TwoFileCaseFixture {
             _workdir: workdir,
