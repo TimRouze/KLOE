@@ -12,7 +12,7 @@ use zstd::Encoder;
 use crate::utils::{Converter, Convert};
 use crate::parser;
 
-pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, verify_kmers: bool, skip_sort: bool, use_unitigs: bool, use_matchtigs: bool, use_eulertigs: bool) -> Result<()>{
+pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usize, m: usize, partition_power: u32, verify_kmers: bool, skip_sort: bool, use_unitigs: bool, use_matchtigs: bool, use_eulertigs: bool, only_step1: bool, only_step2: bool, only_step3: bool) -> Result<()>{
     let _overall_start = Utc::now();
 
     // Start parser in streaming mode: Steps 1+2 run synchronously,
@@ -22,7 +22,13 @@ pub fn compress(output_dir: &String, input_fof: &String, threads: usize, k: usiz
         PathBuf::from(output_dir),
         k, m, partition_power, threads, verify_kmers, skip_sort,
         use_unitigs, use_matchtigs, use_eulertigs,
+        only_step1, only_step2, only_step3,
     ).expect("run_parser_streaming failed");
+
+    if only_step1 {
+        // Step 1 only — partition files are on disk, nothing more to do.
+        return Ok(());
+    }
 
     println!("Simplitigs created, processing sequences (streaming)");
     let mut input_fof_reader = BufReader::new(File::open(input_fof).expect("unable to open fof"));
@@ -130,6 +136,7 @@ fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc:
 
 /// Consume sorted SimplitigRecords from a channel and compress them.
 /// Same logic as write_compressed but reads from mpsc::Receiver instead of FASTA file.
+/// Uses bitset-based group detection (u64 compare) instead of header string parsing.
 fn write_compressed_from_stream(
     unitigs_file_path: String,
     output_dir: &String,
@@ -146,30 +153,31 @@ fn write_compressed_from_stream(
     let mut prev_bucket_pos: u64 = 0;
     let mut cid = 0_usize;
 
-    let mut current_ids: Option<Vec<usize>> = None;
+    let mut current_bitset: u64 = u64::MAX; // sentinel: no group yet
+    let mut current_words: Vec<u64> = Vec::new();
+    let mut has_group = false;
     let mut prev_size: usize = 0;
     let mut group_sizes_buffer: Vec<u8> = Vec::new();
     let mut group_encoder: Option<Encoder<&mut Vec<u8>>> = None;
     let mut buffer_encoded_seq: Vec<Vec<u8>> = Vec::new();
 
     for record in record_rx {
-        // Parse IDs from header (format: ">ids:1,3,5")
-        let header_str = std::str::from_utf8(&record.header).unwrap_or("");
-        let ids_str = header_str.strip_prefix(">ids:").unwrap_or(
-            header_str.strip_prefix("ids:").unwrap_or("")
-        );
-        let ids: Vec<usize> = ids_str
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<usize>().unwrap() - 1)
-            .collect();
-
         let seq = &record.seq;
         let encoded_seq = <Converter as Convert<&[u8]>>::str2num(seq);
         let size = seq.len();
 
-        if let Some(ref current) = current_ids {
-            if &ids != current {
+        // Detect group change via bitset comparison (u64 for ≤64 datasets)
+        let group_changed = if !has_group {
+            true
+        } else if record.ids_words.is_empty() && current_words.is_empty() {
+            record.ids_bitset != current_bitset
+        } else {
+            record.ids_bitset != current_bitset || record.ids_words != current_words
+        };
+
+        if group_changed {
+            if has_group {
+                // Flush previous group
                 for elem in &buffer_encoded_seq {
                     omni_file.write_all(elem)?;
                     prev_tigs_size += elem.len() as u64;
@@ -184,18 +192,34 @@ fn write_compressed_from_stream(
                 size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
                 size_file.write_all(&group_sizes_buffer)?;
 
-                for id in current {
-                    id_to_color_vec[*id].push(cid);
+                // Iterate bits directly into id_to_color_vec (no intermediate Vec)
+                if current_words.is_empty() {
+                    let mut word = current_bitset;
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as usize;
+                        id_to_color_vec[bit].push(cid);
+                        word &= word - 1;
+                    }
+                } else {
+                    for (word_idx, &word) in current_words.iter().enumerate() {
+                        let mut w = word;
+                        while w != 0 {
+                            let bit = w.trailing_zeros() as usize;
+                            id_to_color_vec[word_idx * 64 + bit].push(cid);
+                            w &= w - 1;
+                        }
+                    }
                 }
                 cid += 1;
                 prev_size = 0;
                 group_sizes_buffer.clear();
-                current_ids = Some(ids);
                 group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 1)?);
+            } else {
+                group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 4)?);
             }
-        } else {
-            current_ids = Some(ids);
-            group_encoder = Some(Encoder::new(&mut group_sizes_buffer, 4)?);
+            current_bitset = record.ids_bitset;
+            current_words = record.ids_words.clone();
+            has_group = true;
         }
 
         buffer_encoded_seq.push(encoded_seq);
@@ -215,7 +239,7 @@ fn write_compressed_from_stream(
         prev_size = size;
     }
 
-    if let Some(current) = current_ids {
+    if has_group {
         for elem in &buffer_encoded_seq{
             omni_file.write_all(elem)?;
             prev_tigs_size += elem.len() as u64;
@@ -230,8 +254,23 @@ fn write_compressed_from_stream(
         size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
         size_file.write_all(&group_sizes_buffer)?;
 
-        for id in current {
-            id_to_color_vec[id].push(cid);
+        // Final group: iterate bits into id_to_color_vec
+        if current_words.is_empty() {
+            let mut word = current_bitset;
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                id_to_color_vec[bit].push(cid);
+                word &= word - 1;
+            }
+        } else {
+            for (word_idx, &word) in current_words.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    id_to_color_vec[word_idx * 64 + bit].push(cid);
+                    w &= w - 1;
+                }
+            }
         }
     }
 

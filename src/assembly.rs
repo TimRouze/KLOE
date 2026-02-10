@@ -25,7 +25,7 @@ use traitgraph_algo::dijkstra::DijkstraWeightedEdgeData;
 // KmerEntry: compact k-mer entry packed into 8 bytes
 // ---------------------------------------------------------------------------
 
-/// Compact k-mer entry packed into 8 bytes (was 12).
+/// Compact k-mer entry.
 ///
 /// Layout of `flags: u32`:
 ///   bits 0-1:  successor base (0-3)
@@ -39,6 +39,8 @@ use traitgraph_algo::dijkstra::DijkstraWeightedEdgeData;
 pub(crate) struct KmerEntry {
     pub(crate) ids_offset: u32,
     flags: u32,
+    /// Inline color bitset for ≤64 datasets (words==1). Avoids arena indirection.
+    pub(crate) ids_word: u64,
 }
 
 impl KmerEntry {
@@ -56,6 +58,7 @@ impl KmerEntry {
         Self {
             ids_offset,
             flags: 0,
+            ids_word: 0,
         }
     }
 
@@ -216,6 +219,215 @@ pub(crate) fn assemble_simplitigs_bidirected(
     k: usize,
     mut sink: impl FnMut(Vec<u8>, &[u64]) -> Result<()>,
 ) -> Result<()> {
+    if words == 1 {
+        assemble_simplitigs_bidirected_inline(kmer_map, k, &mut sink)
+    } else {
+        assemble_simplitigs_bidirected_arena(kmer_map, arena, words, k, &mut sink)
+    }
+}
+
+/// Fast path for ≤64 datasets: color IDs stored inline in KmerEntry::ids_word.
+/// No arena indirection — single cache domain per extension step.
+fn assemble_simplitigs_bidirected_inline(
+    kmer_map: &mut HashMap<u64, KmerEntry>,
+    k: usize,
+    sink: &mut impl FnMut(Vec<u8>, &[u64]) -> Result<()>,
+) -> Result<()> {
+    let mask: u64 = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+    let rc_high_shift = 2 * (k - 1);
+
+    let keys: Vec<u64> = kmer_map.keys().copied().collect();
+    let mut ids_buf = [0u64; 1];
+
+    for &seed_key in &keys {
+        let seed = kmer_map.get_mut(&seed_key).unwrap();
+        if seed.visited() {
+            continue;
+        }
+        seed.set_visited();
+        let seed_ids_word = seed.ids_word;
+        let seed_succ = seed.successor();
+        let seed_pred = seed.predecessor();
+        let seed_succ_ambig = seed.succ_ambig();
+        let seed_pred_ambig = seed.pred_ambig();
+
+        let seed_rev = revcomp_bits(seed_key, k);
+        let mut start_bits = seed_key;
+        if seed_rev != seed_key && seed_succ.is_none() && seed_pred.is_none() {
+            start_bits = seed_rev;
+        }
+
+        let mut seq_bits = start_bits;
+        let mut rv_bits = if start_bits == seed_key {
+            seed_rev
+        } else {
+            seed_key
+        };
+        let mut seq = decode_kmer(seq_bits, k);
+
+        let is_fwd = seq_bits <= rv_bits;
+        let mut cur_right_hint: Option<u8> = if is_fwd {
+            seed_succ.filter(|_| !seed_succ_ambig)
+        } else {
+            seed_pred.map(complement_bits).filter(|_| !seed_pred_ambig)
+        };
+
+        // Extend right
+        loop {
+            let mut found = false;
+
+            if let Some(hint_base) = cur_right_hint {
+                let nb = ((seq_bits << 2) & mask) | hint_base as u64;
+                let nr = (rv_bits >> 2) | ((complement_bits(hint_base) as u64) << rc_high_shift);
+                let nc = if nb <= nr { nb } else { nr };
+                if let Some(ent) = kmer_map.get_mut(&nc) {
+                    if !ent.visited() && ent.ids_word == seed_ids_word {
+                        ent.set_visited();
+                        seq.push(bits_to_base(hint_base));
+                        let nf = nb == nc;
+                        cur_right_hint = if nf {
+                            ent.successor().filter(|_| !ent.succ_ambig())
+                        } else {
+                            ent.predecessor().map(complement_bits).filter(|_| !ent.pred_ambig())
+                        };
+                        seq_bits = nb;
+                        rv_bits = nr;
+                        found = true;
+                    }
+                }
+            }
+
+            if !found {
+                let mut fallback_found = false;
+                for base in 0u8..4u8 {
+                    let nb = ((seq_bits << 2) & mask) | base as u64;
+                    let nr =
+                        (rv_bits >> 2) | ((complement_bits(base) as u64) << rc_high_shift);
+                    let nc = if nb <= nr { nb } else { nr };
+                    if let Some(ent) = kmer_map.get_mut(&nc) {
+                        if !ent.visited() && ent.ids_word == seed_ids_word {
+                            ent.set_visited();
+                            seq.push(bits_to_base(base));
+                            let nf = nb == nc;
+                            cur_right_hint = if nf {
+                                ent.successor().filter(|_| !ent.succ_ambig())
+                            } else {
+                                ent.predecessor()
+                                    .map(complement_bits)
+                                    .filter(|_| !ent.pred_ambig())
+                            };
+                            seq_bits = nb;
+                            rv_bits = nr;
+                            fallback_found = true;
+                            break;
+                        }
+                    }
+                }
+                if !fallback_found {
+                    break;
+                }
+            }
+        }
+
+        // Extend left
+        let mut left_bits = start_bits;
+        let mut left_rev = if start_bits == seed_key {
+            seed_rev
+        } else {
+            seed_key
+        };
+        let left_is_fwd = left_bits <= left_rev;
+        let mut cur_left_hint: Option<u8> = if left_is_fwd {
+            seed_pred.filter(|_| !seed_pred_ambig)
+        } else {
+            seed_succ.map(complement_bits).filter(|_| !seed_succ_ambig)
+        };
+        let mut prefix: Vec<u8> = Vec::new();
+
+        loop {
+            let mut found = false;
+
+            if let Some(hint_base) = cur_left_hint {
+                let pb =
+                    (((hint_base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
+                let pr = ((left_rev << 2) | complement_bits(hint_base) as u64) & mask;
+                let pc = if pb <= pr { pb } else { pr };
+                if let Some(ent) = kmer_map.get_mut(&pc) {
+                    if !ent.visited() && ent.ids_word == seed_ids_word {
+                        ent.set_visited();
+                        prefix.push(bits_to_base(hint_base));
+                        let pf = pb == pc;
+                        cur_left_hint = if pf {
+                            ent.predecessor().filter(|_| !ent.pred_ambig())
+                        } else {
+                            ent.successor().map(complement_bits).filter(|_| !ent.succ_ambig())
+                        };
+                        left_bits = pb;
+                        left_rev = pr;
+                        found = true;
+                    }
+                }
+            }
+
+            if !found {
+                let mut fallback_found = false;
+                for base in 0u8..4u8 {
+                    let pb =
+                        (((base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
+                    let pr = ((left_rev << 2) | complement_bits(base) as u64) & mask;
+                    let pc = if pb <= pr { pb } else { pr };
+                    if let Some(ent) = kmer_map.get_mut(&pc) {
+                        if !ent.visited() && ent.ids_word == seed_ids_word {
+                            ent.set_visited();
+                            prefix.push(bits_to_base(base));
+                            let pf = pb == pc;
+                            cur_left_hint = if pf {
+                                ent.predecessor().filter(|_| !ent.pred_ambig())
+                            } else {
+                                ent.successor()
+                                    .map(complement_bits)
+                                    .filter(|_| !ent.succ_ambig())
+                            };
+                            left_bits = pb;
+                            left_rev = pr;
+                            fallback_found = true;
+                            break;
+                        }
+                    }
+                }
+                if !fallback_found {
+                    break;
+                }
+            }
+        }
+
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + seq.len());
+            for b in prefix.into_iter().rev() {
+                full.push(b);
+            }
+            full.extend(seq);
+            seq = full;
+        }
+
+        ids_buf[0] = seed_ids_word;
+        sink(seq, &ids_buf)?;
+    }
+    Ok(())
+}
+
+/// General path for >64 datasets: color IDs stored in arena.
+fn assemble_simplitigs_bidirected_arena(
+    kmer_map: &mut HashMap<u64, KmerEntry>,
+    arena: &[u64],
+    words: usize,
+    k: usize,
+    sink: &mut impl FnMut(Vec<u8>, &[u64]) -> Result<()>,
+) -> Result<()> {
     let mask: u64 = if k == 32 {
         u64::MAX
     } else {
@@ -226,7 +438,6 @@ pub(crate) fn assemble_simplitigs_bidirected(
     let keys: Vec<u64> = kmer_map.keys().copied().collect();
 
     for &seed_key in &keys {
-        // Single get_mut for seed: check visited + mark + capture fields
         let seed = kmer_map.get_mut(&seed_key).unwrap();
         if seed.visited() {
             continue;
@@ -239,14 +450,12 @@ pub(crate) fn assemble_simplitigs_bidirected(
         let seed_pred_ambig = seed.pred_ambig();
         let ids_slice = entry_ids_by_offset(seed_ids_offset, arena, words);
 
-        // Orientation selection via successor/predecessor hints (0 lookups)
         let seed_rev = revcomp_bits(seed_key, k);
         let mut start_bits = seed_key;
         if seed_rev != seed_key && seed_succ.is_none() && seed_pred.is_none() {
             start_bits = seed_rev;
         }
 
-        // Initialize forward and reverse complement bits for incremental tracking
         let mut seq_bits = start_bits;
         let mut rv_bits = if start_bits == seed_key {
             seed_rev
@@ -255,7 +464,6 @@ pub(crate) fn assemble_simplitigs_bidirected(
         };
         let mut seq = decode_kmer(seq_bits, k);
 
-        // Determine walking direction relative to canonical form for hint usage
         let is_fwd = seq_bits <= rv_bits;
         let mut cur_right_hint: Option<u8> = if is_fwd {
             seed_succ.filter(|_| !seed_succ_ambig)
@@ -263,11 +471,10 @@ pub(crate) fn assemble_simplitigs_bidirected(
             seed_pred.map(complement_bits).filter(|_| !seed_pred_ambig)
         };
 
-        // Extend right with incremental revcomp + hint-guided extension
+        // Extend right
         loop {
             let mut found = false;
 
-            // Try hinted base first (avoids blind 4-base search ~80-90% of time)
             if let Some(hint_base) = cur_right_hint {
                 let nb = ((seq_bits << 2) & mask) | hint_base as u64;
                 let nr = (rv_bits >> 2) | ((complement_bits(hint_base) as u64) << rc_high_shift);
@@ -289,7 +496,6 @@ pub(crate) fn assemble_simplitigs_bidirected(
                 }
             }
 
-            // Fallback: blind 4-base search with incremental revcomp
             if !found {
                 let mut fallback_found = false;
                 for base in 0u8..4u8 {
@@ -322,7 +528,7 @@ pub(crate) fn assemble_simplitigs_bidirected(
             }
         }
 
-        // Extend left with incremental revcomp + hint-guided extension
+        // Extend left
         let mut left_bits = start_bits;
         let mut left_rev = if start_bits == seed_key {
             seed_rev
@@ -340,7 +546,6 @@ pub(crate) fn assemble_simplitigs_bidirected(
         loop {
             let mut found = false;
 
-            // Try hinted base first
             if let Some(hint_base) = cur_left_hint {
                 let pb =
                     (((hint_base as u64) << rc_high_shift) | (left_bits >> 2)) & mask;
@@ -363,7 +568,6 @@ pub(crate) fn assemble_simplitigs_bidirected(
                 }
             }
 
-            // Fallback: blind 4-base search with incremental revcomp
             if !found {
                 let mut fallback_found = false;
                 for base in 0u8..4u8 {
@@ -805,7 +1009,7 @@ pub(crate) fn build_eulertig_sequences_from_kmers(
 // FlatKmerTable: open-addressing hash table with software prefetch support
 // ---------------------------------------------------------------------------
 
-pub(crate) const FLAT_TABLE_THRESHOLD: usize = 1_000_000;
+pub(crate) const FLAT_TABLE_THRESHOLD: usize = usize::MAX;
 const EMPTY_KEY: u64 = u64::MAX;
 
 pub(crate) struct FlatKmerTable {

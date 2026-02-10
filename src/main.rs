@@ -60,6 +60,15 @@ struct Args {
     /// Produce monochromatic eulertigs instead of simplitigs
     #[arg(long = "eulertig", default_value_t = false)]
     eulertig: bool,
+    /// Run only Step 1 (superkmer partitioning), keep partition files for later --only-step2
+    #[arg(long = "only-step1", default_value_t = false)]
+    only_step1: bool,
+    /// Run only Step 2+3 (compaction + merge + compression), assumes partition files exist from --only-step1
+    #[arg(long = "only-step2", default_value_t = false)]
+    only_step2: bool,
+    /// Run only Step 3 (merge + compression), assumes simplitigs-part files exist from --only-step2
+    #[arg(long = "only-step3", default_value_t = false)]
+    only_step3: bool,
 
 }
 fn main() {
@@ -86,7 +95,12 @@ fn main() {
             is_compressed_dir_complete(input_dir.clone());
             let _ = decompress::decompress(&String::from("bucket_sizes.txt"), &String::from("id_to_color_id.txt.zst"), &String::from("tigs_kloe.fa"), &String::from("positions_kloe.bin"), &String::from("filenames_id.txt"), &output_dir, &wanted_path, input_dir);
         }else if do_decompress == "compress"{
-            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort, use_unitigs, use_matchtigs, use_eulertigs);
+            let only_steps_set = [args.only_step1, args.only_step2, args.only_step3].iter().filter(|&&f| f).count();
+            if only_steps_set > 1 {
+                eprintln!("Error: only one of --only-step1, --only-step2, --only-step3 can be set at a time.");
+                std::process::exit(1);
+            }
+            let _ = compress::compress(&output_dir, &input_fof, threads, k, m, args.partition_power, args.verify_kmers, args.skip_sort, use_unitigs, use_matchtigs, use_eulertigs, args.only_step1, args.only_step2, args.only_step3);
         }
     }else {
 
