@@ -47,6 +47,12 @@ const ZSTD_LEVEL_FAST: i32 = -4; // zstd "fast=4" mode for high speed
 const PAR_SORT_THRESHOLD: usize = 200_000;
 const BUCKET_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 const GGCAT_PARTITION_SIZE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+const NATIVE_COMPACTION_MEM_BUDGET_GB_DEFAULT: u64 = 28;
+const NATIVE_COMPACTION_RESERVED_MB_DEFAULT: u64 = 2048;
+const NATIVE_COMPACTION_EST_MULTIPLIER_DEFAULT: u64 = 2;
+const NATIVE_COMPACTION_MIN_EST_MB_DEFAULT: u64 = 256;
+const NATIVE_COMPACTION_WAIT_MS: u64 = 5;
+const PHASE3_SHARDS_MULTIPLIER_DEFAULT: usize = 4;
 
 fn parse_env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.parse::<u64>().ok()
@@ -54,7 +60,13 @@ fn parse_env_u64(name: &str) -> Option<u64> {
 
 #[derive(Clone, Debug)]
 pub struct PartitionGgcatConfig {
+    // Memory passed to embedded ggcat.
     pub memory_gb: usize,
+    // Global budget used by native Step 2 compaction limiter.
+    pub native_memory_budget_gb: u64,
+    pub native_memory_reserved_mb: u64,
+    pub native_memory_est_multiplier: u64,
+    pub native_memory_min_est_mb: u64,
     pub temp_dir: String,
     pub partition_size_threshold_bytes: u64,
 }
@@ -67,9 +79,53 @@ impl Default for PartitionGgcatConfig {
             .unwrap_or(GGCAT_PARTITION_SIZE_THRESHOLD_BYTES / (1024 * 1024));
         Self {
             memory_gb: 8,
+            native_memory_budget_gb: parse_env_u64("KLOE_NATIVE_COMPACTION_BUDGET_GB")
+                .unwrap_or(NATIVE_COMPACTION_MEM_BUDGET_GB_DEFAULT)
+                .max(1),
+            native_memory_reserved_mb: parse_env_u64("KLOE_NATIVE_COMPACTION_RESERVED_MB")
+                .unwrap_or(NATIVE_COMPACTION_RESERVED_MB_DEFAULT),
+            native_memory_est_multiplier: parse_env_u64("KLOE_NATIVE_COMPACTION_EST_MULTIPLIER")
+                .unwrap_or(NATIVE_COMPACTION_EST_MULTIPLIER_DEFAULT)
+                .max(1),
+            native_memory_min_est_mb: parse_env_u64("KLOE_NATIVE_COMPACTION_MIN_EST_MB")
+                .unwrap_or(NATIVE_COMPACTION_MIN_EST_MB_DEFAULT),
             temp_dir: String::new(),
             partition_size_threshold_bytes: threshold_mb * 1024 * 1024,
         }
+    }
+}
+
+impl PartitionGgcatConfig {
+    #[inline(always)]
+    fn native_budget_bytes(&self) -> u64 {
+        self.native_memory_budget_gb
+            .max(1)
+            .saturating_mul(1024 * 1024 * 1024)
+    }
+
+    #[inline(always)]
+    fn native_reserved_bytes(&self) -> u64 {
+        self.native_memory_reserved_mb.saturating_mul(1024 * 1024)
+    }
+
+    #[inline(always)]
+    fn native_min_estimated_bytes(&self) -> u64 {
+        self.native_memory_min_est_mb.saturating_mul(1024 * 1024)
+    }
+
+    #[inline(always)]
+    fn estimated_native_partition_bytes(&self, partition_size_bytes: u64) -> u64 {
+        partition_size_bytes
+            .saturating_mul(self.native_memory_est_multiplier.max(1))
+            .max(self.native_min_estimated_bytes())
+    }
+
+    #[inline(always)]
+    fn should_force_ggcat_for_budget(&self, partition_size_bytes: u64) -> bool {
+        let available_for_native = self
+            .native_budget_bytes()
+            .saturating_sub(self.native_reserved_bytes());
+        self.estimated_native_partition_bytes(partition_size_bytes) > available_for_native
     }
 }
 
@@ -114,13 +170,12 @@ struct PartitionWriter {
 struct PartitionReader {
     reader: Option<Box<dyn BufRead + Send>>,
     path: PathBuf,
-    id_width: usize,
     header_buf: Vec<u8>,
     seq_buf: Vec<u8>,
 }
 
 impl PartitionReader {
-    fn new(path: PathBuf, id_width: usize) -> Result<Self> {
+    fn new(path: PathBuf) -> Result<Self> {
         let file = File::open(&path)
             .with_context(|| format!("open partition simplitigs {}", path.display()))?;
         #[cfg(unix)]
@@ -130,7 +185,6 @@ impl PartitionReader {
         Ok(Self {
             reader: Some(Box::new(BufReader::new(decoder))),
             path,
-            id_width,
             header_buf: Vec::new(),
             seq_buf: Vec::new(),
         })
@@ -143,7 +197,6 @@ impl PartitionReader {
 
         let result = read_simplitig_record(
             reader.as_mut(),
-            self.id_width,
             &mut self.header_buf,
             &mut self.seq_buf,
         )
@@ -334,14 +387,8 @@ fn ids_from_bitset(bits: &[u64]) -> Vec<usize> {
     ids
 }
 
-fn id_width(dataset_count: usize) -> usize {
-    let mut value = dataset_count.max(1);
-    let mut width = 1usize;
-    while value >= 10 {
-        value /= 10;
-        width += 1;
-    }
-    width
+fn color_ids_from_usize(ids: Vec<usize>) -> ColorIds {
+    Arc::new(ids.into_iter().map(|id| id as u32).collect())
 }
 
 fn ensure_nofile_limit(required: u64) -> Result<()> {
@@ -1142,8 +1189,8 @@ struct FlatKmerTable {
 }
 
 impl FlatKmerTable {
-    /// Build from a hashbrown HashMap. Target ~70% load factor.
-    fn from_hashmap(map: &HashMap<u64, KmerEntry>) -> Self {
+    /// Build from a hashbrown HashMap by consuming entries. Target ~70% load factor.
+    fn from_hashmap_owned(map: HashMap<u64, KmerEntry>) -> Self {
         let n = map.len();
         // next power of 2 >= n * 10 / 7 (~70% load)
         let capacity = ((n * 10 / 7) + 1).next_power_of_two();
@@ -1151,7 +1198,7 @@ impl FlatKmerTable {
         let mut keys = vec![EMPTY_KEY; capacity];
         let mut values = vec![KmerEntry::new(0); capacity];
         let hasher = ahash::RandomState::new();
-        for (&k, &v) in map.iter() {
+        for (k, v) in map {
             let mut idx = (hasher.hash_one(k) as usize) & mask;
             loop {
                 if keys[idx] == EMPTY_KEY {
@@ -1647,10 +1694,12 @@ fn verify_kmer_maps(
 
 #[derive(Debug)]
 pub struct SimplitigRecord {
-    pub header: Vec<u8>,
-    pub key: Vec<u8>,
+    pub color_ids: Arc<Vec<u32>>,
     pub seq: Vec<u8>,
 }
+
+pub type SimplitigBatch = Vec<SimplitigRecord>;
+type ColorIds = Arc<Vec<u32>>;
 
 #[derive(Debug)]
 struct HeapItem {
@@ -1660,7 +1709,8 @@ struct HeapItem {
 
 impl PartialEq for HeapItem {
     fn eq(&self, other: &Self) -> bool {
-        self.record.key == other.record.key && self.record.seq == other.record.seq
+        self.record.color_ids.as_ref() == other.record.color_ids.as_ref()
+            && self.record.seq == other.record.seq
     }
 }
 
@@ -1676,44 +1726,6 @@ impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         simplitig_cmp(&self.record, &other.record)
     }
-}
-
-fn build_padded_key_from_header(header: &[u8], id_width: usize) -> Result<Vec<u8>> {
-    let rest = header
-        .strip_prefix(b">ids:")
-        .with_context(|| format!("invalid simplitig header (expected >ids:): '{:?}'", header))?;
-    if rest.is_empty() {
-        bail!("no dataset ids found in header '{:?}'", header);
-    }
-    let mut key = Vec::with_capacity(rest.len() + 16);
-    let mut first = true;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let start = idx;
-        while idx < rest.len() && rest[idx] != b',' {
-            let b = rest[idx];
-            if !(b'0'..=b'9').contains(&b) {
-                bail!("invalid dataset id token in header '{:?}'", header);
-            }
-            idx += 1;
-        }
-        let token = &rest[start..idx];
-        if token.is_empty() {
-            bail!("invalid dataset id token in header '{:?}'", header);
-        }
-        if !first {
-            key.push(b',');
-        }
-        first = false;
-        if token.len() < id_width {
-            key.extend(std::iter::repeat_n(b'0', id_width - token.len()));
-        }
-        key.extend_from_slice(token);
-        if idx < rest.len() && rest[idx] == b',' {
-            idx += 1;
-        }
-    }
-    Ok(key)
 }
 
 fn push_usize_decimal(buf: &mut Vec<u8>, mut value: usize) {
@@ -1733,49 +1745,65 @@ fn push_usize_decimal(buf: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-fn push_usize_decimal_padded(buf: &mut Vec<u8>, value: usize, width: usize) {
-    let mut tmp = [0u8; 20];
-    let mut len = 0usize;
-    let mut v = value;
-    if v == 0 {
-        tmp[0] = b'0';
-        len = 1;
-    } else {
-        while v > 0 {
-            tmp[len] = b'0' + (v % 10) as u8;
-            len += 1;
-            v /= 10;
-        }
-    }
-    if len < width {
-        buf.extend(std::iter::repeat_n(b'0', width - len));
-    }
-    for &b in tmp[..len].iter().rev() {
-        buf.push(b);
-    }
-}
-
-fn build_simplitig_header(ids: &[usize]) -> Vec<u8> {
+fn build_simplitig_header(ids: &[u32]) -> Vec<u8> {
     let mut header = Vec::with_capacity(16 + ids.len() * 4);
     header.extend_from_slice(b">ids:");
     for (idx, &id) in ids.iter().enumerate() {
         if idx > 0 {
             header.push(b',');
         }
-        push_usize_decimal(&mut header, id);
+        push_usize_decimal(&mut header, id as usize);
     }
     header
 }
 
-fn build_simplitig_key(ids: &[usize], id_width: usize) -> Vec<u8> {
-    let mut key = Vec::with_capacity(ids.len() * (id_width + 1));
-    for (idx, &id) in ids.iter().enumerate() {
-        if idx > 0 {
-            key.push(b',');
-        }
-        push_usize_decimal_padded(&mut key, id, id_width);
+fn parse_color_ids_from_header(header: &[u8]) -> Result<ColorIds> {
+    let rest = header
+        .strip_prefix(b">ids:")
+        .with_context(|| format!("invalid simplitig header (expected >ids:): '{:?}'", header))?;
+    if rest.is_empty() {
+        bail!("no dataset ids found in header '{:?}'", header);
     }
-    key
+
+    let mut ids = Vec::with_capacity(8);
+    let mut value = 0u32;
+    let mut in_number = false;
+    for &b in rest {
+        match b {
+            b'0'..=b'9' => {
+                in_number = true;
+                value = value
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((b - b'0') as u32))
+                    .context("dataset id overflow while parsing simplitig header")?;
+            }
+            b',' => {
+                if !in_number || value == 0 {
+                    bail!(
+                        "invalid dataset id token in header '{}'",
+                        String::from_utf8_lossy(header)
+                    );
+                }
+                ids.push(value);
+                value = 0;
+                in_number = false;
+            }
+            _ => {
+                bail!(
+                    "invalid dataset id token in header '{}'",
+                    String::from_utf8_lossy(header)
+                );
+            }
+        }
+    }
+    if !in_number || value == 0 {
+        bail!(
+            "invalid trailing dataset id token in header '{}'",
+            String::from_utf8_lossy(header)
+        );
+    }
+    ids.push(value);
+    Ok(Arc::new(ids))
 }
 
 fn read_line_trimmed<R: BufRead + ?Sized>(
@@ -1792,7 +1820,6 @@ fn read_line_trimmed<R: BufRead + ?Sized>(
 
 fn read_simplitig_record<R: BufRead + ?Sized>(
     reader: &mut R,
-    id_width: usize,
     header_buf: &mut Vec<u8>,
     seq_buf: &mut Vec<u8>,
 ) -> Result<Option<SimplitigRecord>> {
@@ -1805,21 +1832,13 @@ fn read_simplitig_record<R: BufRead + ?Sized>(
             String::from_utf8_lossy(header_buf)
         );
     }
-    let header = header_buf.to_vec();
-    let key = build_padded_key_from_header(&header, id_width)?;
+    let color_ids = parse_color_ids_from_header(header_buf)?;
     let seq = seq_buf.to_vec();
-    Ok(Some(SimplitigRecord { header, key, seq }))
-}
-
-fn write_simplitig_record_to_buf(record: &SimplitigRecord, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&record.header);
-    buf.push(b'\n');
-    buf.extend_from_slice(&record.seq);
-    buf.push(b'\n');
+    Ok(Some(SimplitigRecord { color_ids, seq }))
 }
 
 fn simplitig_cmp(a: &SimplitigRecord, b: &SimplitigRecord) -> std::cmp::Ordering {
-    match a.key.cmp(&b.key) {
+    match a.color_ids.as_ref().cmp(b.color_ids.as_ref()) {
         std::cmp::Ordering::Equal => a
             .seq
             .len()
@@ -1841,8 +1860,21 @@ fn sort_simplitigs(records: &mut [SimplitigRecord]) {
 fn write_sorted_chunk<W: Write>(chunk: &mut [SimplitigRecord], writer: &mut W) -> Result<()> {
     sort_simplitigs(chunk);
     let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+    let mut current_ids: Option<ColorIds> = None;
+    let mut current_header = Vec::new();
     for record in chunk.iter() {
-        write_simplitig_record_to_buf(record, &mut buffer);
+        let key_changed = match current_ids.as_ref() {
+            Some(ids) => ids.as_ref() != record.color_ids.as_ref(),
+            None => true,
+        };
+        if key_changed {
+            current_header = build_simplitig_header(record.color_ids.as_ref());
+            current_ids = Some(Arc::clone(&record.color_ids));
+        }
+        buffer.extend_from_slice(&current_header);
+        buffer.push(b'\n');
+        buffer.extend_from_slice(&record.seq);
+        buffer.push(b'\n');
         if buffer.len() >= WRITE_BUFFER_TARGET {
             writer.write_all(&buffer)?;
             buffer.clear();
@@ -2065,8 +2097,21 @@ fn write_partition_records_output(
         write_sorted_chunk(&mut records, &mut encoder)?;
     } else {
         let mut buffer = Vec::with_capacity(WRITE_BUFFER_TARGET);
+        let mut current_ids: Option<ColorIds> = None;
+        let mut current_header = Vec::new();
         for record in records.iter() {
-            write_simplitig_record_to_buf(record, &mut buffer);
+            let key_changed = match current_ids.as_ref() {
+                Some(ids) => ids.as_ref() != record.color_ids.as_ref(),
+                None => true,
+            };
+            if key_changed {
+                current_header = build_simplitig_header(record.color_ids.as_ref());
+                current_ids = Some(Arc::clone(&record.color_ids));
+            }
+            buffer.extend_from_slice(&current_header);
+            buffer.push(b'\n');
+            buffer.extend_from_slice(&record.seq);
+            buffer.push(b'\n');
             if buffer.len() >= WRITE_BUFFER_TARGET {
                 encoder.write_all(&buffer)?;
                 buffer.clear();
@@ -2095,7 +2140,6 @@ fn write_partition_simplitigs_native(
 ) -> Result<()> {
     let (mut map, arena, words) =
         build_kmer_map_from_partition(partition_path, k, dataset_count)?;
-    let width = id_width(dataset_count);
     let mut records = Vec::new();
 
     if use_matchtigs {
@@ -2108,13 +2152,10 @@ fn write_partition_simplitigs_native(
                 *dst |= *src;
             }
         }
-        let ids = ids_from_bitset(&all_ids_bits);
-        let header = build_simplitig_header(&ids);
-        let key = build_simplitig_key(&ids, width);
+        let color_ids = color_ids_from_usize(ids_from_bitset(&all_ids_bits));
         for seq in seqs {
             records.push(SimplitigRecord {
-                header: header.clone(),
-                key: key.clone(),
+                color_ids: Arc::clone(&color_ids),
                 seq,
             });
         }
@@ -2127,43 +2168,42 @@ fn write_partition_simplitigs_native(
                 *dst |= *src;
             }
         }
-        let ids = ids_from_bitset(&all_ids_bits);
-        let header = build_simplitig_header(&ids);
-        let key = build_simplitig_key(&ids, width);
+        let color_ids = color_ids_from_usize(ids_from_bitset(&all_ids_bits));
         for seq in seqs {
             records.push(SimplitigRecord {
-                header: header.clone(),
-                key: key.clone(),
+                color_ids: Arc::clone(&color_ids),
                 seq,
             });
         }
     } else if use_unitigs {
         assemble_unitigs_bidirected(&mut map, &arena, words, k, |seq, ids_bits| {
-            let ids = ids_from_bitset(ids_bits);
-            let header = build_simplitig_header(&ids);
-            let key = build_simplitig_key(&ids, width);
-            records.push(SimplitigRecord { header, key, seq });
+            records.push(SimplitigRecord {
+                color_ids: color_ids_from_usize(ids_from_bitset(ids_bits)),
+                seq,
+            });
             Ok(())
         })?;
     } else {
         // Default: simplitigs
         let use_flat = map.len() >= FLAT_TABLE_THRESHOLD;
         if use_flat {
-            let mut flat = FlatKmerTable::from_hashmap(&map);
-            map.clear();
+            // Move entries out of the hash map so its large allocation can be released
+            // early instead of coexisting with the flat table during assembly.
+            let map_owned = std::mem::take(&mut map);
+            let mut flat = FlatKmerTable::from_hashmap_owned(map_owned);
             assemble_simplitigs_flat(&mut flat, &arena, words, k, |seq, ids_bits| {
-                let ids = ids_from_bitset(ids_bits);
-                let header = build_simplitig_header(&ids);
-                let key = build_simplitig_key(&ids, width);
-                records.push(SimplitigRecord { header, key, seq });
+                records.push(SimplitigRecord {
+                    color_ids: color_ids_from_usize(ids_from_bitset(ids_bits)),
+                    seq,
+                });
                 Ok(())
             })?;
         } else {
             assemble_simplitigs_bidirected(&mut map, &arena, words, k, |seq, ids_bits| {
-                let ids = ids_from_bitset(ids_bits);
-                let header = build_simplitig_header(&ids);
-                let key = build_simplitig_key(&ids, width);
-                records.push(SimplitigRecord { header, key, seq });
+                records.push(SimplitigRecord {
+                    color_ids: color_ids_from_usize(ids_from_bitset(ids_bits)),
+                    seq,
+                });
                 Ok(())
             })?;
         }
@@ -2312,7 +2352,6 @@ fn write_partition_simplitigs_ggcat(
         GGCATInstance::dump_colors(GGCATInstance::get_colormap_file(&graph_path))
             .collect::<Vec<_>>();
 
-    let width = id_width(dataset_count);
     let records = Mutex::new(Vec::<SimplitigRecord>::new());
     let dump_error = Mutex::new(None::<String>);
     instance.dump_unitigs(
@@ -2353,11 +2392,8 @@ fn write_partition_simplitigs_ggcat(
             }
             ids.sort_unstable();
             ids.dedup();
-            let header = build_simplitig_header(&ids);
-            let key = build_simplitig_key(&ids, width);
             records.lock().push(SimplitigRecord {
-                header,
-                key,
+                color_ids: color_ids_from_usize(ids),
                 seq: seq.to_vec(),
             });
         },
@@ -2381,7 +2417,9 @@ fn write_partition_simplitigs(
     use_eulertigs: bool,
     ggcat_cfg: &PartitionGgcatConfig,
 ) -> Result<PartitionCompactionBackend> {
-    if partition_size_bytes >= ggcat_cfg.partition_size_threshold_bytes {
+    let ggcat_due_to_threshold = partition_size_bytes >= ggcat_cfg.partition_size_threshold_bytes;
+    let ggcat_due_to_budget = ggcat_cfg.should_force_ggcat_for_budget(partition_size_bytes);
+    if ggcat_due_to_threshold || ggcat_due_to_budget {
         write_partition_simplitigs_ggcat(
             partition_path,
             k,
@@ -2394,6 +2432,13 @@ fn write_partition_simplitigs(
             use_eulertigs,
             ggcat_cfg,
         )?;
+        if ggcat_due_to_budget && !ggcat_due_to_threshold {
+            eprintln!(
+                "  Step 2: forcing ggcat for {} (partition={} bytes exceeds native budget envelope)",
+                partition_path.display(),
+                partition_size_bytes
+            );
+        }
         Ok(PartitionCompactionBackend::Ggcat)
     } else {
         write_partition_simplitigs_native(
@@ -2555,23 +2600,25 @@ fn chain_and_write_sorted_records(
     if pre_sorted {
         // Input is already sorted by (key, seq_len, seq) — stream directly,
         // skipping all per-group buffering, sorting, and spill-to-disk overhead.
-        let mut current_key: Option<Vec<u8>> = None;
+        let mut current_ids: Option<ColorIds> = None;
+        let mut current_header = Vec::new();
         let mut groups_written = 0usize;
         while let Some(record) = next_record()? {
-            let key_changed = match current_key.as_ref() {
-                Some(k) => k.as_slice() != record.key.as_slice(),
+            let key_changed = match current_ids.as_ref() {
+                Some(ids) => ids.as_ref() != record.color_ids.as_ref(),
                 None => true,
             };
             if key_changed {
-                if current_key.is_some() {
+                if current_ids.is_some() {
                     groups_written += 1;
                     if groups_written % 100_000 == 0 {
                         eprintln!("  streamed {} color groups so far", groups_written);
                     }
                 }
-                current_key = Some(record.key);
+                current_header = build_simplitig_header(record.color_ids.as_ref());
+                current_ids = Some(Arc::clone(&record.color_ids));
             }
-            out_buf.extend_from_slice(&record.header);
+            out_buf.extend_from_slice(&current_header);
             out_buf.push(b'\n');
             out_buf.extend_from_slice(&record.seq);
             out_buf.push(b'\n');
@@ -2586,7 +2633,7 @@ fn chain_and_write_sorted_records(
         encoder
             .finish()
             .with_context(|| format!("finalize simplitig output {}", output_path.display()))?;
-        if current_key.is_some() {
+        if current_ids.is_some() {
             groups_written += 1;
         }
         eprintln!(
@@ -2602,7 +2649,7 @@ fn chain_and_write_sorted_records(
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
 
-    let mut current_key: Option<Vec<u8>> = None;
+    let mut current_ids: Option<ColorIds> = None;
     let mut current_header: Vec<u8> = Vec::new();
     let mut group_seqs: Vec<Vec<u8>> = Vec::new();
     let mut group_bytes: usize = 0;
@@ -2610,12 +2657,12 @@ fn chain_and_write_sorted_records(
     let mut groups_written = 0usize;
 
     while let Some(record) = next_record()? {
-        let key_changed = match current_key.as_ref() {
-            Some(existing) => existing.as_slice() != record.key.as_slice(),
+        let key_changed = match current_ids.as_ref() {
+            Some(existing) => existing.as_ref() != record.color_ids.as_ref(),
             None => true,
         };
         if key_changed {
-            if current_key.is_some() {
+            if current_ids.is_some() {
                 flush_group_sorted(
                     &mut group_seqs,
                     &mut group_bytes,
@@ -2631,8 +2678,8 @@ fn chain_and_write_sorted_records(
                     eprintln!("  sorted {} color groups so far", groups_written);
                 }
             }
-            current_header = record.header.clone();
-            current_key = Some(record.key);
+            current_header = build_simplitig_header(record.color_ids.as_ref());
+            current_ids = Some(Arc::clone(&record.color_ids));
         }
         group_bytes += record.seq.len();
         group_seqs.push(record.seq);
@@ -2644,7 +2691,7 @@ fn chain_and_write_sorted_records(
     }
 
     // Flush last group.
-    if current_key.is_some() {
+    if current_ids.is_some() {
         flush_group_sorted(
             &mut group_seqs,
             &mut group_bytes,
@@ -2772,13 +2819,12 @@ fn kway_merge_sorted_partitions(
     partition_paths: &[PathBuf],
     output_path: &Path,
     threads: usize,
-    dataset_count: usize,
+    _dataset_count: usize,
     k: usize,
 ) -> Result<()> {
-    let width = id_width(dataset_count);
     let mut readers: Vec<PartitionReader> = Vec::new();
     for path in partition_paths {
-        readers.push(PartitionReader::new(path.clone(), width)?);
+        readers.push(PartitionReader::new(path.clone())?);
     }
 
     let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
@@ -2817,12 +2863,11 @@ fn kway_merge_sorted_partitions(
 
 fn merge_partition_group_to_channel(
     partition_paths: Vec<PathBuf>,
-    sender: mpsc::SyncSender<Vec<SimplitigRecord>>,
-    id_width: usize,
+    sender: mpsc::SyncSender<SimplitigBatch>,
 ) -> Result<()> {
     let mut readers: Vec<PartitionReader> = Vec::with_capacity(partition_paths.len());
     for path in partition_paths {
-        readers.push(PartitionReader::new(path, id_width)?);
+        readers.push(PartitionReader::new(path)?);
     }
 
     let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
@@ -2836,7 +2881,7 @@ fn merge_partition_group_to_channel(
     }
 
     const BATCH_SIZE: usize = 512;
-    let mut batch: Vec<SimplitigRecord> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: SimplitigBatch = Vec::with_capacity(BATCH_SIZE);
     while let Some(Reverse(item)) = heap.pop() {
         let run_idx = item.run_idx;
         batch.push(item.record);
@@ -2864,8 +2909,8 @@ fn merge_partition_group_to_channel(
 }
 
 struct BatchedRecordStream {
-    receiver: mpsc::Receiver<Vec<SimplitigRecord>>,
-    buffer: Vec<SimplitigRecord>,
+    receiver: mpsc::Receiver<SimplitigBatch>,
+    buffer: SimplitigBatch,
 }
 
 impl BatchedRecordStream {
@@ -2883,7 +2928,7 @@ impl BatchedRecordStream {
 }
 
 fn merge_sorted_streams_to_output(
-    receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>>,
+    receivers: Vec<mpsc::Receiver<SimplitigBatch>>,
     output_path: &Path,
     encoder_threads: usize,
     k: usize,
@@ -2932,8 +2977,9 @@ fn merge_sorted_streams_to_output(
 }
 
 fn merge_sorted_streams_to_channel(
-    receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>>,
-    sender: mpsc::SyncSender<SimplitigRecord>,
+    receivers: Vec<mpsc::Receiver<SimplitigBatch>>,
+    sender: mpsc::SyncSender<SimplitigBatch>,
+    batch_size: usize,
 ) -> Result<()> {
     let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
 
@@ -2954,15 +3000,24 @@ fn merge_sorted_streams_to_channel(
         }
     }
 
+    let batch_size = batch_size.max(1);
     let mut records_sent = 0u64;
+    let mut batch: SimplitigBatch = Vec::with_capacity(batch_size);
+    let mut receiver_open = true;
     while let Some(Reverse(item)) = heap.pop() {
         let stream_idx = item.run_idx;
-        if sender.send(item.record).is_err() {
-            break;
-        }
+        batch.push(item.record);
         records_sent += 1;
         if records_sent % 1_000_000 == 0 {
             eprintln!("  merge: sent {} records so far", records_sent);
+        }
+        if batch.len() >= batch_size {
+            let out = std::mem::take(&mut batch);
+            if sender.send(out).is_err() {
+                receiver_open = false;
+                break;
+            }
+            batch = Vec::with_capacity(batch_size);
         }
         if let Some(record) = streams[stream_idx].next_record() {
             heap.push(Reverse(HeapItem {
@@ -2971,6 +3026,9 @@ fn merge_sorted_streams_to_channel(
             }));
         }
     }
+    if receiver_open && !batch.is_empty() {
+        let _ = sender.send(batch);
+    }
     drop(sender);
     eprintln!("  merge complete: {} records sent", records_sent);
     Ok(())
@@ -2978,40 +3036,39 @@ fn merge_sorted_streams_to_channel(
 
 fn parallel_merge_to_channel(
     partition_paths: &[PathBuf],
-    sender: mpsc::SyncSender<SimplitigRecord>,
+    sender: mpsc::SyncSender<SimplitigBatch>,
     threads: usize,
     dataset_count: usize,
+    batch_size: usize,
 ) -> Result<()> {
     let threads = threads.max(1);
     if threads <= 1 || partition_paths.len() <= 1 {
-        return merge_to_channel(partition_paths, sender, dataset_count, 0);
+        return merge_to_channel(partition_paths, sender, dataset_count, 0, batch_size);
     }
 
     // Keep one coordinator thread for final k-way merge, use remaining workers
     // to pre-merge partition groups in parallel.
     let worker_threads = threads.saturating_sub(1).max(1);
-    let group_count = worker_threads.min(partition_paths.len()).max(1);
+    let shard_count = parse_phase3_shards(worker_threads);
+    let group_count = shard_count.min(partition_paths.len()).max(1);
     if group_count <= 1 {
-        return merge_to_channel(partition_paths, sender, dataset_count, 0);
+        return merge_to_channel(partition_paths, sender, 0, 0, batch_size);
     }
 
     let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
     let channel_capacity = 16usize;
-    let width = id_width(dataset_count);
 
-    let mut receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>> = Vec::new();
+    let mut receivers: Vec<mpsc::Receiver<SimplitigBatch>> = Vec::new();
     let mut handles = Vec::new();
 
     for chunk in partition_paths.chunks(chunk_size) {
-        let (tx, rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(channel_capacity);
+        let (tx, rx) = mpsc::sync_channel::<SimplitigBatch>(channel_capacity);
         receivers.push(rx);
         let group: Vec<PathBuf> = chunk.to_vec();
-        handles.push(thread::spawn(move || {
-            merge_partition_group_to_channel(group, tx, width)
-        }));
+        handles.push(thread::spawn(move || merge_partition_group_to_channel(group, tx)));
     }
 
-    let merge_result = merge_sorted_streams_to_channel(receivers, sender);
+    let merge_result = merge_sorted_streams_to_channel(receivers, sender, batch_size);
 
     let mut first_worker_err: Option<anyhow::Error> = None;
     for handle in handles {
@@ -3060,31 +3117,29 @@ fn parallel_streaming_merge(
     // which fell through to the single-threaded kway_merge_sorted_partitions).
     let encoder_threads = 1;
     let worker_threads = threads.saturating_sub(encoder_threads).max(1);
-    let group_count = worker_threads.min(partition_paths.len()).max(1);
+    let shard_count = parse_phase3_shards(worker_threads);
+    let group_count = shard_count.min(partition_paths.len()).max(1);
     if group_count <= 1 {
         return kway_merge_sorted_partitions(
             partition_paths,
             output_path,
             threads,
-            dataset_count,
+            0,
             k,
         );
     }
 
     let chunk_size = (partition_paths.len() + group_count - 1) / group_count;
     let channel_capacity = 16usize;
-    let width = id_width(dataset_count);
 
-    let mut receivers: Vec<mpsc::Receiver<Vec<SimplitigRecord>>> = Vec::new();
+    let mut receivers: Vec<mpsc::Receiver<SimplitigBatch>> = Vec::new();
     let mut handles = Vec::new();
 
     for chunk in partition_paths.chunks(chunk_size) {
-        let (tx, rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(channel_capacity);
+        let (tx, rx) = mpsc::sync_channel::<SimplitigBatch>(channel_capacity);
         receivers.push(rx);
         let group: Vec<PathBuf> = chunk.to_vec();
-        handles.push(thread::spawn(move || {
-            merge_partition_group_to_channel(group, tx, width)
-        }));
+        handles.push(thread::spawn(move || merge_partition_group_to_channel(group, tx)));
     }
 
     let merge_result = merge_sorted_streams_to_output(receivers, output_path, encoder_threads, k);
@@ -3353,6 +3408,147 @@ fn partition_size_stats(encoders: &SharedEncoders) -> Result<(u64, u64, u64)> {
     Ok((total, min_size, max_size))
 }
 
+#[derive(Debug)]
+struct NativeCompactionLimiter {
+    budget_bytes: u64,
+    reserved_bytes: u64,
+    max_inflight_estimated_bytes: u64,
+    est_multiplier: u64,
+    min_estimated_bytes: u64,
+    inflight_estimated_bytes: AtomicU64,
+}
+
+#[derive(Debug)]
+struct NativeCompactionPermit {
+    limiter: Arc<NativeCompactionLimiter>,
+    estimated_bytes: u64,
+}
+
+impl Drop for NativeCompactionPermit {
+    fn drop(&mut self) {
+        self.limiter
+            .inflight_estimated_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(self.estimated_bytes))
+            })
+            .ok();
+    }
+}
+
+impl NativeCompactionLimiter {
+    #[inline(always)]
+    fn estimate_partition_bytes(&self, partition_size_bytes: u64) -> u64 {
+        partition_size_bytes
+            .saturating_mul(self.est_multiplier)
+            .max(self.min_estimated_bytes)
+    }
+
+    fn acquire(self: &Arc<Self>, partition_size_bytes: u64) -> NativeCompactionPermit {
+        let estimated_bytes = self.estimate_partition_bytes(partition_size_bytes);
+        loop {
+            let current = self.inflight_estimated_bytes.load(Ordering::Acquire);
+            // Always allow one worker to make progress, even if its estimate exceeds
+            // the configured envelope; otherwise oversized groups can deadlock.
+            let can_run_as_single_worker = current == 0;
+            let inflight_allow = can_run_as_single_worker
+                || current.saturating_add(estimated_bytes) <= self.max_inflight_estimated_bytes;
+            let rss_allow = current_process_rss_bytes()
+                .map(|rss| {
+                    rss.saturating_add(self.reserved_bytes)
+                        .saturating_add(estimated_bytes)
+                        <= self.budget_bytes
+                })
+                .unwrap_or(true)
+                || can_run_as_single_worker;
+            if inflight_allow
+                && rss_allow
+                && self
+                    .inflight_estimated_bytes
+                    .compare_exchange(
+                        current,
+                        current.saturating_add(estimated_bytes),
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return NativeCompactionPermit {
+                    limiter: Arc::clone(self),
+                    estimated_bytes,
+                };
+            }
+            thread::sleep(std::time::Duration::from_millis(NATIVE_COMPACTION_WAIT_MS));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn current_process_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn current_process_rss_bytes() -> Option<u64> {
+    None
+}
+
+fn build_memory_limiter(
+    label: &str,
+    requested_threads: usize,
+    ggcat_cfg: &PartitionGgcatConfig,
+    loc: &Locale,
+) -> Option<Arc<NativeCompactionLimiter>> {
+    if requested_threads <= 1 {
+        return None;
+    }
+
+    let budget_bytes = ggcat_cfg.native_budget_bytes();
+    let reserved_bytes = ggcat_cfg.native_reserved_bytes();
+    let max_inflight_estimated_bytes = budget_bytes
+        .saturating_sub(reserved_bytes)
+        .max(ggcat_cfg.native_min_estimated_bytes());
+    let est_multiplier = ggcat_cfg.native_memory_est_multiplier.max(1);
+    let min_estimated_bytes = ggcat_cfg.native_min_estimated_bytes();
+
+    let limiter = Arc::new(NativeCompactionLimiter {
+        budget_bytes,
+        reserved_bytes,
+        max_inflight_estimated_bytes,
+        est_multiplier,
+        min_estimated_bytes,
+        inflight_estimated_bytes: AtomicU64::new(0),
+    });
+
+    println!(
+        "{} limiter: requested_threads={}, budget={} GB, reserved={} bytes, inflight_estimate_budget={} bytes, est_multiplier={}, min_est={} bytes",
+        label,
+        requested_threads.to_formatted_string(loc),
+        ggcat_cfg.native_memory_budget_gb.to_formatted_string(loc),
+        limiter.reserved_bytes.to_formatted_string(loc),
+        limiter.max_inflight_estimated_bytes.to_formatted_string(loc),
+        limiter.est_multiplier.to_formatted_string(loc),
+        limiter.min_estimated_bytes.to_formatted_string(loc)
+    );
+
+    Some(limiter)
+}
+
+fn parse_phase3_shards(requested_workers: usize) -> usize {
+    let default_shards = requested_workers
+        .saturating_mul(PHASE3_SHARDS_MULTIPLIER_DEFAULT)
+        .max(1);
+    parse_env_u64("KLOE_PHASE3_SHARDS")
+        .map(|v| (v as usize).max(1))
+        .unwrap_or(default_shards)
+}
+
 pub fn run_parser(
     input_fof: PathBuf,
     output_dir: PathBuf,
@@ -3474,14 +3670,17 @@ pub fn run_parser(
         })
         .collect();
     partition_indices.sort_by(|a, b| b.1.cmp(&a.1));
+    let native_limiter = build_memory_limiter("Step 2 native compaction", threads, &ggcat_cfg, &loc);
 
     {
         let compaction_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
+            .num_threads(threads.max(1))
             .build()
             .context("failed to build compaction thread pool")?;
+        let native_limiter = native_limiter.clone();
         compaction_pool.install(|| {
             partition_indices.par_iter().for_each(|&(idx, size)| {
+                let _permit = native_limiter.as_ref().map(|limiter| limiter.acquire(size));
                 let pw = &encoders[idx];
                 let partition_path = pw.path.clone();
                 let part_output = output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
@@ -3594,7 +3793,7 @@ pub fn run_parser_streaming(
     use_eulertigs: bool,
     ggcat_cfg: PartitionGgcatConfig,
 ) -> Result<(
-    mpsc::Receiver<SimplitigRecord>,
+    mpsc::Receiver<SimplitigBatch>,
     thread::JoinHandle<Result<()>>,
     usize, // dataset_count
 )> {
@@ -3698,14 +3897,17 @@ pub fn run_parser_streaming(
         })
         .collect();
     partition_indices.sort_by(|a, b| b.1.cmp(&a.1));
+    let native_limiter = build_memory_limiter("Step 2 native compaction", threads, &ggcat_cfg, &loc);
 
     {
         let compaction_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
+            .num_threads(threads.max(1))
             .build()
             .context("failed to build compaction thread pool")?;
+        let native_limiter = native_limiter.clone();
         compaction_pool.install(|| {
             partition_indices.par_iter().for_each(|&(idx, size)| {
+                let _permit = native_limiter.as_ref().map(|limiter| limiter.acquire(size));
                 let pw = &encoders[idx];
                 let partition_path = pw.path.clone();
                 let part_output = output_dir.join(format!("simplitigs-part-{idx}.fa.zst"));
@@ -3762,7 +3964,24 @@ pub fn run_parser_streaming(
 
     // Step 3: spawn merge thread that sends records via channel
     let merge_start = Utc::now();
-    let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigRecord>(8192);
+    let stream_batch_size = parse_env_u64("KLOE_STREAM_BATCH_SIZE")
+        .unwrap_or(4_096)
+        .max(256) as usize;
+    let default_records = parse_env_u64("KLOE_STREAM_CHANNEL_CAPACITY")
+        .unwrap_or(32_768)
+        .max(1_024) as usize;
+    let budget_bytes = ggcat_cfg
+        .native_budget_bytes()
+        .saturating_sub(ggcat_cfg.native_reserved_bytes());
+    // Keep at most ~1/8 of the configured budget in the Step 3 channel.
+    let channel_budget_bytes = (budget_bytes / 8).max(512 * 1024 * 1024);
+    let estimated_record_bytes = 96u64;
+    let estimated_batch_bytes =
+        (stream_batch_size as u64).saturating_mul(estimated_record_bytes).max(1);
+    let max_batches_by_budget = (channel_budget_bytes / estimated_batch_bytes) as usize;
+    let default_batches = default_records / stream_batch_size.max(1);
+    let stream_channel_capacity = default_batches.min(max_batches_by_budget.max(8)).max(8);
+    let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigBatch>(stream_channel_capacity);
     let sort_records = !skip_sort;
 
     let merge_handle = thread::spawn(move || -> Result<()> {
@@ -3774,17 +3993,33 @@ pub fn run_parser_streaming(
 
         if sort_records {
             // parallel grouped k-way merge sending records to channel
-            parallel_merge_to_channel(&partition_paths, record_tx, threads, dataset_count)?;
+            parallel_merge_to_channel(
+                &partition_paths,
+                record_tx,
+                threads,
+                dataset_count,
+                stream_batch_size,
+            )?;
         } else {
             // No sorting: just stream records from each partition
-            let width = id_width(dataset_count);
-            for path in &partition_paths {
-                let mut reader = PartitionReader::new(path.clone(), width)?;
+            let mut batch: SimplitigBatch = Vec::with_capacity(stream_batch_size);
+            let mut receiver_open = true;
+            'send_loop: for path in &partition_paths {
+                let mut reader = PartitionReader::new(path.clone())?;
                 while let Some(record) = reader.next_record()? {
-                    if record_tx.send(record).is_err() {
-                        break;
+                    batch.push(record);
+                    if batch.len() >= stream_batch_size {
+                        let out = std::mem::take(&mut batch);
+                        if record_tx.send(out).is_err() {
+                            receiver_open = false;
+                            break 'send_loop;
+                        }
+                        batch = Vec::with_capacity(stream_batch_size);
                     }
                 }
+            }
+            if receiver_open && !batch.is_empty() {
+                let _ = record_tx.send(batch);
             }
             drop(record_tx);
         }
@@ -3811,14 +4046,14 @@ pub fn run_parser_streaming(
 /// Performs k-way merge of sorted partition files, sending records to a channel.
 fn merge_to_channel(
     partition_paths: &[PathBuf],
-    sender: mpsc::SyncSender<SimplitigRecord>,
-    dataset_count: usize,
+    sender: mpsc::SyncSender<SimplitigBatch>,
+    _dataset_count: usize,
     _k: usize,
+    batch_size: usize,
 ) -> Result<()> {
-    let width = id_width(dataset_count);
     let mut readers: Vec<PartitionReader> = Vec::new();
     for path in partition_paths {
-        readers.push(PartitionReader::new(path.clone(), width)?);
+        readers.push(PartitionReader::new(path.clone())?);
     }
 
     let mut heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
@@ -3831,15 +4066,24 @@ fn merge_to_channel(
         }
     }
 
+    let batch_size = batch_size.max(1);
     let mut records_sent = 0u64;
+    let mut batch: SimplitigBatch = Vec::with_capacity(batch_size);
+    let mut receiver_open = true;
     while let Some(Reverse(item)) = heap.pop() {
         let run_idx = item.run_idx;
-        if sender.send(item.record).is_err() {
-            break; // receiver dropped
-        }
+        batch.push(item.record);
         records_sent += 1;
         if records_sent % 1_000_000 == 0 {
             eprintln!("  merge: sent {} records so far", records_sent);
+        }
+        if batch.len() >= batch_size {
+            let out = std::mem::take(&mut batch);
+            if sender.send(out).is_err() {
+                receiver_open = false;
+                break; // receiver dropped
+            }
+            batch = Vec::with_capacity(batch_size);
         }
         if let Some(next) = readers[run_idx].next_record()? {
             heap.push(Reverse(HeapItem {
@@ -3847,6 +4091,9 @@ fn merge_to_channel(
                 record: next,
             }));
         }
+    }
+    if receiver_open && !batch.is_empty() {
+        let _ = sender.send(batch);
     }
     drop(sender);
     eprintln!("  merge complete: {} records sent", records_sent);

@@ -31,9 +31,9 @@ struct Args {
     ///Temporary directory for unitigs parsing
     #[arg(short = 'd', long, default_value_t = String::from(""))]
     temp_dir: String,
-    ///Memory budget in GB for ggcat workflows (oversized compression partitions and --ggcat-rebuild)
-    #[arg(short = 'r', long, default_value_t = 8)]
-    memory: usize,
+    ///Required memory budget in GB for compression/decompression workflows
+    #[arg(short = 'r', long)]
+    memory: Option<usize>,
     ///K value, default = 31
     #[arg(short, long, default_value_t = 31)]
     k_size: usize,
@@ -71,7 +71,6 @@ fn main() {
     let input_fof = args.input_list;
     let threads = args.threads;
     let temp_dir = args.temp_dir;
-    let memory = args.memory;
     let k = args.k_size;
     let m = args.minimizer_size;
     //TODO HANDLE ERRORS FOR COMP AND DECOMP
@@ -89,6 +88,10 @@ fn main() {
         std::process::exit(1);
     }
     if let Some(do_decompress) = args.decompress {
+        let Some(memory) = args.memory else {
+            eprintln!("Error: please provide a memory budget with -r/--memory <GB>.");
+            std::process::exit(2);
+        };
         if do_decompress == "decompress" {
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
