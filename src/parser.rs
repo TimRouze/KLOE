@@ -2085,8 +2085,8 @@ pub fn run_parser_streaming(
     let dataset_count = file_paths.len();
 
     // Create encoders only when running Step 1 (they truncate files).
-    // For --only-step2, build dummy encoder list with paths only.
-    let encoders = if only_step2 {
+    // For --only-step2 / --only-step3, build dummy encoder list with paths only.
+    let encoders = if only_step2 || only_step3 {
         let writers: Vec<PartitionWriter> = (0..partitions)
             .map(|i| PartitionWriter {
                 path: output_dir.join(format!("{i}.fa.zst")),
