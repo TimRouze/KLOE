@@ -36,6 +36,7 @@ num-format = "0.4"
 anyhow = "1.0"
 hashbrown = { version = "0.14", default-features = false, features = ["ahash"] }
 ahash = "0.8"
+rustc-hash = "2.1"
 xz2 = "0.1"
 tempfile = "3.23.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -13,7 +13,8 @@ use genome_graph::compact_genome::interface::sequence::{GenomeSequence, OwnedGen
 use genome_graph::compact_genome::interface::sequence_store::{HandleWithLength, SequenceStore};
 use genome_graph::io::fasta::read_bigraph_from_fasta_as_edge_centric;
 use genome_graph::io::SequenceData;
-use hashbrown::HashMap;
+use rustc_hash::FxBuildHasher;
+pub(crate) type HashMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
 use libmatchtigs::{
     EulertigAlgorithm, EulertigAlgorithmConfiguration, GreedytigAlgorithm,
     GreedytigAlgorithmConfiguration, MatchtigEdgeData, NodeWeightArrayType, TigAlgorithm,

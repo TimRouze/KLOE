@@ -4,7 +4,9 @@ use anyhow::{bail, Context, Result};
 use bio::io::fasta;
 use chrono::{DateTime, Duration, Utc};
 use flate2::read::GzDecoder;
-use hashbrown::{hash_map::Entry, HashMap};
+use hashbrown::hash_map::Entry;
+use rustc_hash::FxBuildHasher;
+type HashMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
 use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
 use rayon::{prelude::*, ThreadPoolBuilder};
@@ -396,7 +398,7 @@ fn merge_bitsets(into: &mut Vec<u64>, from: &[u64]) {
 fn build_kmer_map_from_inputs(file_paths: &[PathBuf], k: usize) -> Result<HashMap<u64, Vec<u64>>> {
     let dataset_count = file_paths.len();
     let words = bitset_words(dataset_count);
-    let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut map: HashMap<u64, Vec<u64>> = HashMap::default();
     for (idx, path) in file_paths.iter().enumerate() {
         let word_idx = idx / 64;
         let bit_mask = 1u64 << (idx % 64);
@@ -447,7 +449,7 @@ fn build_output_kmer_map(
     k: usize,
     dataset_count: usize,
 ) -> Result<HashMap<u64, Vec<u64>>> {
-    let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut map: HashMap<u64, Vec<u64>> = HashMap::default();
     let reader = open_fasta_reader(simplitig_path)?;
     for record in reader.records() {
         let record = record
@@ -718,7 +720,7 @@ fn process_file(
     dataset_count: usize,
 ) -> Result<()> {
     let reader = open_fasta_reader(file_path)?;
-    let mut local_buffers: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut local_buffers: HashMap<usize, Vec<u8>> = HashMap::default();
     let mut local_superkmers = 0u64;
     let mut local_bases = 0u64;
     let file_id_header = format!(">{}\n", file_id).into_bytes();
@@ -801,7 +803,7 @@ fn build_kmer_map_from_partition(
     k: usize,
     dataset_count: usize,
 ) -> Result<(HashMap<u64, KmerEntry>, Vec<u64>, usize)> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     let mut arena = Vec::new();
     let words = build_kmer_map_reuse(partition_path, k, dataset_count, &mut map, &mut arena)?;
     Ok((map, arena, words))
