@@ -2068,10 +2068,11 @@ pub fn run_parser_streaming(
     if k < m {
         bail!("k-mer length ({}) must be >= minimizer length ({})", k, m);
     }
-    // When running --only-step2 repeatedly, preserve partition files for re-use.
-    KEEP_PARTITION_FILES.store(only_step2, Ordering::Relaxed);
-    // When running --only-step3 repeatedly, preserve simplitigs-part files for re-use.
-    KEEP_SIMPLITIG_PART_FILES.store(only_step3, Ordering::Relaxed);
+    // When running any --only-stepN, preserve all intermediate files so each
+    // step can be re-run independently without regenerating earlier outputs.
+    let any_only_step = only_step1 || only_step2 || only_step3;
+    KEEP_PARTITION_FILES.store(any_only_step, Ordering::Relaxed);
+    KEEP_SIMPLITIG_PART_FILES.store(any_only_step, Ordering::Relaxed);
     let overall_start = Utc::now();
     let partitions = 1u64
         .checked_shl(partition_power)
