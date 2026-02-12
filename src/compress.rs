@@ -1,7 +1,7 @@
 
 use core::panic;
 use std::fmt::Write as FmtWrite;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Result, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -109,25 +109,23 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
 fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc::Receiver<Vec<parser::SimplitigRecord>>) -> Vec<usize>{
     let write_time = Utc::now();
     println!("Starting writing compressed sequences (streaming).");
-    let pair = match write_compressed_from_stream(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files, record_rx){
-        Ok(res_pair) => res_pair,
+    let pos_nb_unitig = match write_compressed_from_stream(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files, record_rx){
+        Ok(pos) => pos,
         Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
     };
-    parser::log_checkpoint("Writing compressed sequences wall time:", write_time);
+    parser::log_checkpoint("Writing compressed sequences + id_to_color temp files wall time:", write_time);
     let position_time = Utc::now();
-    let pos_nb_unitig = pair.0;
-    let id_to_color_vec = pair.1;
 
     println!("Starting to write positions");
-    let cursor_positions = match write_positions(pos_nb_unitig, String::from(output_dir.clone()+"positions_kloe.bin")){
+    let _cursor_positions = match write_positions(pos_nb_unitig, String::from(output_dir.clone()+"positions_kloe.bin")){
         Ok(vec) => vec,
         Err(e) => panic!("Error writting positions: {e:?}"),
     };
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
-    let write_id_cid = match write_id_to_color_id_test(output_dir.clone()+"id_to_color_id.txt.zst", id_to_color_vec, cursor_positions){
+    let write_id_cid = match write_id_to_color_id_from_disk(output_dir, nb_files){
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
-        Err(e) => panic!("error writting id to color id list: {e:?}"),
+        Err(e) => panic!("error writing id to color id list: {e:?}"),
     };
     parser::log_checkpoint("Write id to cid wall time:", id_time);
     parser::log_checkpoint("Compression took:", write_time);
@@ -137,16 +135,24 @@ fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc:
 /// Consume sorted SimplitigRecords from a channel and compress them.
 /// Same logic as write_compressed but reads from mpsc::Receiver instead of FASTA file.
 /// Uses bitset-based group detection (u64 compare) instead of header string parsing.
+/// Streams id-to-CID mapping to temporary files on disk (one per input file) to avoid
+/// holding the entire id_to_color_vec in memory (~80 GB for 256 files × 405M CIDs).
+/// Returns pos_nb_unitig — id-to-CID temp files are on disk.
 fn write_compressed_from_stream(
     unitigs_file_path: String,
     output_dir: &String,
     nb_files: u32,
     record_rx: mpsc::Receiver<Vec<parser::SimplitigRecord>>,
-) -> Result<(Vec<(u64, u64)>, Vec<Vec<usize>>)> {
+) -> Result<Vec<(u64, u64)>> {
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
     let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
 
-    let mut id_to_color_vec: Vec<Vec<usize>> = vec![Vec::new(); nb_files as usize];
+    // One temp file per input file for streaming CID writes (instead of in-memory Vec<Vec<usize>>)
+    let mut id_to_color_writers: Vec<BufWriter<File>> = Vec::with_capacity(nb_files as usize);
+    for fid in 0..nb_files {
+        let path = format!("{}.id_to_color_tmp_{}.bin", output_dir, fid);
+        id_to_color_writers.push(BufWriter::new(File::create(&path)?));
+    }
     let mut pos_nb_unitig: Vec<(u64, u64)> = vec![(0, 0)];
 
     let mut prev_tigs_size: u64 = 0;
@@ -193,12 +199,13 @@ fn write_compressed_from_stream(
                 size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
                 size_file.write_all(&group_sizes_buffer)?;
 
-                // Iterate bits directly into id_to_color_vec (no intermediate Vec)
+                // Stream CID to temp files for each file in this color group
+                let cid_bytes = (cid as u32).to_le_bytes();
                 if current_words.is_empty() {
                     let mut word = current_bitset;
                     while word != 0 {
                         let bit = word.trailing_zeros() as usize;
-                        id_to_color_vec[bit].push(cid);
+                        id_to_color_writers[bit].write_all(&cid_bytes)?;
                         word &= word - 1;
                     }
                 } else {
@@ -206,7 +213,7 @@ fn write_compressed_from_stream(
                         let mut w = word;
                         while w != 0 {
                             let bit = w.trailing_zeros() as usize;
-                            id_to_color_vec[word_idx * 64 + bit].push(cid);
+                            id_to_color_writers[word_idx * 64 + bit].write_all(&cid_bytes)?;
                             w &= w - 1;
                         }
                     }
@@ -256,12 +263,13 @@ fn write_compressed_from_stream(
         size_file.write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
         size_file.write_all(&group_sizes_buffer)?;
 
-        // Final group: iterate bits into id_to_color_vec
+        // Stream CID to temp files for final group
+        let cid_bytes = (cid as u32).to_le_bytes();
         if current_words.is_empty() {
             let mut word = current_bitset;
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
-                id_to_color_vec[bit].push(cid);
+                id_to_color_writers[bit].write_all(&cid_bytes)?;
                 word &= word - 1;
             }
         } else {
@@ -269,7 +277,7 @@ fn write_compressed_from_stream(
                 let mut w = word;
                 while w != 0 {
                     let bit = w.trailing_zeros() as usize;
-                    id_to_color_vec[word_idx * 64 + bit].push(cid);
+                    id_to_color_writers[word_idx * 64 + bit].write_all(&cid_bytes)?;
                     w &= w - 1;
                 }
             }
@@ -278,9 +286,13 @@ fn write_compressed_from_stream(
 
     omni_file.flush()?;
     size_file.flush()?;
+    for w in &mut id_to_color_writers {
+        w.flush()?;
+    }
+    drop(id_to_color_writers);
 
     println!("Completed compression: total tigs={}, total sizes={}", prev_tigs_size, prev_bucket_pos);
-    Ok((pos_nb_unitig, id_to_color_vec))
+    Ok(pos_nb_unitig)
 }
 
 
@@ -450,6 +462,57 @@ fn write_id_to_color_id_test(cid_file_path: String, id_to_color_vec: Vec<Vec<usi
         tot_size += 8 + buffer.len();
         cid_file.write_all(&(buffer.len() as u64).to_le_bytes())?;
         cid_file.write_all(&buffer)?;
+    }
+
+    cid_file.write_all(&(0_u64).to_le_bytes())?;
+    Ok(id_cid_line_sizes)
+}
+
+/// Disk-streaming variant of write_id_to_color_id_test.
+/// Reads CIDs from per-file temp files instead of in-memory Vec<Vec<usize>>.
+/// Deletes temp files after processing.
+fn write_id_to_color_id_from_disk(output_dir: &str, nb_files: u32) -> std::io::Result<Vec<usize>> {
+    let cid_file_path = format!("{}id_to_color_id.txt.zst", output_dir);
+    let mut cid_file = BufWriter::new(File::create(&cid_file_path)?);
+    let mut id_cid_line_sizes = Vec::with_capacity(nb_files as usize);
+    let mut tot_size: usize = 0;
+
+    for fid in 0..nb_files {
+        let tmp_path = format!("{}.id_to_color_tmp_{}.bin", output_dir, fid);
+        let file_data = fs::read(&tmp_path)?;
+        let num_cids = file_data.len() / 4;
+
+        // Build the comma-separated position string (cursor_positions[cid] = cid * 16)
+        let mut to_write = String::new();
+        for i in 0..num_cids {
+            let offset = i * 4;
+            let cid = u32::from_le_bytes([
+                file_data[offset],
+                file_data[offset + 1],
+                file_data[offset + 2],
+                file_data[offset + 3],
+            ]) as usize;
+            let pos = cid * 16;
+            if i > 0 {
+                to_write.push(',');
+            }
+            write!(&mut to_write, "{}", pos).unwrap();
+        }
+
+        let mut buffer = Vec::new();
+        {
+            let mut cid_encoder = Encoder::new(&mut buffer, 1)?;
+            cid_encoder.write_all(to_write.as_bytes())?;
+            cid_encoder.finish()?;
+        }
+
+        id_cid_line_sizes.push(tot_size);
+        tot_size += 8 + buffer.len();
+        cid_file.write_all(&(buffer.len() as u64).to_le_bytes())?;
+        cid_file.write_all(&buffer)?;
+
+        // Clean up temp file
+        fs::remove_file(&tmp_path)?;
     }
 
     cid_file.write_all(&(0_u64).to_le_bytes())?;
