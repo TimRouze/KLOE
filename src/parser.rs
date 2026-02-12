@@ -2061,7 +2061,7 @@ pub fn run_parser_streaming(
     only_step2: bool,
     only_step3: bool,
 ) -> Result<(
-    mpsc::Receiver<SimplitigRecord>,
+    mpsc::Receiver<Vec<SimplitigRecord>>,
     thread::JoinHandle<Result<()>>,
     usize, // dataset_count
 )> {
@@ -2171,7 +2171,7 @@ pub fn run_parser_streaming(
 
     if only_step1 {
         // Return a dummy channel + handle — caller will exit immediately.
-        let (_, record_rx) = mpsc::sync_channel::<SimplitigRecord>(0);
+        let (_, record_rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(0);
         let handle = thread::spawn(|| Ok(()));
         println!("--only-step1: partition files written, stopping.");
         return Ok((record_rx, handle, dataset_count));
@@ -2238,7 +2238,7 @@ pub fn run_parser_streaming(
 
     if only_step2 {
         // Stop after Step 2 — skip merge/compression for pure benchmarking.
-        let (_, record_rx) = mpsc::sync_channel::<SimplitigRecord>(0);
+        let (_, record_rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(0);
         let handle = thread::spawn(|| Ok(()));
         println!("--only-step2: compaction done, stopping (skipping Step 3).");
         return Ok((record_rx, handle, dataset_count));
@@ -2261,7 +2261,7 @@ pub fn run_parser_streaming(
 
     // Step 3: spawn merge thread that sends records via channel
     let merge_start = Utc::now();
-    let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigRecord>(8192);
+    let (record_tx, record_rx) = mpsc::sync_channel::<Vec<SimplitigRecord>>(64);
     let sort_records = !skip_sort;
 
     let merge_handle = thread::spawn(move || -> Result<()> {
@@ -2275,14 +2275,26 @@ pub fn run_parser_streaming(
             // k-way merge sending records to channel
             merge_to_channel(&partition_paths, record_tx, dataset_count, k)?;
         } else {
-            // No sorting: just stream records from each partition
+            // No sorting: just stream records from each partition in batches
+            const BATCH_SIZE: usize = 512;
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            let mut send_failed = false;
             for path in &partition_paths {
+                if send_failed { break; }
                 let mut reader = PartitionReader::new(path.clone(), dataset_count)?;
                 while let Some(record) = reader.next_record()? {
-                    if record_tx.send(record).is_err() {
-                        break;
+                    batch.push(record);
+                    if batch.len() >= BATCH_SIZE {
+                        let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
+                        if record_tx.send(full_batch).is_err() {
+                            send_failed = true;
+                            break;
+                        }
                     }
                 }
+            }
+            if !send_failed && !batch.is_empty() {
+                let _ = record_tx.send(batch);
             }
             drop(record_tx);
         }
@@ -2311,7 +2323,7 @@ pub fn run_parser_streaming(
 /// Performs k-way merge of sorted partition files, sending records to a channel.
 fn merge_to_channel(
     partition_paths: &[PathBuf],
-    sender: mpsc::SyncSender<SimplitigRecord>,
+    sender: mpsc::SyncSender<Vec<SimplitigRecord>>,
     dataset_count: usize,
     _k: usize,
 ) -> Result<()> {
@@ -2330,13 +2342,19 @@ fn merge_to_channel(
         }
     }
 
+    const BATCH_SIZE: usize = 512;
+    let mut batch: Vec<SimplitigRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut records_sent = 0u64;
     while let Some(Reverse(item)) = heap.pop() {
         let run_idx = item.run_idx;
-        if sender.send(item.record).is_err() {
-            break; // receiver dropped
-        }
+        batch.push(item.record);
         records_sent += 1;
+        if batch.len() >= BATCH_SIZE {
+            let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
+            if sender.send(full_batch).is_err() {
+                break; // receiver dropped
+            }
+        }
         if records_sent % 1_000_000 == 0 {
             eprintln!("  merge: sent {} records so far", records_sent);
         }
@@ -2346,6 +2364,9 @@ fn merge_to_channel(
                 record: next,
             }));
         }
+    }
+    if !batch.is_empty() {
+        let _ = sender.send(batch);
     }
     drop(sender);
     eprintln!("  merge complete: {} records sent", records_sent);

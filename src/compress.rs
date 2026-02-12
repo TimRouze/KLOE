@@ -106,7 +106,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize>{
 }
 
 /// Streaming variant: consumes records from a channel instead of reading from a file.
-fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc::Receiver<parser::SimplitigRecord>) -> Vec<usize>{
+fn sort_by_bucket_streaming(output_dir: &String, nb_files: u32, record_rx: mpsc::Receiver<Vec<parser::SimplitigRecord>>) -> Vec<usize>{
     let write_time = Utc::now();
     println!("Starting writing compressed sequences (streaming).");
     let pair = match write_compressed_from_stream(output_dir.clone()+"tigs_kloe.fa", output_dir, nb_files, record_rx){
@@ -141,7 +141,7 @@ fn write_compressed_from_stream(
     unitigs_file_path: String,
     output_dir: &String,
     nb_files: u32,
-    record_rx: mpsc::Receiver<parser::SimplitigRecord>,
+    record_rx: mpsc::Receiver<Vec<parser::SimplitigRecord>>,
 ) -> Result<(Vec<(u64, u64)>, Vec<Vec<usize>>)> {
     let mut omni_file = BufWriter::new(File::create(unitigs_file_path)?);
     let mut size_file = BufWriter::new(File::create(output_dir.clone() + "bucket_sizes.txt")?);
@@ -161,7 +161,8 @@ fn write_compressed_from_stream(
     let mut group_encoder: Option<Encoder<&mut Vec<u8>>> = None;
     let mut buffer_encoded_seq: Vec<Vec<u8>> = Vec::new();
 
-    for record in record_rx {
+    for batch in record_rx {
+    for record in batch {
         let seq = &record.seq;
         let encoded_seq = <Converter as Convert<&[u8]>>::str2num(seq);
         let size = seq.len();
@@ -237,6 +238,7 @@ fn write_compressed_from_stream(
             encoder.write_all(&delta.to_le_bytes())?;
         }
         prev_size = size;
+    }
     }
 
     if has_group {
