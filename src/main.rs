@@ -2,6 +2,7 @@
 
 mod compress;
 mod decompress;
+mod merge;
 mod parser;
 mod utils;
 use clap::Parser;
@@ -11,7 +12,7 @@ use std::path::Path;
 #[command(author, version, about, long_about = None)]
 struct Args {
     ///output: Option<String>,
-    /// Decompression "compress" to compress input, "decompress" to decompress input, "stats" to get kmer stats
+    /// Command mode: "compress", "decompress", or "merge"
     decompress: Option<String>,
     ///Input file list (Compression)
     #[arg(short, long, default_value_t=String::from(""))]
@@ -25,6 +26,9 @@ struct Args {
     ///input directory for decompression
     #[arg(short, long, default_value_t = String::from(""))]
     compressed_dir: String,
+    ///second input archive directory for merge mode
+    #[arg(long, default_value_t = String::from(""))]
+    compressed_dir_b: String,
     ///List of files to decompress
     #[arg(short = 'Q', long, default_value_t = String::from(""))]
     wanted_files: String,
@@ -67,6 +71,7 @@ fn main() {
 
     let output_dir = args.out_dir;
     let input_dir = args.compressed_dir;
+    let input_dir_b = args.compressed_dir_b;
     //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
     let input_fof = args.input_list;
     let threads = args.threads;
@@ -154,11 +159,43 @@ fn main() {
                 std::process::exit(1);
             }
             //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
+        } else if do_decompress == "merge" {
+            if input_dir.is_empty() || input_dir_b.is_empty() {
+                eprintln!(
+                    "merge requires two archives: use -c/--compressed-dir for archive A and --compressed-dir-b for archive B"
+                );
+                std::process::exit(2);
+            }
+            let merge_cfg = merge::MergeConfig {
+                threads,
+                minimizer_size: m,
+                partition_power: args.partition_power,
+                temp_dir: temp_dir.clone(),
+                verify_kmers: args.verify_kmers,
+                skip_sort: args.skip_sort,
+                use_unitigs,
+                use_matchtigs,
+                use_eulertigs,
+            };
+            if let Err(err) = merge::merge_archives_with_config(
+                &input_dir,
+                &input_dir_b,
+                &output_dir,
+                k,
+                memory,
+                merge_cfg,
+            ) {
+                eprintln!("merge failed: {err}");
+                std::process::exit(1);
+            }
         }
     } else {
-        println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
+        println!(
+            "Wrong positional arguments given. Values are 'compress', 'decompress', or 'merge'"
+        );
         println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
         println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
+        println!("Ex: if merge: cargo r -r -- merge -c archive_a --compressed-dir-b archive_b -o merged_archive -r 16");
     }
 }
 
@@ -180,7 +217,7 @@ fn is_compressed_dir_complete(input_dir: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compress, decompress};
+    use super::{compress, decompress, merge};
     use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;
@@ -931,5 +968,66 @@ mod tests {
                 "mode={mode}: targeted decompression should not create non-target files"
             );
         }
+    }
+
+    #[test]
+    fn merge_two_archives_preserves_per_file_kmer_content() {
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive_a = workdir.path().join("archive_a");
+        let archive_b = workdir.path().join("archive_b");
+        let merged_archive = workdir.path().join("archive_merged");
+        let merged_out = workdir.path().join("merged_out");
+        fs::create_dir_all(&archive_a).expect("create archive_a directory");
+        fs::create_dir_all(&archive_b).expect("create archive_b directory");
+        fs::create_dir_all(&merged_archive).expect("create merged archive directory");
+        fs::create_dir_all(&merged_out).expect("create merged output directory");
+
+        let shared = "ACGTACGTTGCAACGTACGTTGCAACGTACGTACGTA".to_string();
+        let a1_only = "TTGCAACGTACGTTTGCAACGTACGTTTGCAACGTAC".to_string();
+        let a2_only = "GGATCCGGATCCGGATCCGGATCCGGATCCGGATCCA".to_string();
+        let b2_only = "CCGTAACCGTAACCGTAACCGTAACCGTAACCGTAAC".to_string();
+
+        let a_file1 = workdir.path().join("a_sample1.fa");
+        let a_file2 = workdir.path().join("a_sample2.fa");
+        let b_file1 = workdir.path().join("b_sample1.fa");
+        let b_file2 = workdir.path().join("b_sample2.fa");
+
+        write_fasta(&a_file1, &[shared.as_str(), a1_only.as_str()]);
+        write_fasta(&a_file2, &[a2_only.as_str()]);
+        write_fasta(&b_file1, &[shared.as_str()]);
+        write_fasta(&b_file2, &[b2_only.as_str()]);
+
+        run_compression(&[a_file1.clone(), a_file2.clone()], &archive_a, K)
+            .expect("compress archive A");
+        run_compression(&[b_file1.clone(), b_file2.clone()], &archive_b, K)
+            .expect("compress archive B");
+
+        merge::merge_archives(
+            &archive_a.display().to_string(),
+            &archive_b.display().to_string(),
+            &merged_archive.display().to_string(),
+            K,
+            1,
+        )
+        .expect("merge archives");
+
+        run_full_decompression(&merged_archive, &merged_out);
+
+        assert_kmer_equivalent(
+            &[shared.clone(), a1_only.clone()],
+            &make_dump_path(&merged_out, &a_file1),
+            K,
+        );
+        assert_kmer_equivalent(
+            &[a2_only.clone()],
+            &make_dump_path(&merged_out, &a_file2),
+            K,
+        );
+        assert_kmer_equivalent(&[shared.clone()], &make_dump_path(&merged_out, &b_file1), K);
+        assert_kmer_equivalent(
+            &[b2_only.clone()],
+            &make_dump_path(&merged_out, &b_file2),
+            K,
+        );
     }
 }

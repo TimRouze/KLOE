@@ -71,7 +71,7 @@ fn read_input_fof_filenames(input_fof: &str) -> Result<Vec<String>> {
     Ok(filenames)
 }
 
-fn write_filenames_id_offsets(
+pub(crate) fn write_filenames_id_offsets(
     output_dir: &str,
     filenames: &[String],
     id_cid_line_sizes: &[usize],
@@ -209,7 +209,7 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize> {
 }
 
 /// Streaming variant: consumes records from a channel instead of reading from a file.
-fn sort_by_bucket_streaming(
+pub(crate) fn sort_by_bucket_streaming(
     output_dir: &String,
     nb_files: u32,
     record_rx: mpsc::Receiver<parser::SimplitigBatch>,
@@ -554,8 +554,7 @@ fn write_id_to_color_id_from_spills(
     cursor_positions: &[usize],
     spill_dir: &Path,
 ) -> std::io::Result<Vec<usize>> {
-    let mut cid_file =
-        BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&cid_file_path)?);
+    let mut cid_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&cid_file_path)?);
     let mut id_cid_line_sizes = Vec::with_capacity(spill_paths.len());
     let mut tot_size = 0usize;
 

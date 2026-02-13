@@ -33,6 +33,11 @@ For decompression, run:
 ./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST
 ```
 
+To merge two existing archives, run:
+```sh
+./target/release/kloe merge -c path/to/archive_A --compressed-dir-b path/to/archive_B -o path/to/merged/archive -r 16
+```
+
 ### Compression parameters
 When running kloe in compression mode, add "compress" before any other parameter.
 
@@ -99,3 +104,25 @@ After writing `Dump_*.fa` files, run embedded ggcat on those dumps and produce a
 - `rebuilt_simplitigs.fa` by default (implemented via ggcat Pathtigs)
 
 `-r/--memory` controls the rebuild budget; embedded ggcat uses half of this value (GB).
+
+## Archive merge
+When running kloe in merge mode, add "merge" before any other parameter.
+
+#### compressed-dir -c
+Input directory for archive A.
+
+#### compressed-dir-b
+Input directory for archive B.
+
+#### out-dir -o
+Output directory where the merged archive is written.
+
+#### memory -r
+Global memory budget in GB. Merge uses this budget to batch archive-A color sets while scanning archive B.
+
+#### output tig mode flags
+Merge honors the same output mode flags as compression:
+- default: simplitigs
+- `--unitig`
+- `--matchtig`
+- `--eulertig`
