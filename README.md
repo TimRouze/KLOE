@@ -70,13 +70,13 @@ There can only be one flag set at once or 0. If several flags are set the tool w
 KLOE embeds `ggcat` in-process (no external `ggcat` executable required at runtime).
 
 Compression keeps the native KLOE pipeline, and only routes oversized phase-2 partitions to ggcat.
-Default oversized threshold is partition file size >= 1 GB.
+Default oversized threshold is partition file size >= 10 GB.
 
 You can tune the threshold with:
 - `KLOE_AUTO_GGCAT_PARTITION_MB`
 - `KLOE_AUTO_GGCAT_PARTITION_AVG_MB` (legacy alias)
 
-`-r/--memory` sets ggcat memory budget in GB for compression fallback and `--ggcat-rebuild`.
+`-r/--memory` sets the global budget in GB. Native KLOE compaction uses this full value; embedded ggcat uses half of it.
 
 
 ## Archive decompression
@@ -98,4 +98,4 @@ After writing `Dump_*.fa` files, run embedded ggcat on those dumps and produce a
 - `rebuilt_eulertigs.fa` when `--eulertig` is set
 - `rebuilt_simplitigs.fa` by default (implemented via ggcat Pathtigs)
 
-`-r/--memory` controls the rebuild memory budget (GB).
+`-r/--memory` controls the rebuild budget; embedded ggcat uses half of this value (GB).

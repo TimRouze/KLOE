@@ -167,9 +167,10 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
     };
     fs::create_dir_all(&temp_dir)?;
 
+    let ggcat_memory_gb = (cfg.memory_gb / 2).max(1);
     let instance = GGCATInstance::create(GGCATConfig {
         temp_dir: Some(temp_dir.clone()),
-        memory: cfg.memory_gb.max(1) as f64,
+        memory: ggcat_memory_gb as f64,
         prefer_memory: true,
         total_threads_count: cfg.threads.max(1),
         intermediate_compression_level: None,
@@ -190,7 +191,7 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
         rebuild_mode_name(mode),
         cfg.k,
         cfg.threads.max(1),
-        cfg.memory_gb.max(1)
+        ggcat_memory_gb
     );
     let graph_path = instance.build_graph(
         streams,

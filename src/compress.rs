@@ -112,8 +112,9 @@ pub fn compress_with_ggcat(
     let _overall_start = Utc::now();
     let filenames = read_input_fof_filenames(input_fof)?;
     println!("Compression backend: native KLOE parser (ggcat only for oversized partitions)");
+    let ggcat_memory_gb = (ggcat_cfg.memory_gb / 2).max(1);
     let parser_ggcat_cfg = parser::PartitionGgcatConfig {
-        memory_gb: ggcat_cfg.memory_gb,
+        memory_gb: ggcat_memory_gb,
         native_memory_budget_gb: ggcat_cfg.memory_gb as u64,
         temp_dir: ggcat_cfg.temp_dir.clone(),
         ..parser::PartitionGgcatConfig::default()
