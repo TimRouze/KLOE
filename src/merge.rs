@@ -746,23 +746,30 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
         })?;
 
         let mut cids = Vec::new();
+        let mut current_cid = 0usize;
         for token in text.split(',') {
             let token = token.trim();
             if token.is_empty() {
                 continue;
             }
-            let offset = token.parse::<usize>().map_err(|err| {
+            let delta = token.parse::<usize>().map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid cid offset '{}' in '{}': {}",
+                        "invalid cid delta '{}' in '{}': {}",
                         token,
                         path.to_string_lossy(),
                         err
                     ),
                 )
             })?;
-            cids.push(offset / 16);
+            current_cid = current_cid.checked_add(delta).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cid delta overflow while decoding '{}'", path.to_string_lossy()),
+                )
+            })?;
+            cids.push(current_cid);
         }
         cids.sort_unstable();
         cids.dedup();

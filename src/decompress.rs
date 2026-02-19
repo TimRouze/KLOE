@@ -299,7 +299,7 @@ pub fn decompress_with_options(
 ///
 /// The positions file contains N entries of exactly 16 bytes each:
 /// [u64 tigs_pos LE][u64 sizes_pos LE].
-/// Returns a Vec where index i corresponds to the position pair at byte offset i*16.
+/// Returns a Vec where index i corresponds to CID i.
 fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
     let mut file = BufReader::new(File::open(positions_filename)?);
     let file_size = file.get_ref().metadata()?.len() as usize;
@@ -319,12 +319,32 @@ fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
     Ok(positions)
 }
 
-/// Build a lookup from byte-offset (as stored in id_to_color_id) to position index.
+/// Decode comma-separated delta-encoded CIDs into absolute CID indexes.
 ///
-/// The id_to_color_id file stores byte offsets into the positions file as CID keys.
-/// With the raw format, byte_offset = index * 16, so index = byte_offset / 16.
-fn byte_offset_to_position_index(byte_offset: usize) -> usize {
-    byte_offset / 16
+/// Example: "3,2,0,5" => [3,5,5,10]
+fn decode_delta_cids(text: &str, context: &str) -> Result<Vec<usize>> {
+    let mut cids = Vec::new();
+    let mut current = 0usize;
+    for token in text.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let delta = token.parse::<usize>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid cid delta '{}' in '{}': {}", token, context, err),
+            )
+        })?;
+        current = current.checked_add(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cid delta overflow while decoding '{}'", context),
+            )
+        })?;
+        cids.push(current);
+    }
+    Ok(cids)
 }
 
 /// Preload all bucket sizes from the sizes file into a Vec indexed by byte offset.
@@ -416,7 +436,7 @@ fn decompress_all(
         }
 
         // Look up position from preloaded data
-        let pos_index = byte_offset_to_position_index(*cid);
+        let pos_index = *cid;
         if pos_index >= all_positions.len() {
             eprintln!(
                 "Error: position index {} out of range for CID {}",
@@ -508,15 +528,21 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
             let mut decoder = Decoder::new(&buffer[..])?;
             decoder.read_to_end(&mut decompressed_data)?;
         }
-        let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
-        let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
-        for cid in temp_cids {
-            if cid != "" {
-                cid_ids_map
-                    .entry(cid.parse::<usize>().unwrap())
-                    .and_modify(|list: &mut Vec<_>| list.push(counter))
-                    .or_insert(Vec::from([counter]));
-            }
+        let str_tmp = String::from_utf8(decompressed_data).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid UTF-8 while decoding '{}' entry: {}",
+                    color_id_filename, err
+                ),
+            )
+        })?;
+        let decoded_cids = decode_delta_cids(&str_tmp, color_id_filename)?;
+        for cid in decoded_cids {
+            cid_ids_map
+                .entry(cid)
+                .and_modify(|list: &mut Vec<_>| list.push(counter))
+                .or_insert(Vec::from([counter]));
         }
         color_id_file.read_exact(&mut buffer_size)?;
         size_read = usize::from_le_bytes(buffer_size);
@@ -556,15 +582,22 @@ fn get_cid_to_id_targeted(
                 let mut decoder = Decoder::new(&buffer[..])?;
                 decoder.read_to_end(&mut decompressed_data)?;
             }
-            let str_tmp = String::from_utf8(decompressed_data).expect("Error reading cids");
-            let temp_cids = str_tmp.split(',').collect::<Vec<_>>();
-            for cid in temp_cids {
-                if cid != "" {
-                    cid_ids_map
-                        .entry(cid.parse::<usize>().unwrap())
-                        .and_modify(|list: &mut Vec<_>| list.push(entry.0))
-                        .or_insert(Vec::from([entry.0]));
-                }
+            let str_tmp = String::from_utf8(decompressed_data).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid UTF-8 while decoding '{}' entry at offset {}: {}",
+                        color_id_filename, entry.1, err
+                    ),
+                )
+            })?;
+            let context = format!("{}@{}", color_id_filename, entry.1);
+            let decoded_cids = decode_delta_cids(&str_tmp, &context)?;
+            for cid in decoded_cids {
+                cid_ids_map
+                    .entry(cid)
+                    .and_modify(|list: &mut Vec<_>| list.push(entry.0))
+                    .or_insert(Vec::from([entry.0]));
             }
             wanted_filenames.push((line.clone(), entry.0));
         } else {
@@ -638,7 +671,7 @@ fn decompress_wanted(
         }
 
         // Look up position from preloaded data
-        let pos_index = byte_offset_to_position_index(*cid);
+        let pos_index = *cid;
         if pos_index >= all_positions.len() {
             eprintln!(
                 "Error: position index {} out of range for CID {}",

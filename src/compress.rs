@@ -162,7 +162,7 @@ pub fn compress_with_ggcat(
 /// - read color-set information,
 /// - compress and write unitigs grouped by color,
 /// - write positions of each color bucket and tigs bucket,
-/// - generate mapping from input file ID to color-bucket positions.
+/// - generate mapping from input file ID to color-bucket CIDs.
 ///
 /// PARAM
 /// - `output_dir`: base output directory where Fulgor outputs are located.
@@ -185,20 +185,18 @@ pub fn sort_by_bucket(output_dir: &String, nb_files: u32) -> Vec<usize> {
     let id_to_color_vec = pair.1;
 
     println!("Starting to write positions");
-    let cursor_positions = match write_positions(
+    if let Err(e) = write_positions(
         pos_nb_unitig,
         String::from(output_dir.clone() + "positions_kloe.bin"),
     ) {
-        Ok(vec) => vec,
-        Err(e) => panic!("Error writting positions: {e:?}"),
-    };
+        panic!("Error writting positions: {e:?}");
+    }
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
     // WRITE FILE ID TO COLOR ID FILE
     let write_id_cid = match write_id_to_color_id(
         output_dir.clone() + "id_to_color_id.txt.zst",
         id_to_color_vec,
-        cursor_positions,
     ) {
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
@@ -232,19 +230,17 @@ pub(crate) fn sort_by_bucket_streaming(
     let spill_dir = triple.2;
 
     println!("Starting to write positions");
-    let cursor_positions = match write_positions(
+    if let Err(e) = write_positions(
         pos_nb_unitig,
         String::from(output_dir.clone() + "positions_kloe.bin"),
     ) {
-        Ok(vec) => vec,
-        Err(e) => panic!("Error writting positions: {e:?}"),
-    };
+        panic!("Error writting positions: {e:?}");
+    }
     parser::log_checkpoint("Write positions wall time:", position_time);
     let id_time = Utc::now();
     let write_id_cid = match write_id_to_color_id_from_spills(
         output_dir.clone() + "id_to_color_id.txt.zst",
         &spill_paths,
-        &cursor_positions,
         &spill_dir,
     ) {
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
@@ -522,19 +518,14 @@ fn write_compressed(
 /// PARAM
 /// - `pos_nb_unitigs`: vector of (tigs_cursor, sizes_cursor) pairs.
 /// - `filepath`: path to position file (should end in .bin, not .zst).
-///
-/// RETURNS
-/// - Vec<usize> of starting byte offsets in positions file (simply i*16).
-fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<Vec<usize>> {
+fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<()> {
     let mut pos_file = BufWriter::new(File::create(filepath).expect("unable to create file"));
-    let mut vec_cursor_position = Vec::with_capacity(pos_nb_unitigs.len());
-    for (i, elem) in pos_nb_unitigs.iter().enumerate() {
-        vec_cursor_position.push(i * 16);
+    for elem in &pos_nb_unitigs {
         pos_file.write_all(&elem.0.to_le_bytes())?;
         pos_file.write_all(&elem.1.to_le_bytes())?;
     }
     pos_file.flush()?;
-    Ok(vec_cursor_position)
+    Ok(())
 }
 
 fn create_id_cid_spill_dir(output_dir: &str) -> Result<PathBuf> {
@@ -551,7 +542,6 @@ fn create_id_cid_spill_dir(output_dir: &str) -> Result<PathBuf> {
 fn write_id_to_color_id_from_spills(
     cid_file_path: String,
     spill_paths: &[PathBuf],
-    cursor_positions: &[usize],
     spill_dir: &Path,
 ) -> std::io::Result<Vec<usize>> {
     let mut cid_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&cid_file_path)?);
@@ -564,27 +554,38 @@ fn write_id_to_color_id_from_spills(
         {
             let mut cid_encoder = Encoder::new(&mut payload, 1)?;
             let mut first = true;
+            let mut prev_cid = 0usize;
             loop {
                 let mut raw = [0u8; 8];
                 match std::io::Read::read_exact(&mut reader, &mut raw) {
                     Ok(()) => {
-                        let cid = u64::from_le_bytes(raw) as usize;
-                        if cid >= cursor_positions.len() {
+                        let raw_cid = u64::from_le_bytes(raw);
+                        let cid = usize::try_from(raw_cid).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "color id {} cannot be represented as usize while writing {}",
+                                    raw_cid,
+                                    cid_file_path
+                                ),
+                            )
+                        })?;
+                        if cid < prev_cid {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
-                                    "color id {} outside [0, {}) while writing {}",
-                                    cid,
-                                    cursor_positions.len(),
-                                    cid_file_path
+                                    "color ids are not sorted ({} before {}) while writing {}",
+                                    prev_cid, cid, cid_file_path
                                 ),
                             ));
                         }
+                        let delta = cid - prev_cid;
                         if !first {
                             cid_encoder.write_all(b",")?;
                         }
                         first = false;
-                        write!(&mut cid_encoder, "{}", cursor_positions[cid])?;
+                        write!(&mut cid_encoder, "{}", delta)?;
+                        prev_cid = cid;
                     }
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e),
@@ -610,7 +611,6 @@ fn write_id_to_color_id_from_spills(
 fn write_id_to_color_id(
     cid_file_path: String,
     id_to_color_vec: Vec<Vec<usize>>,
-    cursor_positions: Vec<usize>,
 ) -> std::io::Result<Vec<usize>> {
     let mut cid_file = BufWriter::new(File::create(&cid_file_path)?);
     let mut id_cid_line_sizes = Vec::with_capacity(id_to_color_vec.len());
@@ -618,13 +618,21 @@ fn write_id_to_color_id(
 
     for elem in id_to_color_vec {
         let mut to_write = String::new();
+        let mut prev_cid = 0usize;
 
-        for (i, e) in elem.iter().enumerate() {
-            let pos = cursor_positions[*e];
+        for (i, cid) in elem.iter().enumerate() {
+            if *cid < prev_cid {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("color ids are not sorted ({} before {})", prev_cid, cid),
+                ));
+            }
+            let delta = *cid - prev_cid;
             if i > 0 {
                 to_write.push(',');
             }
-            write!(&mut to_write, "{}", pos).unwrap();
+            write!(&mut to_write, "{}", delta).unwrap();
+            prev_cid = *cid;
         }
 
         let mut buffer = Vec::new();
