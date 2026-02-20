@@ -3,7 +3,7 @@
 mod compress;
 mod decompress;
 mod merge;
-mod parser;
+mod records;
 mod utils;
 use clap::Parser;
 use std::path::Path;

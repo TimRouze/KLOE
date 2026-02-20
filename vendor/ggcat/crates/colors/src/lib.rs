@@ -1,4 +1,3 @@
-#![allow(warnings)]
 use crate::storage::run_length::RunLengthColorsSerializer;
 
 pub mod bundles;
@@ -8,7 +7,5 @@ pub mod managers;
 pub mod non_colored;
 pub mod parsers;
 pub mod storage;
-
-pub(crate) mod async_slice_queue;
 
 pub type DefaultColorsSerializer = RunLengthColorsSerializer;

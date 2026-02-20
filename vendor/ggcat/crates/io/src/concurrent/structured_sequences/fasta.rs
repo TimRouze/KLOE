@@ -1,19 +1,32 @@
 use crate::concurrent::structured_sequences::{IdentSequenceWriter, StructuredSequenceBackend};
+use crate::concurrent::temp_reads::extra_data::{
+    SequenceExtraData, SequenceExtraDataConsecutiveCompression,
+};
 use config::{DEFAULT_OUTPUT_BUFFER_SIZE, DEFAULT_PER_CPU_BUFFER_SIZE};
-use flate2::write::GzEncoder;
+use dynamic_dispatch::dynamic_dispatch;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use lz4::{BlockMode, BlockSize, ContentChecksum};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use self::stream_finish::FastaWriterWrapper;
+use super::stream_finish::SequencesWriterWrapper;
 
 #[cfg(feature = "support_kmer_counters")]
 use super::SequenceAbundance;
+use super::{StructuredSequenceBackendInit, StructuredSequenceBackendWrapper};
 
-mod stream_finish;
+pub struct FastaWriterWrapper;
+
+#[dynamic_dispatch]
+impl StructuredSequenceBackendWrapper for FastaWriterWrapper {
+    type Backend<
+        ColorInfo: IdentSequenceWriter + SequenceExtraDataConsecutiveCompression,
+        LinksInfo: IdentSequenceWriter + SequenceExtraData,
+    > = FastaWriter<ColorInfo, LinksInfo>;
+}
 
 pub struct FastaWriter<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter> {
     writer: Box<dyn Write>,
@@ -31,17 +44,17 @@ unsafe impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter> Sync
 {
 }
 
-impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter>
-    FastaWriter<ColorInfo, LinksInfo>
+impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter> StructuredSequenceBackendInit
+    for FastaWriter<ColorInfo, LinksInfo>
 {
-    pub fn new_compressed_gzip(path: impl AsRef<Path>, level: u32) -> Self {
+    fn new_compressed_gzip(path: impl AsRef<Path>, level: u32) -> Self {
         let compress_stream = GzEncoder::new(
             BufWriter::with_capacity(DEFAULT_OUTPUT_BUFFER_SIZE, File::create(&path).unwrap()),
             Compression::new(level),
         );
 
         FastaWriter {
-            writer: Box::new(FastaWriterWrapper::new(BufWriter::with_capacity(
+            writer: Box::new(SequencesWriterWrapper::new(BufWriter::with_capacity(
                 DEFAULT_OUTPUT_BUFFER_SIZE,
                 compress_stream,
             ))),
@@ -50,7 +63,7 @@ impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter>
         }
     }
 
-    pub fn new_compressed_lz4(path: impl AsRef<Path>, level: u32) -> Self {
+    fn new_compressed_lz4(path: impl AsRef<Path>, level: u32) -> Self {
         let compress_stream = lz4::EncoderBuilder::new()
             .level(level)
             .checksum(ContentChecksum::NoChecksum)
@@ -63,7 +76,7 @@ impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter>
             .unwrap();
 
         FastaWriter {
-            writer: Box::new(FastaWriterWrapper::new(BufWriter::with_capacity(
+            writer: Box::new(SequencesWriterWrapper::new(BufWriter::with_capacity(
                 DEFAULT_OUTPUT_BUFFER_SIZE,
                 compress_stream,
             ))),
@@ -72,9 +85,26 @@ impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter>
         }
     }
 
-    pub fn new_plain(path: impl AsRef<Path>) -> Self {
+    fn new_compressed_zstd(path: impl AsRef<Path>, level: u32) -> Self {
+        let compress_stream = zstd::stream::write::Encoder::new(
+            BufWriter::with_capacity(DEFAULT_OUTPUT_BUFFER_SIZE, File::create(&path).unwrap()),
+            level as i32,
+        )
+        .unwrap();
+
         FastaWriter {
-            writer: Box::new(FastaWriterWrapper::new(BufWriter::with_capacity(
+            writer: Box::new(SequencesWriterWrapper::new(BufWriter::with_capacity(
+                DEFAULT_OUTPUT_BUFFER_SIZE,
+                compress_stream,
+            ))),
+            path: path.as_ref().to_path_buf(),
+            _phantom: PhantomData,
+        }
+    }
+
+    fn new_plain(path: impl AsRef<Path>) -> Self {
+        FastaWriter {
+            writer: Box::new(SequencesWriterWrapper::new(BufWriter::with_capacity(
                 DEFAULT_OUTPUT_BUFFER_SIZE,
                 File::create(&path).unwrap(),
             ))),
@@ -89,7 +119,7 @@ impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter>
 {
     type SequenceTempBuffer = Vec<u8>;
 
-    fn alloc_temp_buffer() -> Self::SequenceTempBuffer {
+    fn alloc_temp_buffer(_: usize) -> Self::SequenceTempBuffer {
         Vec::with_capacity(DEFAULT_PER_CPU_BUFFER_SIZE.as_bytes())
     }
 

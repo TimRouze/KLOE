@@ -9,7 +9,7 @@ use zstd::Decoder;
 
 use crate::compress;
 use crate::decompress;
-use crate::parser;
+use crate::records;
 use crate::utils::vec2str;
 
 const REQUIRED_ARCHIVE_FILES: [&str; 5] = [
@@ -293,7 +293,7 @@ pub fn merge_archives_with_config(
 
     let stage_output_dir = normalize_output_dir(&stage_archive_dir);
     let total_datasets = merged_filenames.len();
-    let (tx, rx) = mpsc::sync_channel::<parser::SimplitigBatch>(16);
+    let (tx, rx) = mpsc::sync_channel::<records::SimplitigBatch>(16);
 
     let producer = thread::spawn(move || {
         produce_merged_records(
@@ -363,7 +363,7 @@ fn produce_merged_records(
     a_batches: Vec<Vec<usize>>,
     b_cids: Vec<usize>,
     k: usize,
-    sender: mpsc::SyncSender<parser::SimplitigBatch>,
+    sender: mpsc::SyncSender<records::SimplitigBatch>,
 ) -> io::Result<MergeStats> {
     let mut matched_b_kmers: HashSet<u64> = HashSet::new();
     let mut emitted_records = 0u64;
@@ -494,7 +494,7 @@ fn recompact_stage_archive(
 fn emit_indexed_pass_records(
     indexed_kmers: HashMap<u64, Vec<u32>>,
     k: usize,
-    sender: &mpsc::SyncSender<parser::SimplitigBatch>,
+    sender: &mpsc::SyncSender<records::SimplitigBatch>,
 ) -> io::Result<u64> {
     let mut records = indexed_kmers
         .into_iter()
@@ -517,7 +517,7 @@ fn emit_indexed_pass_records(
                 arc
             }
         };
-        batch.push(parser::SimplitigRecord {
+        batch.push(records::SimplitigRecord {
             color_ids: color,
             seq: decode_kmer_bits(kmer, k),
         });
@@ -541,7 +541,7 @@ fn emit_b_only_records(
     shifted_b_cid_to_ids: &[Vec<u32>],
     matched_b_kmers: &HashSet<u64>,
     k: usize,
-    sender: &mpsc::SyncSender<parser::SimplitigBatch>,
+    sender: &mpsc::SyncSender<records::SimplitigBatch>,
 ) -> io::Result<u64> {
     let mut emitted = 0u64;
     let mut batch = Vec::with_capacity(PRODUCER_BATCH_SIZE);
@@ -563,7 +563,7 @@ fn emit_b_only_records(
             arc
         };
 
-        batch.push(parser::SimplitigRecord {
+        batch.push(records::SimplitigRecord {
             color_ids: color,
             seq: decode_kmer_bits(kmer, k),
         });
@@ -766,7 +766,10 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
             current_cid = current_cid.checked_add(delta).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("cid delta overflow while decoding '{}'", path.to_string_lossy()),
+                    format!(
+                        "cid delta overflow while decoding '{}'",
+                        path.to_string_lossy()
+                    ),
                 )
             })?;
             cids.push(current_cid);

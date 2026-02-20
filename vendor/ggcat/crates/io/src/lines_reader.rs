@@ -70,7 +70,7 @@ impl LinesReader {
                 },
                 DEFAULT_OUTPUT_BUFFER_SIZE,
             ) {
-                println!(
+                ggcat_logging::error!(
                     "WARNING: Error while reading file {}",
                     path.as_ref().display()
                 );
@@ -83,7 +83,46 @@ impl LinesReader {
             .unwrap();
             self.read_stream_buffered(file, callback)
                 .unwrap_or_else(|_| {
-                    println!(
+                    ggcat_logging::error!(
+                        "WARNING: Error while reading file {}",
+                        path.as_ref().display()
+                    );
+                });
+        } else if path.as_ref().extension().filter(|x| *x == "bz2").is_some() {
+            let file = bzip2::read::BzDecoder::new(
+                File::open(&path).expect(&format!("Cannot open file {}", path.as_ref().display())),
+            );
+            self.read_stream_buffered(file, callback)
+                .unwrap_or_else(|_| {
+                    ggcat_logging::error!(
+                        "WARNING: Error while reading file {}",
+                        path.as_ref().display()
+                    );
+                });
+        } else if path.as_ref().extension().filter(|x| *x == "xz").is_some() {
+            let file = xz2::read::XzDecoder::new(
+                File::open(&path).expect(&format!("Cannot open file {}", path.as_ref().display())),
+            );
+            self.read_stream_buffered(file, callback)
+                .unwrap_or_else(|_| {
+                    ggcat_logging::error!(
+                        "WARNING: Error while reading file {}",
+                        path.as_ref().display()
+                    );
+                });
+        } else if path
+            .as_ref()
+            .extension()
+            .filter(|x| *x == "zst" || *x == "zstd")
+            .is_some()
+        {
+            let file = zstd::stream::read::Decoder::new(
+                File::open(&path).expect(&format!("Cannot open file {}", path.as_ref().display())),
+            )
+            .unwrap();
+            self.read_stream_buffered(file, callback)
+                .unwrap_or_else(|_| {
+                    ggcat_logging::error!(
                         "WARNING: Error while reading file {}",
                         path.as_ref().display()
                     );
@@ -93,7 +132,7 @@ impl LinesReader {
                 File::open(&path).expect(&format!("Cannot open file {}", path.as_ref().display()));
             self.read_stream_buffered(file, callback)
                 .unwrap_or_else(|_| {
-                    println!(
+                    ggcat_logging::error!(
                         "WARNING: Error while reading file {}",
                         path.as_ref().display()
                     );
@@ -152,7 +191,7 @@ impl LinesReader {
                 // File finished
                 if buffer.len() == 0 {
                     if line_pending {
-                        eprintln!(
+                        ggcat_logging::error!(
                             "WARNING: No newline at ending of file '{}'",
                             file.as_ref().display()
                         );

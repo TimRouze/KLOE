@@ -24,8 +24,9 @@ GGCATInstance *GGCATInstance::create(GGCATConfig config)
         ffi_config.intermediate_compression_level = config.intermediate_compression_level,
         ffi_config.use_stats_file = config.use_stats_file,
         ffi_config.stats_file = rust::String(config.stats_file.c_str()),
+        ffi_config.messages_callback = (size_t)config.messages_callback;
 
-        ffi_instance = &ggcat_create(ffi_config);
+        ffi_instance = ggcat_create(ffi_config);
     }
     return &instance;
 }
@@ -40,7 +41,9 @@ std::string GGCATInstance::build_graph_from_files(
     ExtraElaborationStep extra_elab,
     bool colors,
     Slice<std::string> color_names,
-    size_t minimizer_length)
+    size_t minimizer_length,
+    uint32_t gfa_output_version,
+    bool enable_disk_optimization)
 {
     std::vector<rust::String> ffi_input_files;
 
@@ -66,7 +69,9 @@ std::string GGCATInstance::build_graph_from_files(
                                            minimizer_length,
                                            colors,
                                            min_multiplicity,
-                                           extra_elab);
+                                           extra_elab,
+                                           gfa_output_version,
+                                           enable_disk_optimization);
     return std::string(rust_str.c_str());
 }
 
@@ -80,7 +85,9 @@ std::string GGCATInstance::build_graph_internal_ffi(
     ExtraElaborationStep extra_elab,
     bool colors,
     Slice<std::string> color_names,
-    size_t minimizer_length)
+    size_t minimizer_length,
+    bool output_gfa,
+    bool enable_disk_optimization)
 {
     std::vector<InputStreamFFI> ffi_input_streams;
 
@@ -111,7 +118,9 @@ std::string GGCATInstance::build_graph_internal_ffi(
                                              minimizer_length,
                                              colors,
                                              min_multiplicity,
-                                             extra_elab);
+                                             extra_elab,
+                                             output_gfa,
+                                             enable_disk_optimization);
     return std::string(rust_str.c_str());
 }
 
@@ -194,14 +203,15 @@ void GGCATInstance::query_colormap_internal(
 {
     auto subsets_rust_vec = rust::Vec<uint32_t>();
     subsets_rust_vec.reserve(subsets_len);
-    for (size_t i = 0; i < subsets_len; i++) {
-        subsets_rust_vec.push_back(((uint32_t*)subsets_ptr)[i]);
+    for (size_t i = 0; i < subsets_len; i++)
+    {
+        subsets_rust_vec.push_back(((uint32_t *)subsets_ptr)[i]);
     }
 
     ggcat_query_colormap(*ffi_instance,
-                       rust::String(colormap_file.c_str()),
-                       subsets_rust_vec,
-                       single_thread_output_function,
-                       context,
-                       output_function);
+                         rust::String(colormap_file.c_str()),
+                         subsets_rust_vec,
+                         single_thread_output_function,
+                         context,
+                         output_function);
 }

@@ -1,19 +1,22 @@
-use crate::structs::query_colored_counters::{ColorsRange, QueryColoredCountersSerializer};
 use crate::ColoredQueryOutputFormat;
+use crate::structs::query_colored_counters::{ColorsRange, QueryColoredCountersSerializer};
 use colors::colors_manager::ColorMapReader;
 use colors::colors_manager::{ColorsManager, ColorsMergeManager};
 use config::{
-    get_compression_level_info, get_memory_mode, ColorIndexType, SwapPriority,
-    DEFAULT_PREFETCH_AMOUNT, KEEP_FILES, QUERIES_COUNT_MIN_BATCH,
+    ColorIndexType, DEFAULT_PREFETCH_AMOUNT, KEEP_FILES, OUTPUT_COMPRESSION_LEVEL,
+    QUERIES_COUNT_MIN_BATCH, SwapPriority, get_compression_level_info, get_memory_mode,
 };
 use flate2::Compression;
-use hashes::{HashFunctionFactory, MinimizerHashFunctionFactory};
-use io::get_bucket_index;
+use ggcat_logging::UnrecoverableErrorLogging;
+use hashes::HashFunctionFactory;
 use nightly_quirks::prelude::*;
-use parallel_processor::buckets::readers::compressed_binary_reader::CompressedBinaryReader;
-use parallel_processor::buckets::readers::BucketReader;
+use parallel_processor::buckets::readers::binary_reader::{
+    BinaryChunkReader, ChunkedBinaryReaderIndex, DecoderType,
+};
+use parallel_processor::buckets::readers::compressed_decoder::CompressedStreamDecoder;
+use parallel_processor::buckets::readers::typed_binary_reader::TypedStreamReader;
 use parallel_processor::buckets::writers::compressed_binary_writer::CompressedBinaryWriter;
-use parallel_processor::buckets::LockFreeBucket;
+use parallel_processor::buckets::{LockFreeBucket, SingleBucket};
 use parallel_processor::memory_fs::RemoveFileMode;
 use parallel_processor::phase_times_monitor::PHASES_TIMES_MONITOR;
 use parking_lot::{Condvar, Mutex};
@@ -29,6 +32,7 @@ enum QueryOutputFileWriter {
     Plain(File),
     LZ4Compressed(lz4::Encoder<File>),
     GzipCompressed(flate2::write::GzEncoder<File>),
+    ZstdCompressed(zstd::stream::write::Encoder<'static, File>),
 }
 
 impl Write for QueryOutputFileWriter {
@@ -37,6 +41,7 @@ impl Write for QueryOutputFileWriter {
             QueryOutputFileWriter::Plain(w) => w.write(buf),
             QueryOutputFileWriter::LZ4Compressed(w) => w.write(buf),
             QueryOutputFileWriter::GzipCompressed(w) => w.write(buf),
+            QueryOutputFileWriter::ZstdCompressed(w) => w.write(buf),
         }
     }
 
@@ -45,22 +50,19 @@ impl Write for QueryOutputFileWriter {
             QueryOutputFileWriter::Plain(w) => w.flush(),
             QueryOutputFileWriter::LZ4Compressed(w) => w.flush(),
             QueryOutputFileWriter::GzipCompressed(w) => w.flush(),
+            QueryOutputFileWriter::ZstdCompressed(w) => w.flush(),
         }
     }
 }
 
-pub fn colored_query_output<
-    H: MinimizerHashFunctionFactory,
-    MH: HashFunctionFactory,
-    CX: ColorsManager,
->(
-    colormap: &<CX::ColorsMergeManagerType<H, MH> as ColorsMergeManager<H, MH>>::GlobalColorsTableReader,
-    mut colored_query_buckets: Vec<PathBuf>,
+pub fn colored_query_output<MH: HashFunctionFactory, CX: ColorsManager>(
+    colormap: &<CX::ColorsMergeManagerType as ColorsMergeManager>::GlobalColorsTableReader,
+    mut colored_query_buckets: Vec<SingleBucket>,
     output_file: PathBuf,
     temp_dir: PathBuf,
     query_kmers_count: &[u64],
     colored_query_output_format: ColoredQueryOutputFormat,
-) {
+) -> anyhow::Result<()> {
     PHASES_TIMES_MONITOR
         .write()
         .start_phase("phase: colored query output".to_string());
@@ -83,19 +85,32 @@ pub fn colored_query_output<
         output_file
     };
 
-    let query_output_file = File::create(&output_file).unwrap();
+    let query_output_file = File::create(&output_file)
+        .log_unrecoverable_error_with_data("Cannot create output file", output_file.display())?;
+
+    let output_compression_level = OUTPUT_COMPRESSION_LEVEL.load(Ordering::Relaxed);
 
     let query_output = Mutex::new((
         BufWriter::new(
             match output_file.extension().map(|e| e.to_str()).flatten() {
                 Some("lz4") => QueryOutputFileWriter::LZ4Compressed(
                     lz4::EncoderBuilder::new()
-                        .level(4)
+                        .level(output_compression_level.min(16))
                         .build(query_output_file)
                         .unwrap(),
                 ),
                 Some("gz") => QueryOutputFileWriter::GzipCompressed(
-                    flate2::GzBuilder::new().write(query_output_file, Compression::default()),
+                    flate2::GzBuilder::new().write(
+                        query_output_file,
+                        Compression::new(output_compression_level.min(9)),
+                    ),
+                ),
+                Some("zst") | Some("zstd") => QueryOutputFileWriter::ZstdCompressed(
+                    zstd::stream::write::Encoder::new(
+                        query_output_file,
+                        output_compression_level.min(22) as i32,
+                    )
+                    .unwrap(),
                 ),
                 _ => QueryOutputFileWriter::Plain(query_output_file),
             },
@@ -131,18 +146,20 @@ pub fn colored_query_output<
                 queries_colors_list_pool.clear();
 
                 let start_query_index =
-                    get_bucket_index(&input) as usize * max_bucket_queries_count / buckets_count;
+                    input.index as usize * max_bucket_queries_count / buckets_count;
 
-                CompressedBinaryReader::new(
-                    &input,
+                let file_index = ChunkedBinaryReaderIndex::from_file(
+                    &input.path,
                     RemoveFileMode::Remove {
                         remove_fs: !KEEP_FILES.load(Ordering::Relaxed),
                     },
                     DEFAULT_PREFETCH_AMOUNT,
-                )
-                .decode_all_bucket_items::<QueryColoredCountersSerializer, _>(
-                    (Vec::new(), Vec::new()),
-                    &mut (),
+                );
+
+                TypedStreamReader::get_items::<QueryColoredCountersSerializer>(
+                    None,
+                    (),
+                    file_index.into_chunks(),
                     |counters, _| {
                         for query in counters.queries {
                             let (entry_epoch, colors_map_index) = &mut queries_results
@@ -173,7 +190,7 @@ pub fn colored_query_output<
                     },
                 );
 
-                let bucket_index = get_bucket_index(input);
+                let bucket_index = input.index;
 
                 let compressed_stream = CompressedBinaryWriter::new(
                     &temp_dir.join("query-data"),
@@ -183,6 +200,7 @@ pub fn colored_query_output<
                         get_compression_level_info(),
                     ),
                     bucket_index as usize,
+                    &(),
                 );
 
                 let mut jsonline_buffer = vec![];
@@ -247,7 +265,7 @@ pub fn colored_query_output<
                 let stream_path = compressed_stream.get_path();
                 compressed_stream.finalize();
 
-                let mut decompress_stream = CompressedBinaryReader::new(
+                let file_index = ChunkedBinaryReaderIndex::from_file(
                     stream_path,
                     RemoveFileMode::Remove { remove_fs: true },
                     DEFAULT_PREFETCH_AMOUNT,
@@ -262,16 +280,21 @@ pub fn colored_query_output<
                     queries_lock.deref_mut()
                 };
 
-                std::io::copy(&mut decompress_stream.get_single_stream(), queries_file).unwrap();
+                for chunk in file_index.into_chunks() {
+                    assert_eq!(chunk.get_decoder_type(), DecoderType::Compressed);
+                    let mut reader = BinaryChunkReader::<CompressedStreamDecoder>::new(chunk);
+                    std::io::copy(&mut reader, queries_file).unwrap();
+                }
 
                 *query_write_index += 1;
                 output_sync_condvar.notify_all();
             }
         });
 
-    println!(
+    ggcat_logging::info!(
         "Operations count: {} vs real {}",
         OPS_COUNT.load(Ordering::Relaxed),
         COL_COUNT.load(Ordering::Relaxed)
     );
+    Ok(())
 }

@@ -90,9 +90,8 @@ fn ggcat_extra_elaboration(mode: RebuildMode) -> ExtraElaboration {
     match mode {
         RebuildMode::Unitig => ExtraElaboration::None,
         RebuildMode::Matchtig => ExtraElaboration::GreedyMatchtigs,
-        RebuildMode::Eulertig => ExtraElaboration::Eulertigs,
-        // GGCAT has no explicit "simplitig" mode; Pathtigs is the closest compacted mode.
-        RebuildMode::Simplitig => ExtraElaboration::Pathtigs,
+        RebuildMode::Eulertig => ExtraElaboration::FastEulertigs,
+        RebuildMode::Simplitig => ExtraElaboration::FastSimplitigs,
     }
 }
 
@@ -167,7 +166,7 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
     };
     fs::create_dir_all(&temp_dir)?;
 
-    let ggcat_memory_gb = (cfg.memory_gb / 2).max(1);
+    let ggcat_memory_gb = cfg.memory_gb.max(1);
     let instance = GGCATInstance::create(GGCATConfig {
         temp_dir: Some(temp_dir.clone()),
         memory: ggcat_memory_gb as f64,
@@ -175,7 +174,9 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
         total_threads_count: cfg.threads.max(1),
         intermediate_compression_level: None,
         stats_file: None,
-    });
+        messages_callback: None,
+    })
+    .map_err(|err| io::Error::other(format!("create ggcat instance: {err}")))?;
 
     let streams = dump_fastas
         .iter()
@@ -193,18 +194,21 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
         cfg.threads.max(1),
         ggcat_memory_gb
     );
-    let graph_path = instance.build_graph(
-        streams,
-        rebuilt_output,
-        None,
-        cfg.k,
-        cfg.threads.max(1),
-        false,
-        None,
-        false,
-        1,
-        ggcat_extra_elaboration(mode),
-    );
+    let graph_path = instance
+        .build_graph(
+            streams,
+            rebuilt_output,
+            None,
+            cfg.k,
+            cfg.threads.max(1),
+            false,
+            None,
+            false,
+            1,
+            ggcat_extra_elaboration(mode),
+            None,
+        )
+        .map_err(|err| io::Error::other(format!("run ggcat rebuild: {err}")))?;
 
     println!(
         "ggcat rebuild complete: {} (mode={})",

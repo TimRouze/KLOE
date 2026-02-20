@@ -11,6 +11,14 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#if __cplusplus >= 202002L
+#include <ranges>
+#endif
+
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdollar-in-identifier-extension"
+#endif // __clang__
 
 namespace rust {
 inline namespace cxxbridge1 {
@@ -48,6 +56,10 @@ public:
   String(const char *, std::size_t);
   String(const char16_t *);
   String(const char16_t *, std::size_t);
+#ifdef __cpp_char8_t
+  String(const char8_t *s);
+  String(const char8_t *s, std::size_t len);
+#endif
 
   static String lossy(const std::string &) noexcept;
   static String lossy(const char *) noexcept;
@@ -55,8 +67,8 @@ public:
   static String lossy(const char16_t *) noexcept;
   static String lossy(const char16_t *, std::size_t) noexcept;
 
-  String &operator=(const String &) &noexcept;
-  String &operator=(String &&) &noexcept;
+  String &operator=(const String &) & noexcept;
+  String &operator=(String &&) & noexcept;
 
   explicit operator std::string() const;
 
@@ -111,8 +123,8 @@ template <>
 struct copy_assignable_if<false> {
   copy_assignable_if() noexcept = default;
   copy_assignable_if(const copy_assignable_if &) noexcept = default;
-  copy_assignable_if &operator=(const copy_assignable_if &) &noexcept = delete;
-  copy_assignable_if &operator=(copy_assignable_if &&) &noexcept = default;
+  copy_assignable_if &operator=(const copy_assignable_if &) & noexcept = delete;
+  copy_assignable_if &operator=(copy_assignable_if &&) & noexcept = default;
 };
 } // namespace detail
 
@@ -125,8 +137,11 @@ public:
   Slice() noexcept;
   Slice(T *, std::size_t count) noexcept;
 
-  Slice &operator=(const Slice<T> &) &noexcept = default;
-  Slice &operator=(Slice<T> &&) &noexcept = default;
+  template <typename C>
+  explicit Slice(C &c) : Slice(c.data(), c.size()) {}
+
+  Slice &operator=(const Slice<T> &) & noexcept = default;
+  Slice &operator=(Slice<T> &&) & noexcept = default;
 
   T *data() const noexcept;
   std::size_t size() const noexcept;
@@ -158,10 +173,20 @@ private:
   std::array<std::uintptr_t, 2> repr;
 };
 
+#ifdef __cpp_deduction_guides
+template <typename C>
+explicit Slice(C &c)
+    -> Slice<std::remove_reference_t<decltype(*std::declval<C>().data())>>;
+#endif // __cpp_deduction_guides
+
 template <typename T>
 class Slice<T>::iterator final {
 public:
+#if __cplusplus >= 202002L
+  using iterator_category = std::contiguous_iterator_tag;
+#else
   using iterator_category = std::random_access_iterator_tag;
+#endif
   using value_type = T;
   using difference_type = std::ptrdiff_t;
   using pointer = typename std::add_pointer<T>::type;
@@ -179,6 +204,9 @@ public:
   iterator &operator+=(difference_type) noexcept;
   iterator &operator-=(difference_type) noexcept;
   iterator operator+(difference_type) const noexcept;
+  friend inline iterator operator+(difference_type lhs, iterator rhs) noexcept {
+    return rhs + lhs;
+  }
   iterator operator-(difference_type) const noexcept;
   difference_type operator-(const iterator &) const noexcept;
 
@@ -194,6 +222,11 @@ private:
   void *pos;
   std::size_t stride;
 };
+
+#if __cplusplus >= 202002L
+static_assert(std::ranges::contiguous_range<rust::Slice<const uint8_t>>);
+static_assert(std::contiguous_iterator<rust::Slice<const uint8_t>::iterator>);
+#endif
 
 template <typename T>
 Slice<T>::Slice() noexcept {
@@ -337,7 +370,8 @@ typename Slice<T>::iterator::difference_type
 Slice<T>::iterator::operator-(const iterator &other) const noexcept {
   auto diff = std::distance(static_cast<char *>(other.pos),
                             static_cast<char *>(this->pos));
-  return diff / this->stride;
+  return diff / static_cast<typename Slice<T>::iterator::difference_type>(
+                    this->stride);
 }
 
 template <typename T>
@@ -411,7 +445,7 @@ public:
   Vec(Vec &&) noexcept;
   ~Vec() noexcept;
 
-  Vec &operator=(Vec &&) &noexcept;
+  Vec &operator=(Vec &&) & noexcept;
   Vec &operator=(const Vec &) &;
 
   std::size_t size() const noexcept;
@@ -485,7 +519,7 @@ Vec<T>::~Vec() noexcept {
 }
 
 template <typename T>
-Vec<T> &Vec<T>::operator=(Vec &&other) &noexcept {
+Vec<T> &Vec<T>::operator=(Vec &&other) & noexcept {
   this->drop();
   this->repr = other.repr;
   new (&other) Vec();
@@ -716,7 +750,14 @@ std::size_t align_of() {
 } // namespace cxxbridge1
 } // namespace rust
 
+#if __cplusplus >= 201402L
+#define CXX_DEFAULT_VALUE(value) = value
+#else
+#define CXX_DEFAULT_VALUE(value)
+#endif
+
 struct GGCATConfigFFI;
+struct InputStreamFFI;
 struct GGCATInstanceFFI;
 
 #ifndef CXXBRIDGE1_STRUCT_GGCATConfigFFI
@@ -724,28 +765,44 @@ struct GGCATInstanceFFI;
 // Main config of GGCAT. This config is global and should be passed to GGCATInstance::create
 struct GGCATConfigFFI final {
   // If false, a memory only mode is attempted. May crash for large input data if there is no enough RAM memory.
-  bool use_temp_dir;
+  bool use_temp_dir CXX_DEFAULT_VALUE(false);
   // Directory for temporary files
   ::rust::String temp_dir;
   // Maximum suggested memory usage (GB)
   // The tool will try use only up to this GB of memory to store temporary files
   // without writing to disk. This usage does not include the needed memory for the processing steps.
   // GGCAT can allocate extra memory for files if the current memory is not enough to complete the current operation
-  double memory;
+  double memory CXX_DEFAULT_VALUE(0);
   // Use all the given memory before writing to disk
-  bool prefer_memory;
+  bool prefer_memory CXX_DEFAULT_VALUE(false);
   // The total threads to be used
-  ::std::size_t total_threads_count;
+  ::std::size_t total_threads_count CXX_DEFAULT_VALUE(0);
   // The default lz4 compression level for the intermediate files, -1 to use default values
-  ::std::uint32_t intermediate_compression_level;
+  ::std::uint32_t intermediate_compression_level CXX_DEFAULT_VALUE(0);
   // True if the stats file should be created
-  bool use_stats_file;
+  bool use_stats_file CXX_DEFAULT_VALUE(false);
   // The path to an optional json-formatted real time stats file
   ::rust::String stats_file;
+  // Function pointer with signature void (uint8_t, const char *) receiving messages
+  ::std::size_t messages_callback CXX_DEFAULT_VALUE(0);
+  // Output the result in the specified version of GFA format, 0 outputs in FASTA (default)
+  // Supported V1 and V2
+  ::std::uint32_t gfa_output_version CXX_DEFAULT_VALUE(0);
 
   using IsRelocatable = ::std::true_type;
 };
 #endif // CXXBRIDGE1_STRUCT_GGCATConfigFFI
+
+#ifndef CXXBRIDGE1_STRUCT_InputStreamFFI
+#define CXXBRIDGE1_STRUCT_InputStreamFFI
+struct InputStreamFFI final {
+  ::std::size_t virtual_read_block CXX_DEFAULT_VALUE(0);
+  ::std::size_t virtual_estimated_base_count CXX_DEFAULT_VALUE(0);
+  ::std::size_t block_data CXX_DEFAULT_VALUE(0);
+
+  using IsRelocatable = ::std::true_type;
+};
+#endif // CXXBRIDGE1_STRUCT_InputStreamFFI
 
 #ifndef CXXBRIDGE1_STRUCT_GGCATInstanceFFI
 #define CXXBRIDGE1_STRUCT_GGCATInstanceFFI
@@ -762,13 +819,16 @@ private:
 #endif // CXXBRIDGE1_STRUCT_GGCATInstanceFFI
 
 // Creates a new GGCATInstance. If an instance already exists, it will be returned, ignoring the new config.
-const ::GGCATInstanceFFI &ggcat_create(::GGCATConfigFFI config) noexcept;
+::GGCATInstanceFFI const *ggcat_create(::GGCATConfigFFI config) noexcept;
 
 // Builds a new graph from the given input files, with the specified parameters
-::rust::String ggcat_build_from_files(const ::GGCATInstanceFFI &instance, ::rust::Slice<const ::rust::String> input_files, ::rust::String output_file, ::rust::Slice<const ::rust::String> color_names, ::std::size_t kmer_length, ::std::size_t threads_count, bool forward_only, ::std::size_t minimizer_length, bool colors, ::std::size_t min_multiplicity, ::std::size_t extra_elab) noexcept;
+::rust::String ggcat_build_from_files(::GGCATInstanceFFI const &instance, ::rust::Slice<::rust::String const> input_files, ::rust::String output_file, ::rust::Slice<::rust::String const> color_names, ::std::size_t kmer_length, ::std::size_t threads_count, bool forward_only, ::std::size_t minimizer_length, bool colors, ::std::size_t min_multiplicity, ::std::size_t extra_elab, ::std::uint32_t gfa_output_version) noexcept;
+
+// Builds a new graph from the given input streams, with the specified parameters
+::rust::String ggcat_build_from_streams(::GGCATInstanceFFI const &instance, ::rust::Slice<::InputStreamFFI const> input_streams, ::rust::String output_file, ::rust::Slice<::rust::String const> color_names, ::std::size_t kmer_length, ::std::size_t threads_count, bool forward_only, ::std::size_t minimizer_length, bool colors, ::std::size_t min_multiplicity, ::std::size_t extra_elab, ::std::uint32_t gfa_output_version) noexcept;
 
 // Queries a (optionally) colored graph with a specific set of sequences as queries
-::rust::String ggcat_query_graph(const ::GGCATInstanceFFI &instance, ::rust::String input_graph, ::rust::String input_query, ::rust::String output_file_prefix, ::std::size_t kmer_length, ::std::size_t threads_count, bool forward_only, ::std::size_t minimizer_length, bool colors, ::std::size_t color_output_format) noexcept;
+::rust::String ggcat_query_graph(::GGCATInstanceFFI const &instance, ::rust::String input_graph, ::rust::String input_query, ::rust::String output_file_prefix, ::std::size_t kmer_length, ::std::size_t threads_count, bool forward_only, ::std::size_t minimizer_length, bool colors, ::std::size_t color_output_format) noexcept;
 
 ::rust::String ggcat_get_colormap_file(::rust::String graph_file) noexcept;
 
@@ -782,7 +842,10 @@ const ::GGCATInstanceFFI &ggcat_create(::GGCATConfigFFI config) noexcept;
 // are returned as whole unitigs to speedup colormap reading times
 void ggcat_dump_unitigs(::GGCATInstanceFFI const &instance, ::rust::String graph_input, ::std::size_t kmer_length, ::std::size_t minimizer_length, bool colors, ::std::size_t threads_count, bool single_thread_output_function, ::std::size_t output_function_context, ::std::size_t output_function_ptr) noexcept;
 
+// Queries specified color subsets of the colormap, returning
+// the color indices corresponding to the colors of each subset
+void ggcat_query_colormap(::GGCATInstanceFFI const &instance, ::rust::String colormap, ::rust::Vec<::std::uint32_t> subsets, bool single_thread_output_function, ::std::size_t output_function_context, ::std::size_t output_function_ptr) noexcept;
 
-/// Queries specified color subsets of the colormap, returning
-/// the color indices corresponding to the colors of each subset
-void ggcat_query_colormap(::GGCATInstanceFFI const &instance, ::rust::String colormap_file, ::std::size_t output_function_context, ::std::size_t output_function_ptr) noexcept;
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif // __clang__

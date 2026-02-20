@@ -68,20 +68,20 @@ If this flag is set, the archive will contain monochromatic matchtigs.
 #### eulertigs
 If this flag is set, the archive will contain monochromatic eulertigs.
 
-By default, if none of the above flags are set, the archive will contain monochromatic simplitigs.
+By default, if none of the above flags are set, compression uses ggcat monochromatic unitigs mode.
 There can only be one flag set at once or 0. If several flags are set the tool will not run and raise an error.
 
-#### ggcat oversized-partition fallback
+#### ggcat `build-colored-fasta` backend (hard switch)
 KLOE embeds `ggcat` in-process (no external `ggcat` executable required at runtime).
 
-Compression keeps the native KLOE pipeline, and only routes oversized phase-2 partitions to ggcat.
-Default oversized threshold is partition file size >= 10 GB.
+Compression is now fully driven by the forked ggcat direct colored export path (sorted by color bitsets), streamed into the native KLOE archive writer.
 
-You can tune the threshold with:
-- `KLOE_AUTO_GGCAT_PARTITION_MB`
-- `KLOE_AUTO_GGCAT_PARTITION_AVG_MB` (legacy alias)
+The on-disk KLOE archive format is unchanged (`tigs_kloe.fa`, `bucket_sizes.txt`, `positions_kloe.bin`, `id_to_color_id.txt.zst`, `filenames_id.txt`).
 
-`-r/--memory` sets the global budget in GB. Native KLOE compaction uses this full value; embedded ggcat uses half of it.
+The vendored ggcat fork is pinned to commit:
+`fe6a633e64f60cd7266951d73c1def5cc023fa96`
+
+`-r/--memory` sets the embedded ggcat memory budget in GB.
 
 
 ## Archive decompression
@@ -103,7 +103,7 @@ After writing `Dump_*.fa` files, run embedded ggcat on those dumps and produce a
 - `rebuilt_eulertigs.fa` when `--eulertig` is set
 - `rebuilt_simplitigs.fa` by default (implemented via ggcat Pathtigs)
 
-`-r/--memory` controls the rebuild budget; embedded ggcat uses half of this value (GB).
+`-r/--memory` controls the rebuild budget (GB) passed to embedded ggcat.
 
 ## Archive merge
 When running kloe in merge mode, add "merge" before any other parameter.
@@ -122,7 +122,7 @@ Global memory budget in GB. Merge uses this budget to batch archive-A color sets
 
 #### output tig mode flags
 Merge honors the same output mode flags as compression:
-- default: simplitigs
+- default: unitigs
 - `--unitig`
 - `--matchtig`
 - `--eulertig`

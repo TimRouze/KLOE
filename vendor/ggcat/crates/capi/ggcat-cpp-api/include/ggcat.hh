@@ -54,6 +54,13 @@ namespace ggcat
         DnaSequencesFileType_BINARY = 3,
     };
 
+    enum MessageLevel {
+        MessageLevel_Info = 0,
+        MessageLevel_Warning = 1,
+        MessageLevel_Error = 2,
+        MessageLevel_UnrecoverableError = 3
+    };
+
     struct DnaSequence
     {
         Slice<char> ident_data;
@@ -101,6 +108,9 @@ namespace ggcat
         bool use_stats_file;
         // The path to an optional json-formatted real time stats file
         std::string stats_file;
+
+        // The messages callback, if not null no info will be printed to stdout
+        void (*messages_callback)(MessageLevel level, const char *message);
     };
 
     struct __InputStreamBlockData
@@ -182,7 +192,9 @@ namespace ggcat
             ExtraElaborationStep extra_elab,
             bool colors,
             Slice<std::string> color_names,
-            size_t minimizer_length);
+            size_t minimizer_length,
+            bool output_gfa,
+            bool enable_disk_optimization);
 
     public:
         static GGCATInstance *create(GGCATConfig config);
@@ -217,7 +229,13 @@ namespace ggcat
             Slice<std::string> color_names = Slice<std::string>::empty(),
 
             // Overrides the default m-mers (minimizers) length
-            size_t minimizer_length = -1);
+            size_t minimizer_length = -1,
+
+            // Output the result as a GFA file with the specific version (0 to disable)
+            uint32_t gfa_output_version = 0,
+
+            // Enable disk optimization
+            bool enable_disk_optimization = true);
 
         /// Builds a new graph from the given input streams, with the specified parameters
         template <typename S>
@@ -250,7 +268,13 @@ namespace ggcat
             Slice<std::string> color_names = Slice<std::string>::empty(),
 
             // Overrides the default m-mers (minimizers) length
-            size_t minimizer_length = -1)
+            size_t minimizer_length = -1,
+
+            // Outputs the result as GFA
+            bool output_gfa = false,
+
+            // Enable disk optimization
+            bool enable_disk_optimization = true)
         {
 
             thread_local std::unique_ptr<StreamReader> stream_reader = nullptr;
@@ -292,7 +316,9 @@ namespace ggcat
                                             extra_elab,
                                             colors,
                                             color_names,
-                                            minimizer_length);
+                                            minimizer_length,
+                                            output_gfa,
+                                            enable_disk_optimization);
         }
 
         /// Queries a (optionally) colored graph with a specific set of sequences as queries

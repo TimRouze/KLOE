@@ -1,17 +1,24 @@
 mod utils;
 
+use ::utils::assembler_phases::AssemblerPhase;
 use colors::bundles::graph_querying::ColorBundleGraphQuerying;
 use colors::colors_manager::ColorsManager;
 use colors::{
     bundles::multifile_building::ColorBundleMultifileBuilding, non_colored::NonColoredManager,
 };
-use hashes::MinimizerHashFunctionFactory;
-use hashes::{cn_nthash::CanonicalNtHashIteratorFactory, fw_nthash::ForwardNtHashIteratorFactory};
-use io::sequences_stream::fasta::FastaFileSequencesStream;
+use config::{KEEP_FILES, MEMORY_THRESHOLD_CLEAR_START_OFFSET, MINIMUM_GLOBAL_MEMORY};
+pub use ggcat_logging::MessageLevel;
+use ggcat_logging::{UnrecoverableErrorLogging, info, warn};
+use io::concurrent::structured_sequences::StructuredSequenceBackendWrapper;
+use io::concurrent::structured_sequences::color_records::ColorRecordsWriterWrapper;
+use io::concurrent::structured_sequences::fasta::FastaWriterWrapper;
+use io::concurrent::structured_sequences::gfa::{GFAWriterWrapperV1, GFAWriterWrapperV2};
 use io::sequences_stream::GenericSequencesStream;
+use io::sequences_stream::fasta::FastaFileSequencesStream;
 use parallel_processor::enable_counters_logging;
 use parallel_processor::memory_data_size::MemoryDataSize;
 use parallel_processor::memory_fs::MemoryFs;
+use parallel_processor::memory_fs::allocator::MemoryAllocationLimits;
 use parallel_processor::phase_times_monitor::PHASES_TIMES_MONITOR;
 use parking_lot::Mutex;
 use std::cmp::max;
@@ -25,33 +32,44 @@ pub use crate::utils::HashType;
 pub use config::ColorIndexType;
 pub use io::sequences_reader::{DnaSequence, DnaSequencesFileType};
 pub use io::sequences_stream::{
-    general::{DynamicSequencesStream, GeneralSequenceBlockData},
     SequenceInfo,
+    general::{DynamicSequencesStream, GeneralSequenceBlockData},
 };
 pub use querier::ColoredQueryOutputFormat;
 
 pub mod debug {
     use crate::utils::HashType;
-    use assembler::AssemblerStartingStep;
     pub use config::KEEP_FILES as DEBUG_KEEP_FILES;
     use parking_lot::Mutex;
     use querier::QuerierStartingStep;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::AtomicBool;
+    use utils::assembler_phases::AssemblerPhase;
 
-    pub static DEBUG_ASSEMBLER_FIRST_STEP: Mutex<AssemblerStartingStep> =
-        Mutex::new(AssemblerStartingStep::MinimizerBucketing);
-    pub static DEBUG_ASSEMBLER_LAST_STEP: Mutex<AssemblerStartingStep> =
-        Mutex::new(AssemblerStartingStep::MaximalUnitigsLinks);
+    pub static DEBUG_ASSEMBLER_FIRST_STEP: Mutex<AssemblerPhase> =
+        Mutex::new(AssemblerPhase::MinimizerBucketing);
+    pub static DEBUG_ASSEMBLER_LAST_STEP: Mutex<AssemblerPhase> =
+        Mutex::new(AssemblerPhase::MaximalUnitigsLinks);
 
     pub static DEBUG_QUERIER_FIRST_STEP: Mutex<QuerierStartingStep> =
         Mutex::new(QuerierStartingStep::MinimizerBucketing);
 
     pub static DEBUG_HASH_TYPE: Mutex<HashType> = Mutex::new(HashType::Auto);
 
-    pub static DEBUG_LINK_PHASE_ITERATION_START_STEP: AtomicUsize = AtomicUsize::new(0);
     pub static DEBUG_ONLY_BSTATS: AtomicBool = AtomicBool::new(false);
 
     pub static BUCKETS_COUNT_LOG_FORCE: Mutex<Option<usize>> = Mutex::new(None);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum LoggingMode {
+    Log,
+    ForceStdout,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum GfaVersion {
+    V1,
+    V2,
 }
 
 /// Main config of GGCAT. This config is global and should be passed to GGCATInstance::create
@@ -76,6 +94,9 @@ pub struct GGCATConfig {
 
     /// The path to an optional json-formatted real time stats file
     pub stats_file: Option<PathBuf>,
+
+    /// The messages callback, if present, no output will be automatically written to stdout
+    pub messages_callback: Option<fn(MessageLevel, &str)>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -89,6 +110,10 @@ pub enum ExtraElaboration {
     Eulertigs,
     /// Generate pathtigs
     Pathtigs,
+    /// Generate simplitigs
+    FastSimplitigs,
+    /// Generate fast eulertigs
+    FastEulertigs,
 }
 
 static INSTANCE: Mutex<Option<&'static GGCATInstance>> = Mutex::new(None);
@@ -110,20 +135,31 @@ fn remove_tempdir(temp_dir: Option<PathBuf>) {
     }
 }
 
-/// Main GGCAT struct. It's a singleton and can be create by passing a GGCATConfig.
+/// Main GGCAT struct. It's a singleton and can be created by passing a GGCATConfig.
 /// Successive calls to create will return the same instance, ignoring the new configuration.
 impl GGCATInstance {
     /// Creates a new GGCATInstance. If an instance already exists, it will be returned, ignoring the new config.
-    pub fn create(config: GGCATConfig) -> &'static Self {
+    pub fn create(config: GGCATConfig) -> anyhow::Result<&'static Self> {
         let mut instance = INSTANCE.lock();
 
         if let Some(instance) = instance.deref() {
-            return instance;
+            return Ok(instance);
         }
+
+        parallel_processor::set_logger_function(|level, message| {
+            ggcat_logging::log(
+                match level {
+                    parallel_processor::LogLevel::Info => MessageLevel::Info,
+                    parallel_processor::LogLevel::Warning => MessageLevel::Warning,
+                    parallel_processor::LogLevel::Error => MessageLevel::Error,
+                },
+                &message,
+            );
+        });
 
         // Increase the maximum allowed number of open files
         if let Err(err) = fdlimit::raise_fd_limit() {
-            println!(
+            ggcat_logging::warn!(
                 "WARNING: Failed to increase the maximum number of open files: {}",
                 err
             );
@@ -131,14 +167,21 @@ impl GGCATInstance {
 
         config::PREFER_MEMORY.store(config.prefer_memory, Ordering::Relaxed);
 
+        if let Some(callback) = config.messages_callback {
+            ggcat_logging::setup_logging_callback(callback);
+        }
+
         rayon::ThreadPoolBuilder::new()
             .num_threads(config.total_threads_count)
             .thread_name(|i| format!("rayon-thread-{}", i))
             .build_global()
-            .unwrap();
+            .log_unrecoverable_error("Cannot initialize rayon thread pool")?;
 
         if let Some(temp_dir) = &config.temp_dir {
-            create_dir_all(temp_dir).unwrap();
+            create_dir_all(temp_dir).log_unrecoverable_error_with_data(
+                "Cannot create temporary directory",
+                temp_dir.display(),
+            )?;
         } else {
             todo!("Force memory-only usage")
         }
@@ -149,16 +192,26 @@ impl GGCATInstance {
             });
         }
 
+        let requested_memory = MemoryDataSize::from_bytes(
+            (config.memory * (MemoryDataSize::OCTET_GIBIOCTET_FACTOR as f64)) as usize,
+        );
+
         MemoryFs::init(
-            MemoryDataSize::from_bytes(
-                (config.memory * (MemoryDataSize::OCTET_GIBIOCTET_FACTOR as f64)) as usize,
-            ),
+            requested_memory,
             config::FLUSH_QUEUE_FACTOR * config.total_threads_count,
             max(1, config.total_threads_count / 4),
             8192,
+            if requested_memory.as_bytes() > MINIMUM_GLOBAL_MEMORY.as_bytes() {
+                Some(MemoryAllocationLimits {
+                    max_usage: requested_memory - MEMORY_THRESHOLD_CLEAR_START_OFFSET,
+                    min_fs_usage: MINIMUM_GLOBAL_MEMORY,
+                })
+            } else {
+                None
+            },
         );
         *instance = Some(Box::leak(Box::new(GGCATInstance(config))));
-        return instance.unwrap();
+        return Ok(instance.unwrap());
     }
 
     /// Builds a new graph from the given input streams, with the specified parameters
@@ -189,13 +242,9 @@ impl GGCATInstance {
         min_multiplicity: usize,
 
         extra_elab: ExtraElaboration,
-    ) -> PathBuf {
-        let bucketing_hash_dispatch = if forward_only {
-            <ForwardNtHashIteratorFactory as MinimizerHashFunctionFactory>::dynamic_dispatch_id()
-        } else {
-            <CanonicalNtHashIteratorFactory as MinimizerHashFunctionFactory>::dynamic_dispatch_id()
-        };
 
+        gfa_output_version: Option<GfaVersion>,
+    ) -> anyhow::Result<PathBuf> {
         let merging_hash_dispatch = utils::get_hash_static_id(
             debug::DEBUG_HASH_TYPE.lock().clone(),
             kmer_length,
@@ -208,14 +257,41 @@ impl GGCATInstance {
             NonColoredManager::dynamic_dispatch_id()
         };
 
-        let temp_dir = create_tempdir(self.0.temp_dir.clone());
+        if gfa_output_version.is_some() && colors {
+            anyhow::bail!("GFA output is not supported with colors");
+        }
+
+        let output_mode = match gfa_output_version {
+            None => FastaWriterWrapper::dynamic_dispatch_id(),
+            Some(GfaVersion::V1) => GFAWriterWrapperV1::dynamic_dispatch_id(),
+            Some(GfaVersion::V2) => GFAWriterWrapperV2::dynamic_dispatch_id(),
+        };
+
+        let first_step = debug::DEBUG_ASSEMBLER_FIRST_STEP.lock().clone();
+        let last_step = debug::DEBUG_ASSEMBLER_LAST_STEP.lock().clone();
+        let temp_dir = if first_step == AssemblerPhase::default() {
+            create_tempdir(self.0.temp_dir.clone())
+        } else {
+            Some(
+                self.0
+                    .temp_dir
+                    .clone()
+                    .expect("while testing successive phases the temp dir must be specified"),
+            )
+        };
+
+        if let Some(temp_dir) = &temp_dir {
+            info!("Temporary directory: {}", temp_dir.display());
+        } else {
+            warn!("No temporary directory specified, writing to cwd!");
+        }
 
         let output_file = assembler::dynamic_dispatch::run_assembler(
-            (bucketing_hash_dispatch, merging_hash_dispatch, colors_hash),
+            (merging_hash_dispatch, colors_hash, output_mode),
             kmer_length,
             minimizer_length.unwrap_or(::utils::compute_best_m(kmer_length)),
-            debug::DEBUG_ASSEMBLER_FIRST_STEP.lock().clone(),
-            debug::DEBUG_ASSEMBLER_LAST_STEP.lock().clone(),
+            first_step,
+            last_step,
             input_streams,
             color_names.unwrap_or(&[]),
             output_file,
@@ -223,21 +299,106 @@ impl GGCATInstance {
             threads_count,
             min_multiplicity,
             *debug::BUCKETS_COUNT_LOG_FORCE.lock(),
-            Some(debug::DEBUG_LINK_PHASE_ITERATION_START_STEP.load(Ordering::Relaxed)),
             self.0.intermediate_compression_level,
             extra_elab == ExtraElaboration::UnitigLinks,
             match extra_elab {
                 ExtraElaboration::GreedyMatchtigs => Some(assembler::MatchtigMode::GreedyTigs),
                 ExtraElaboration::Eulertigs => Some(assembler::MatchtigMode::EulerTigs),
                 ExtraElaboration::Pathtigs => Some(assembler::MatchtigMode::PathTigs),
+                ExtraElaboration::FastSimplitigs => Some(assembler::MatchtigMode::FastSimpliTigs),
+                ExtraElaboration::FastEulertigs => Some(assembler::MatchtigMode::FastEulerTigs),
                 _ => None,
             },
             debug::DEBUG_ONLY_BSTATS.load(Ordering::Relaxed),
+            forward_only,
+        )?;
+
+        if last_step == AssemblerPhase::FinalStep && !KEEP_FILES.load(Ordering::Relaxed) {
+            remove_tempdir(temp_dir);
+        } else {
+            info!("Keeping temp dir at {:?}", temp_dir);
+        }
+
+        Ok(output_file)
+    }
+
+    /// Builds a colored graph writing raw color-records as output.
+    /// This is intended as an internal fast path for post-processing into
+    /// custom colored FASTA exports.
+    pub fn build_graph_color_records(
+        &self,
+        input_streams: Vec<GeneralSequenceBlockData>,
+        output_file: PathBuf,
+        color_names: Option<&[String]>,
+        kmer_length: usize,
+        threads_count: usize,
+        forward_only: bool,
+        minimizer_length: Option<usize>,
+        min_multiplicity: usize,
+        extra_elab: ExtraElaboration,
+    ) -> anyhow::Result<PathBuf> {
+        let merging_hash_dispatch = utils::get_hash_static_id(
+            debug::DEBUG_HASH_TYPE.lock().clone(),
+            kmer_length,
+            forward_only,
         );
 
-        remove_tempdir(temp_dir);
+        let colors_hash = ColorBundleMultifileBuilding::dynamic_dispatch_id();
+        let output_mode = ColorRecordsWriterWrapper::dynamic_dispatch_id();
 
-        output_file
+        let first_step = debug::DEBUG_ASSEMBLER_FIRST_STEP.lock().clone();
+        let last_step = debug::DEBUG_ASSEMBLER_LAST_STEP.lock().clone();
+        let temp_dir = if first_step == AssemblerPhase::default() {
+            create_tempdir(self.0.temp_dir.clone())
+        } else {
+            Some(
+                self.0
+                    .temp_dir
+                    .clone()
+                    .expect("while testing successive phases the temp dir must be specified"),
+            )
+        };
+
+        if let Some(temp_dir) = &temp_dir {
+            info!("Temporary directory: {}", temp_dir.display());
+        } else {
+            warn!("No temporary directory specified, writing to cwd!");
+        }
+
+        let output_file = assembler::dynamic_dispatch::run_assembler(
+            (merging_hash_dispatch, colors_hash, output_mode),
+            kmer_length,
+            minimizer_length.unwrap_or(::utils::compute_best_m(kmer_length)),
+            first_step,
+            last_step,
+            input_streams,
+            color_names.unwrap_or(&[]),
+            output_file,
+            temp_dir.clone(),
+            threads_count,
+            min_multiplicity,
+            *debug::BUCKETS_COUNT_LOG_FORCE.lock(),
+            self.0.intermediate_compression_level,
+            extra_elab == ExtraElaboration::UnitigLinks,
+            match extra_elab {
+                ExtraElaboration::GreedyMatchtigs => Some(assembler::MatchtigMode::GreedyTigs),
+                ExtraElaboration::Eulertigs => Some(assembler::MatchtigMode::EulerTigs),
+                ExtraElaboration::Pathtigs => Some(assembler::MatchtigMode::PathTigs),
+                ExtraElaboration::FastSimplitigs => Some(assembler::MatchtigMode::FastSimpliTigs),
+                ExtraElaboration::FastEulertigs => Some(assembler::MatchtigMode::FastEulerTigs),
+                _ => None,
+            },
+            debug::DEBUG_ONLY_BSTATS.load(Ordering::Relaxed),
+            forward_only,
+        )?;
+
+        if last_step == AssemblerPhase::FinalStep && !KEEP_FILES.load(Ordering::Relaxed) {
+            remove_tempdir(temp_dir);
+        } else {
+            info!("Keeping temp dir at {:?}", temp_dir);
+        }
+
+        Ok(output_file)
     }
 
     /// Queries a (optionally) colored graph with a specific set of sequences as queries
@@ -265,13 +426,7 @@ impl GGCATInstance {
 
         // Query output format
         color_output_format: ColoredQueryOutputFormat,
-    ) -> PathBuf {
-        let bucketing_hash_dispatch = if forward_only {
-            <ForwardNtHashIteratorFactory as MinimizerHashFunctionFactory>::dynamic_dispatch_id()
-        } else {
-            <CanonicalNtHashIteratorFactory as MinimizerHashFunctionFactory>::dynamic_dispatch_id()
-        };
-
+    ) -> anyhow::Result<PathBuf> {
         let merging_hash_dispatch = utils::get_hash_static_id(
             debug::DEBUG_HASH_TYPE.lock().clone(),
             kmer_length,
@@ -287,7 +442,7 @@ impl GGCATInstance {
         let temp_dir = create_tempdir(self.0.temp_dir.clone());
 
         let output_file = querier::dynamic_dispatch::run_query(
-            (bucketing_hash_dispatch, merging_hash_dispatch, colors_hash),
+            (merging_hash_dispatch, colors_hash),
             kmer_length,
             minimizer_length.unwrap_or(::utils::compute_best_m(kmer_length)),
             debug::DEBUG_QUERIER_FIRST_STEP.lock().clone(),
@@ -299,11 +454,11 @@ impl GGCATInstance {
             threads_count,
             self.0.intermediate_compression_level,
             color_output_format,
-        );
+        )?;
 
         remove_tempdir(temp_dir);
 
-        output_file
+        Ok(output_file)
     }
 
     /// Obtains the standard colormap file path from a graph file path
@@ -317,19 +472,19 @@ impl GGCATInstance {
     pub fn dump_colors(
         // The input colormap
         input_colormap: impl AsRef<Path>,
-    ) -> impl Iterator<Item = String> {
+    ) -> anyhow::Result<impl Iterator<Item = String>> {
+        use colors::DefaultColorsSerializer;
         use colors::colors_manager::ColorMapReader;
         use colors::storage::deserializer::ColorsDeserializer;
-        use colors::DefaultColorsSerializer;
 
         let colors_deserializer =
-            ColorsDeserializer::<DefaultColorsSerializer>::new(input_colormap, true);
+            ColorsDeserializer::<DefaultColorsSerializer>::new(input_colormap, true)?;
 
-        (0..colors_deserializer.colors_count()).map(move |i| {
+        Ok((0..colors_deserializer.colors_count()).map(move |i| {
             colors_deserializer
                 .get_color_name(i as ColorIndexType, true)
                 .to_string()
-        })
+        }))
     }
 
     /// Queries specified color subsets of the colormap, returning
@@ -344,13 +499,13 @@ impl GGCATInstance {
         // avoiding the need for synchronization in the user code
         single_thread_output_function: bool,
         output_function: impl Fn(ColorIndexType, &[ColorIndexType]) + Send + Sync,
-    ) {
+    ) -> anyhow::Result<()> {
         dumper::dump_colormap_query(
             colormap_file,
             subsets,
             single_thread_output_function,
             output_function,
-        );
+        )
     }
 
     /// Dumps the unitigs of the given graph, optionally with colors
@@ -371,7 +526,7 @@ impl GGCATInstance {
         // avoiding the need for synchronization in the user code
         single_thread_output_function: bool,
         output_function: impl Fn(&[u8], &[ColorIndexType], bool) + Send + Sync,
-    ) {
+    ) -> anyhow::Result<()> {
         let temp_dir = create_tempdir(self.0.temp_dir.clone());
 
         if colors {
@@ -385,7 +540,7 @@ impl GGCATInstance {
                 single_thread_output_function,
                 self.0.intermediate_compression_level,
                 output_function,
-            );
+            )?;
         } else {
             FastaFileSequencesStream::new().read_block(
                 &(graph_input.as_ref().to_path_buf(), None),
@@ -398,5 +553,6 @@ impl GGCATInstance {
         }
 
         remove_tempdir(temp_dir);
+        Ok(())
     }
 }

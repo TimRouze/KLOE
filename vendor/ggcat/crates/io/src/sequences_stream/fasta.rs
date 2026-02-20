@@ -1,3 +1,5 @@
+use ggcat_logging::UnrecoverableErrorLogging;
+
 use crate::sequences_reader::{DnaSequence, SequencesReader};
 use crate::sequences_stream::{GenericSequencesStream, SequenceInfo};
 use std::path::PathBuf;
@@ -7,24 +9,24 @@ pub struct FastaFileSequencesStream {
 }
 
 impl FastaFileSequencesStream {
-    pub fn get_estimated_bases_count(file: &PathBuf) -> u64 {
+    pub fn get_estimated_bases_count(file: &PathBuf) -> anyhow::Result<u64> {
         // TODO: Improve this ratio estimation
         const COMPRESSED_READS_RATIO: f64 = 0.5;
 
         let length = std::fs::metadata(file)
-            .expect(&format!("Error while opening file {}", file.display()))
+            .log_unrecoverable_error_with_data("Error while opening file", file.display())?
             .len();
 
         let file_bases_count = if file
             .extension()
-            .map(|x| x == "gz" || x == "lz4")
+            .map(|x| x == "gz" || x == "lz4" || x == "bz2" || x == "xz" || x == "zst" || x == "zstd")
             .unwrap_or(false)
         {
             (length as f64 * COMPRESSED_READS_RATIO) as u64
         } else {
             length
         };
-        file_bases_count
+        Ok(file_bases_count)
     }
 }
 
