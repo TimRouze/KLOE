@@ -26,6 +26,7 @@ const PAR_SORT_THRESHOLD: usize = 200_000;
 const COLOR_RECORD_BATCH_SIZE: usize = 4_096;
 const COLOR_CHUNK_TARGET_BYTES: usize = 128 * 1024 * 1024;
 const GROUP_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
+const SINGLE_COLOR_EXACT_FALLBACK_MAX_KMERS: usize = 64;
 
 pub fn compress(
     output_dir: &String,
@@ -1160,6 +1161,7 @@ fn produce_ggcat_records(
         color_index_to_dataset_index.push(parsed - 1);
     }
 
+    let keep_ggcat = std::env::var_os("KLOE_KEEP_GGCAT").is_some();
     let process_result = (|| -> Result<()> {
         let mut subset_cache: HashMap<ColorIndexType, Vec<ColorIndexType>> = HashMap::new();
         let mut bitset = vec![b'0'; colors_count];
@@ -1223,12 +1225,24 @@ fn produce_ggcat_records(
             }
 
             let subset = runs[0].0;
-            bitset.fill(b'0');
             let mapped = subset_cache.entry(subset).or_insert_with(|| {
                 let mut colors = Vec::new();
                 colors_deserializer.get_color_mappings(subset, &mut colors);
                 colors
             });
+            let seq_kmers = seq.len() - k + 1;
+            let needs_exact_fallback = mapped.len() > 1
+                || (mapped.len() == 1 && seq_kmers <= SINGLE_COLOR_EXACT_FALLBACK_MAX_KMERS);
+            if needs_exact_fallback {
+                let kmers = canonical_kmers_from_seq(seq, k)?;
+                for canon in kmers {
+                    ambiguous_kmers.insert(canon);
+                }
+                ambiguous_entries.push(seq.to_vec());
+                return Ok(());
+            }
+
+            bitset.fill(b'0');
             for &color in mapped.iter() {
                 let color_idx = color as usize;
                 let Some(&dataset_idx) = color_index_to_dataset_index.get(color_idx) else {
@@ -1402,9 +1416,18 @@ fn produce_ggcat_records(
         Ok(())
     })();
 
-    let _ = fs::remove_file(&records_output);
-    let _ = fs::remove_file(&colormap_file);
-    let _ = fs::remove_dir_all(&chunk_dir);
+    if keep_ggcat {
+        eprintln!(
+            "DEBUG_KEEP_GGCAT graph={} colormap={} chunks_dir={}",
+            records_output.display(),
+            colormap_file.display(),
+            chunk_dir.display()
+        );
+    } else {
+        let _ = fs::remove_file(&records_output);
+        let _ = fs::remove_file(&colormap_file);
+        let _ = fs::remove_dir_all(&chunk_dir);
+    }
 
     process_result
 }
