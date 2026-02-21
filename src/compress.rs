@@ -217,8 +217,8 @@ fn ggcat_extra_elaboration(
     } else if use_eulertigs {
         ExtraElaboration::FastEulertigs
     } else {
-        // Hard-switch default mode to simplitigs when no explicit tig flag is provided.
-        ExtraElaboration::FastSimplitigs
+        // For colored-record export we need color-safe output to preserve per-file k-mers.
+        ExtraElaboration::None
     }
 }
 
@@ -278,6 +278,67 @@ fn read_color_record(
     reader.read_exact(&mut seq)?;
 
     Ok(Some((subsets, seq)))
+}
+
+fn parse_color_runs_from_header(header: &[u8]) -> Result<Vec<(ColorIndexType, usize)>> {
+    let mut runs = Vec::new();
+    for token in header.split(|b| *b == b' ') {
+        if token.len() < 4 || token[0] != b'C' || token[1] != b':' {
+            continue;
+        }
+        let rest = &token[2..];
+        let Some(colon_pos) = rest.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        if colon_pos == 0 || colon_pos + 1 >= rest.len() {
+            continue;
+        }
+        let color_hex = std::str::from_utf8(&rest[..colon_pos]).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid color tag '{}' in header '{}': {err}",
+                    String::from_utf8_lossy(token),
+                    String::from_utf8_lossy(header)
+                ),
+            )
+        })?;
+        let count_text = std::str::from_utf8(&rest[(colon_pos + 1)..]).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid color count tag '{}' in header '{}': {err}",
+                    String::from_utf8_lossy(token),
+                    String::from_utf8_lossy(header)
+                ),
+            )
+        })?;
+
+        let subset = ColorIndexType::from_str_radix(color_hex, 16).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid color subset '{}' in header '{}': {err}",
+                    color_hex,
+                    String::from_utf8_lossy(header)
+                ),
+            )
+        })?;
+        let count = count_text.parse::<usize>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid color run count '{}' in header '{}': {err}",
+                    count_text,
+                    String::from_utf8_lossy(header)
+                ),
+            )
+        })?;
+        if count > 0 {
+            runs.push((subset, count));
+        }
+    }
+    Ok(runs)
 }
 
 fn flush_sorted_chunk(
@@ -903,7 +964,7 @@ fn produce_ggcat_records(
     );
 
     let records_output = instance
-        .build_graph_color_records(
+        .build_graph(
             input_streams,
             raw_records_file,
             Some(&color_names),
@@ -911,10 +972,12 @@ fn produce_ggcat_records(
             threads.max(1),
             false,
             Some(m),
+            true,
             1,
             ggcat_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
+            None,
         )
-        .map_err(|e| to_io_err("ggcat build_graph_color_records", e))?;
+        .map_err(|e| to_io_err("ggcat build_graph", e))?;
 
     let colormap_file = GGCATInstance::get_colormap_file(&records_output);
     let mut colors_deserializer =
@@ -974,54 +1037,167 @@ fn produce_ggcat_records(
     let mut chunk_bytes = 0usize;
 
     let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(&records_output)?);
-    while let Some((subsets, seq)) = read_color_record(&mut reader)? {
-        bitset.fill(b'0');
+    let mut line = Vec::new();
+    let mut current_header: Option<Vec<u8>> = None;
+    let mut current_seq: Vec<u8> = Vec::new();
 
-        if subsets.is_empty() {
+    let mut emit_entry = |header: &[u8], seq: &[u8]| -> Result<()> {
+        let runs = parse_color_runs_from_header(header)?;
+        if runs.is_empty() {
             if colors_count == 1 {
+                bitset.fill(b'0');
                 bitset[0] = b'1';
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "ggcat emitted a sequence without color subsets",
-                ));
-            }
-        } else {
-            for subset in subsets {
-                let mapped = subset_cache.entry(subset).or_insert_with(|| {
-                    let mut colors = Vec::new();
-                    colors_deserializer.get_color_mappings(subset, &mut colors);
-                    colors
-                });
-                for &color in mapped.iter() {
-                    let color_idx = color as usize;
-                    let Some(&dataset_idx) = color_index_to_dataset_index.get(color_idx) else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("ggcat color index {} out of range", color_idx),
-                        ));
-                    };
-                    if dataset_idx >= bitset.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("dataset index {} out of range", dataset_idx),
-                        ));
-                    }
-                    bitset[dataset_idx] = b'1';
+                let record = SortedColorRecord {
+                    key: bitset.clone(),
+                    seq: seq.to_vec(),
+                };
+                chunk_bytes += record.key.len() + record.seq.len();
+                records.push(record);
+                if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
+                    flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
+                    chunk_bytes = 0;
                 }
+                return Ok(());
             }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ggcat emitted colored sequence without color runs: '{}'",
+                    String::from_utf8_lossy(header)
+                ),
+            ));
         }
 
-        let record = SortedColorRecord {
-            key: bitset.clone(),
-            seq,
-        };
-        chunk_bytes += record.key.len() + record.seq.len();
-        records.push(record);
+        if seq.len() < k {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ggcat sequence shorter than k (len={}, k={}) for '{}'",
+                    seq.len(),
+                    k,
+                    String::from_utf8_lossy(header)
+                ),
+            ));
+        }
+        let base_expected_kmers = seq.len() - k + 1;
+        let total_kmers: usize = runs.iter().map(|(_, count)| *count).sum();
 
-        if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
-            flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
-            chunk_bytes = 0;
+        let mut wrapped_seq = Vec::new();
+        let seq_for_runs: &[u8] = if total_kmers == base_expected_kmers + 1 {
+            wrapped_seq.reserve(seq.len() + 1);
+            wrapped_seq.extend_from_slice(seq);
+            wrapped_seq.push(seq[0]);
+            wrapped_seq.as_slice()
+        } else {
+            seq
+        };
+        let expected_kmers = seq_for_runs.len() - k + 1;
+
+        if total_kmers != expected_kmers {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ggcat color runs sum {} kmers but sequence encodes {} kmers for '{}'",
+                    total_kmers,
+                    expected_kmers,
+                    String::from_utf8_lossy(header)
+                ),
+            ));
+        }
+
+        let mut kmer_start = 0usize;
+        for (subset, kmer_count) in runs {
+            bitset.fill(b'0');
+            let mapped = subset_cache.entry(subset).or_insert_with(|| {
+                let mut colors = Vec::new();
+                colors_deserializer.get_color_mappings(subset, &mut colors);
+                colors
+            });
+            for &color in mapped.iter() {
+                let color_idx = color as usize;
+                let Some(&dataset_idx) = color_index_to_dataset_index.get(color_idx) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("ggcat color index {} out of range", color_idx),
+                    ));
+                };
+                if dataset_idx >= bitset.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("dataset index {} out of range", dataset_idx),
+                    ));
+                }
+                bitset[dataset_idx] = b'1';
+            }
+
+            let seg_start = kmer_start;
+            let seg_end = seg_start + kmer_count + k - 1;
+            if seg_end > seq_for_runs.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid ggcat run bounds [{}..{}) for seq len {} in '{}'",
+                        seg_start,
+                        seg_end,
+                        seq_for_runs.len(),
+                        String::from_utf8_lossy(header)
+                    ),
+                ));
+            }
+
+            let record = SortedColorRecord {
+                key: bitset.clone(),
+                seq: seq_for_runs[seg_start..seg_end].to_vec(),
+            };
+            chunk_bytes += record.key.len() + record.seq.len();
+            records.push(record);
+            if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
+                flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
+                chunk_bytes = 0;
+            }
+
+            kmer_start += kmer_count;
+        }
+
+        if kmer_start != expected_kmers {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ggcat color runs covered {} kmers but sequence encodes {} kmers for '{}'",
+                    kmer_start,
+                    expected_kmers,
+                    String::from_utf8_lossy(header)
+                ),
+            ));
+        }
+
+        Ok(())
+    };
+
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            if let Some(header) = current_header.take() {
+                emit_entry(&header, &current_seq)?;
+            }
+            break;
+        }
+
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line[0] == b'>' {
+            if let Some(header) = current_header.take() {
+                emit_entry(&header, &current_seq)?;
+                current_seq.clear();
+            }
+            current_header = Some(line[1..].to_vec());
+        } else {
+            current_seq.extend_from_slice(&line);
         }
     }
 
