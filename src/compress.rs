@@ -6,7 +6,7 @@ use ggcat_colors::storage::deserializer::ColorsDeserializer;
 use ggcat_colors::DefaultColorsSerializer;
 use rayon::slice::ParallelSliceMut;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Write};
 use std::path::{Path, PathBuf};
@@ -339,6 +339,136 @@ fn parse_color_runs_from_header(header: &[u8]) -> Result<Vec<(ColorIndexType, us
         }
     }
     Ok(runs)
+}
+
+#[inline(always)]
+fn base_to_bits(base: u8) -> Option<u64> {
+    match base {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
+    }
+}
+
+fn for_each_canonical_kmer_bytes(
+    seq: &[u8],
+    k: usize,
+    mut f: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    if k == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "k must be greater than zero",
+        ));
+    }
+    if k > 31 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("k={} is unsupported for exact fallback (requires k<=31)", k),
+        ));
+    }
+    if seq.len() < k {
+        return Ok(());
+    }
+
+    let mask = (1u64 << (2 * k)) - 1;
+    let rc_shift = 2 * (k - 1);
+    let mut fwd = 0u64;
+    let mut rev = 0u64;
+    let mut valid_len = 0usize;
+
+    for &base in seq {
+        if let Some(bits) = base_to_bits(base) {
+            fwd = ((fwd << 2) | bits) & mask;
+            rev = (rev >> 2) | ((3 - bits) << rc_shift);
+            valid_len += 1;
+            if valid_len >= k {
+                f(if fwd < rev { fwd } else { rev })?;
+            }
+        } else {
+            fwd = 0;
+            rev = 0;
+            valid_len = 0;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_kmers_from_seq(seq: &[u8], k: usize) -> Result<Vec<u64>> {
+    let mut kmers = Vec::with_capacity(seq.len().saturating_sub(k) + 1);
+    for_each_canonical_kmer_bytes(seq, k, |canon| {
+        kmers.push(canon);
+        Ok(())
+    })?;
+    if seq.len() >= k && kmers.len() != seq.len() - k + 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sequence contains non-ACGT bases in exact fallback path",
+        ));
+    }
+    Ok(kmers)
+}
+
+fn for_each_canonical_kmer_in_file(path: &str, k: usize, mut f: impl FnMut(u64)) -> Result<()> {
+    let (reader, _) = niffler::from_path(path)
+        .map_err(|err| io::Error::other(format!("open input file '{}': {err}", path)))?;
+    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, reader);
+    let mut line = Vec::new();
+    let mut rolling = Vec::with_capacity(k.saturating_mul(2));
+
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line[0] == b'>' || line[0] == b'@' {
+            rolling.clear();
+            continue;
+        }
+        if line[0] == b'+' {
+            // FASTQ quality header/lines are not expected in current inputs.
+            rolling.clear();
+            continue;
+        }
+
+        if rolling.is_empty() {
+            for_each_canonical_kmer_bytes(&line, k, |canon| {
+                f(canon);
+                Ok(())
+            })?;
+            if k > 1 && line.len() >= k - 1 {
+                rolling.extend_from_slice(&line[(line.len() - (k - 1))..]);
+            } else if k > 1 {
+                rolling.extend_from_slice(&line);
+            }
+            continue;
+        }
+
+        let mut combined = Vec::with_capacity(rolling.len() + line.len());
+        combined.extend_from_slice(&rolling);
+        combined.extend_from_slice(&line);
+        for_each_canonical_kmer_bytes(&combined, k, |canon| {
+            f(canon);
+            Ok(())
+        })?;
+        rolling.clear();
+        if k > 1 && combined.len() >= k - 1 {
+            rolling.extend_from_slice(&combined[(combined.len() - (k - 1))..]);
+        } else if k > 1 {
+            rolling.extend_from_slice(&combined);
+        }
+    }
+
+    Ok(())
 }
 
 fn flush_sorted_chunk(
@@ -1030,83 +1160,69 @@ fn produce_ggcat_records(
         color_index_to_dataset_index.push(parsed - 1);
     }
 
-    let mut subset_cache: HashMap<ColorIndexType, Vec<ColorIndexType>> = HashMap::new();
-    let mut bitset = vec![b'0'; colors_count];
-    let mut records = Vec::new();
-    let mut chunk_files = Vec::new();
-    let mut chunk_bytes = 0usize;
+    let process_result = (|| -> Result<()> {
+        let mut subset_cache: HashMap<ColorIndexType, Vec<ColorIndexType>> = HashMap::new();
+        let mut bitset = vec![b'0'; colors_count];
+        let mut records = Vec::new();
+        let mut chunk_files = Vec::new();
+        let mut chunk_bytes = 0usize;
+        let mut ambiguous_entries: Vec<Vec<u8>> = Vec::new();
+        let mut ambiguous_kmers: HashSet<u64> = HashSet::new();
 
-    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(&records_output)?);
-    let mut line = Vec::new();
-    let mut current_header: Option<Vec<u8>> = None;
-    let mut current_seq: Vec<u8> = Vec::new();
+        let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(&records_output)?);
+        let mut line = Vec::new();
+        let mut current_header: Option<Vec<u8>> = None;
+        let mut current_seq: Vec<u8> = Vec::new();
 
-    let mut emit_entry = |header: &[u8], seq: &[u8]| -> Result<()> {
-        let runs = parse_color_runs_from_header(header)?;
-        if runs.is_empty() {
-            if colors_count == 1 {
-                bitset.fill(b'0');
-                bitset[0] = b'1';
-                let record = SortedColorRecord {
-                    key: bitset.clone(),
-                    seq: seq.to_vec(),
-                };
-                chunk_bytes += record.key.len() + record.seq.len();
-                records.push(record);
-                if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
-                    flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
-                    chunk_bytes = 0;
+        let mut emit_entry = |header: &[u8], seq: &[u8]| -> Result<()> {
+            let runs = parse_color_runs_from_header(header)?;
+            if runs.is_empty() {
+                if colors_count == 1 {
+                    bitset.fill(b'0');
+                    bitset[0] = b'1';
+                    let record = SortedColorRecord {
+                        key: bitset.clone(),
+                        seq: seq.to_vec(),
+                    };
+                    chunk_bytes += record.key.len() + record.seq.len();
+                    records.push(record);
+                    if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
+                        flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
+                        chunk_bytes = 0;
+                    }
+                    return Ok(());
                 }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ggcat emitted colored sequence without color runs: '{}'",
+                        String::from_utf8_lossy(header)
+                    ),
+                ));
+            }
+
+            if seq.len() < k {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ggcat sequence shorter than k (len={}, k={}) for '{}'",
+                        seq.len(),
+                        k,
+                        String::from_utf8_lossy(header)
+                    ),
+                ));
+            }
+
+            if runs.len() > 1 {
+                let kmers = canonical_kmers_from_seq(seq, k)?;
+                for canon in kmers {
+                    ambiguous_kmers.insert(canon);
+                }
+                ambiguous_entries.push(seq.to_vec());
                 return Ok(());
             }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ggcat emitted colored sequence without color runs: '{}'",
-                    String::from_utf8_lossy(header)
-                ),
-            ));
-        }
 
-        if seq.len() < k {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ggcat sequence shorter than k (len={}, k={}) for '{}'",
-                    seq.len(),
-                    k,
-                    String::from_utf8_lossy(header)
-                ),
-            ));
-        }
-        let base_expected_kmers = seq.len() - k + 1;
-        let total_kmers: usize = runs.iter().map(|(_, count)| *count).sum();
-
-        let mut wrapped_seq = Vec::new();
-        let seq_for_runs: &[u8] = if total_kmers == base_expected_kmers + 1 {
-            wrapped_seq.reserve(seq.len() + 1);
-            wrapped_seq.extend_from_slice(seq);
-            wrapped_seq.push(seq[0]);
-            wrapped_seq.as_slice()
-        } else {
-            seq
-        };
-        let expected_kmers = seq_for_runs.len() - k + 1;
-
-        if total_kmers != expected_kmers {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ggcat color runs sum {} kmers but sequence encodes {} kmers for '{}'",
-                    total_kmers,
-                    expected_kmers,
-                    String::from_utf8_lossy(header)
-                ),
-            ));
-        }
-
-        let mut kmer_start = 0usize;
-        for (subset, kmer_count) in runs {
+            let subset = runs[0].0;
             bitset.fill(b'0');
             let mapped = subset_cache.entry(subset).or_insert_with(|| {
                 let mut colors = Vec::new();
@@ -1130,24 +1246,9 @@ fn produce_ggcat_records(
                 bitset[dataset_idx] = b'1';
             }
 
-            let seg_start = kmer_start;
-            let seg_end = seg_start + kmer_count + k - 1;
-            if seg_end > seq_for_runs.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid ggcat run bounds [{}..{}) for seq len {} in '{}'",
-                        seg_start,
-                        seg_end,
-                        seq_for_runs.len(),
-                        String::from_utf8_lossy(header)
-                    ),
-                ));
-            }
-
             let record = SortedColorRecord {
                 key: bitset.clone(),
-                seq: seq_for_runs[seg_start..seg_end].to_vec(),
+                seq: seq.to_vec(),
             };
             chunk_bytes += record.key.len() + record.seq.len();
             records.push(record);
@@ -1156,108 +1257,156 @@ fn produce_ggcat_records(
                 chunk_bytes = 0;
             }
 
-            kmer_start += kmer_count;
-        }
-
-        if kmer_start != expected_kmers {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ggcat color runs covered {} kmers but sequence encodes {} kmers for '{}'",
-                    kmer_start,
-                    expected_kmers,
-                    String::from_utf8_lossy(header)
-                ),
-            ));
-        }
-
-        Ok(())
-    };
-
-    loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            if let Some(header) = current_header.take() {
-                emit_entry(&header, &current_seq)?;
-            }
-            break;
-        }
-
-        while matches!(line.last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
-        if line.is_empty() {
-            continue;
-        }
-        if line[0] == b'>' {
-            if let Some(header) = current_header.take() {
-                emit_entry(&header, &current_seq)?;
-                current_seq.clear();
-            }
-            current_header = Some(line[1..].to_vec());
-        } else {
-            current_seq.extend_from_slice(&line);
-        }
-    }
-
-    flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
-
-    let mut current_key: Option<Vec<u8>> = None;
-    let mut current_color_ids: Option<Arc<Vec<u32>>> = None;
-    let mut batch: SimplitigBatch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
-
-    stream_sorted_records_from_chunks(&chunk_files, |record| {
-        let color_ids = match current_key.as_ref() {
-            Some(active_key) if active_key.as_slice() == record.key.as_slice() => {
-                Arc::clone(current_color_ids.as_ref().expect("color ids must be set"))
-            }
-            _ => {
-                let ids = Arc::new(bitset_to_dataset_ids(&record.key, dataset_count)?);
-                current_key = Some(record.key.clone());
-                current_color_ids = Some(Arc::clone(&ids));
-                ids
-            }
+            Ok(())
         };
 
-        batch.push(SimplitigRecord {
-            color_ids,
-            seq: record.seq,
-        });
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 {
+                if let Some(header) = current_header.take() {
+                    emit_entry(&header, &current_seq)?;
+                }
+                break;
+            }
 
-        if batch.len() >= COLOR_RECORD_BATCH_SIZE {
-            let out = std::mem::take(&mut batch);
-            sender.send(out).map_err(|e| {
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            if line[0] == b'>' {
+                if let Some(header) = current_header.take() {
+                    emit_entry(&header, &current_seq)?;
+                    current_seq.clear();
+                }
+                current_header = Some(line[1..].to_vec());
+            } else {
+                current_seq.extend_from_slice(&line);
+            }
+        }
+
+        if !ambiguous_entries.is_empty() {
+            let mut kmer_membership: HashMap<u64, Vec<u8>> = ambiguous_kmers
+                .into_iter()
+                .map(|canon| (canon, vec![b'0'; dataset_count]))
+                .collect();
+
+            for (dataset_idx, filename) in filenames.iter().enumerate() {
+                for_each_canonical_kmer_in_file(filename, k, |canon| {
+                    if let Some(bits) = kmer_membership.get_mut(&canon) {
+                        bits[dataset_idx] = b'1';
+                    }
+                })?;
+            }
+
+            for seq in ambiguous_entries {
+                let kmers = canonical_kmers_from_seq(&seq, k)?;
+                let mut run_start = 0usize;
+                while run_start < kmers.len() {
+                    let key = kmer_membership
+                        .get(&kmers[run_start])
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "missing k-mer membership for ambiguous sequence",
+                            )
+                        })?
+                        .clone();
+                    if !key.iter().any(|bit| *bit == b'1') {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "found ambiguous k-mer with empty dataset membership",
+                        ));
+                    }
+
+                    let mut run_end = run_start + 1;
+                    while run_end < kmers.len() {
+                        let next = kmer_membership.get(&kmers[run_end]).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "missing k-mer membership for ambiguous sequence",
+                            )
+                        })?;
+                        if *next != key {
+                            break;
+                        }
+                        run_end += 1;
+                    }
+
+                    let record = SortedColorRecord {
+                        key,
+                        seq: seq[run_start..(run_end + k - 1)].to_vec(),
+                    };
+                    chunk_bytes += record.key.len() + record.seq.len();
+                    records.push(record);
+                    if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
+                        flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
+                        chunk_bytes = 0;
+                    }
+
+                    run_start = run_end;
+                }
+            }
+        }
+
+        flush_sorted_chunk(&mut records, &mut chunk_files, &chunk_dir)?;
+
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut current_color_ids: Option<Arc<Vec<u32>>> = None;
+        let mut batch: SimplitigBatch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
+
+        stream_sorted_records_from_chunks(&chunk_files, |record| {
+            let color_ids = match current_key.as_ref() {
+                Some(active_key) if active_key.as_slice() == record.key.as_slice() => {
+                    Arc::clone(current_color_ids.as_ref().expect("color ids must be set"))
+                }
+                _ => {
+                    let ids = Arc::new(bitset_to_dataset_ids(&record.key, dataset_count)?);
+                    current_key = Some(record.key.clone());
+                    current_color_ids = Some(Arc::clone(&ids));
+                    ids
+                }
+            };
+
+            batch.push(SimplitigRecord {
+                color_ids,
+                seq: record.seq,
+            });
+
+            if batch.len() >= COLOR_RECORD_BATCH_SIZE {
+                let out = std::mem::take(&mut batch);
+                sender.send(out).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("record receiver dropped: {e}"),
+                    )
+                })?;
+                batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
+            }
+
+            Ok(())
+        })?;
+
+        if !batch.is_empty() {
+            sender.send(batch).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("record receiver dropped: {e}"),
                 )
             })?;
-            batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
         }
 
+        drop(sender);
         Ok(())
-    })?;
-
-    if !batch.is_empty() {
-        sender.send(batch).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("record receiver dropped: {e}"),
-            )
-        })?;
-    }
-
-    drop(sender);
+    })();
 
     let _ = fs::remove_file(&records_output);
     let _ = fs::remove_file(&colormap_file);
-    for chunk in chunk_files {
-        let _ = fs::remove_file(chunk);
-    }
     let _ = fs::remove_dir_all(&chunk_dir);
 
-    Ok(())
+    process_result
 }
 
 pub fn compress_with_ggcat(
