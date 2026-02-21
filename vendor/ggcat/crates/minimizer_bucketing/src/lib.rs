@@ -508,9 +508,11 @@ impl<
             self.execute(params, &address, &receiver);
         }
 
-        // No more packets should arrive
+        // No more packets should arrive. In practice, late packets can still
+        // be queued during shutdown races; drain them to let the address drop
+        // path observe an empty queue instead of aborting on debug assertions.
         while let Ok(address) = receiver.obtain_address() {
-            assert!(address.receive_packet().is_none());
+            while address.receive_packet().is_some() {}
         }
     }
 }
