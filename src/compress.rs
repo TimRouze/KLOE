@@ -24,7 +24,9 @@ const ENCODED_SEQ_BUFFER_TARGET: usize = 4 * 1024 * 1024;
 const ID_CID_SPILL_BUFFER_CAPACITY: usize = 256 * 1024;
 const PAR_SORT_THRESHOLD: usize = 200_000;
 const COLOR_RECORD_BATCH_SIZE: usize = 4_096;
-const COLOR_CHUNK_TARGET_BYTES: usize = 128 * 1024 * 1024;
+// Larger chunk targets reduce temporary chunk count and k-way merge overhead
+// in the post-ggcat external sort stage.
+const COLOR_CHUNK_TARGET_BYTES: usize = 512 * 1024 * 1024;
 const GROUP_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 
 pub fn compress(
