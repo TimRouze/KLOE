@@ -28,21 +28,6 @@ const COLOR_RECORD_BATCH_SIZE: usize = 4_096;
 // in the post-ggcat external sort stage.
 const COLOR_CHUNK_TARGET_BYTES: usize = 512 * 1024 * 1024;
 const GROUP_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
-const BUCKET_SIZES_FORMAT_MAGIC: [u8; 8] = *b"KLSZV001";
-const BUCKET_SIZE_COMPRESSION_LEVEL: i32 = 6;
-
-#[inline]
-fn write_uvarint<W: Write>(writer: &mut W, mut value: usize) -> io::Result<()> {
-    let mut buf = [0u8; 10];
-    let mut idx = 0usize;
-    while value >= 0x80 {
-        buf[idx] = ((value as u8) & 0x7f) | 0x80;
-        value >>= 7;
-        idx += 1;
-    }
-    buf[idx] = value as u8;
-    writer.write_all(&buf[..=idx])
-}
 
 pub fn compress(
     output_dir: &String,
@@ -457,6 +442,7 @@ struct StreamWriterState {
     prev_bucket_pos: u64,
     cid: usize,
     encoded_seq_buffer: Vec<u8>,
+    first_group: bool,
 }
 
 impl StreamWriterState {
@@ -476,25 +462,23 @@ impl StreamWriterState {
             spill_writers.push(writer);
         }
 
-        let mut size_file = BufWriter::with_capacity(
-            IO_BUFFER_CAPACITY,
-            File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
-        );
-        size_file.write_all(&BUCKET_SIZES_FORMAT_MAGIC)?;
-
         Ok((
             Self {
                 omni_file: BufWriter::with_capacity(
                     IO_BUFFER_CAPACITY,
                     File::create(unitigs_file_path)?,
                 ),
-                size_file,
+                size_file: BufWriter::with_capacity(
+                    IO_BUFFER_CAPACITY,
+                    File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
+                ),
                 spill_writers,
-                pos_nb_unitig: vec![(0, BUCKET_SIZES_FORMAT_MAGIC.len() as u64)],
+                pos_nb_unitig: vec![(0, 0)],
                 prev_tigs_size: 0,
-                prev_bucket_pos: BUCKET_SIZES_FORMAT_MAGIC.len() as u64,
+                prev_bucket_pos: 0,
                 cid: 0,
                 encoded_seq_buffer: Vec::with_capacity(ENCODED_SEQ_BUFFER_TARGET),
+                first_group: true,
             },
             spill_paths,
             spill_dir,
@@ -513,8 +497,9 @@ impl StreamWriterState {
         }
 
         let mut group_sizes_buffer: Vec<u8> = Vec::new();
-        let mut group_encoder =
-            Encoder::new(&mut group_sizes_buffer, BUCKET_SIZE_COMPRESSION_LEVEL)?;
+        let level = if self.first_group { 4 } else { 1 };
+        let mut group_encoder = Encoder::new(&mut group_sizes_buffer, level)?;
+        self.first_group = false;
 
         let mut prev_size: usize = 0;
         emit_sorted_group_sequences(seqs, run_paths, spill_dir, |seq| {
@@ -533,7 +518,7 @@ impl StreamWriterState {
                     "group sizes are not nondecreasing",
                 )
             })?;
-            write_uvarint(&mut group_encoder, delta)?;
+            group_encoder.write_all(&delta.to_le_bytes())?;
             prev_size = size;
             Ok(())
         })?;

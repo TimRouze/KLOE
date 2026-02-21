@@ -9,8 +9,6 @@ use zstd::Decoder;
 
 use crate::utils::vec2str;
 
-const BUCKET_SIZES_FORMAT_MAGIC: [u8; 8] = *b"KLSZV001";
-
 //   =========================================================================================== DECOMPRESSION ==============================================================================
 
 /// High-level decompression entry point.
@@ -353,48 +351,21 @@ fn decode_delta_cids(text: &str, context: &str) -> Result<Vec<usize>> {
     Ok(cids)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BucketSizesEncoding {
-    LegacyU64Delta,
-    VarintDelta,
-}
-
 /// Preload all bucket sizes from the sizes file into a Vec indexed by byte offset.
 ///
-/// The sizes file format is either:
-/// - legacy: repeated [u64 compressed_len][compressed_data...], payload is u64 LE deltas
-/// - v1: [8-byte magic "KLSZV001"] then repeated [u64 compressed_len][compressed_data...],
-///   payload is uvarint deltas
-///
+/// The sizes file format: repeated [u64 compressed_len][compressed_data...].
 /// Returns a HashMap from byte_offset -> Vec<usize> of actual sizes.
 fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
     let mut file = BufReader::new(File::open(size_filename)?);
     let mut sizes_map = HashMap::new();
-    let mut first = [0u8; 8];
-    let (encoding, mut offset, mut pending_len): (BucketSizesEncoding, u64, Option<[u8; 8]>) =
-        match file.read_exact(&mut first) {
-            Ok(()) if first == BUCKET_SIZES_FORMAT_MAGIC => (
-                BucketSizesEncoding::VarintDelta,
-                BUCKET_SIZES_FORMAT_MAGIC.len() as u64,
-                None,
-            ),
-            Ok(()) => (BucketSizesEncoding::LegacyU64Delta, 0, Some(first)),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(sizes_map),
-            Err(e) => return Err(e),
-        };
-
+    let mut offset: u64 = 0;
     loop {
-        let len_buf = if let Some(buf) = pending_len.take() {
-            buf
-        } else {
-            let mut buf = [0u8; 8];
-            match file.read_exact(&mut buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            buf
-        };
+        let mut len_buf = [0u8; 8];
+        match file.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
         let compressed_size = usize::from_le_bytes(len_buf);
         if compressed_size == 0 {
             break;
@@ -407,35 +378,12 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
         decoder.read_to_end(&mut decompressed)?;
 
         let mut sizes = Vec::new();
-        let mut prev = 0usize;
-        match encoding {
-            BucketSizesEncoding::LegacyU64Delta => {
-                for chunk in decompressed.chunks_exact(8) {
-                    let delta = usize::from_le_bytes(chunk.try_into().unwrap());
-                    let actual_size = delta + prev;
-                    sizes.push(actual_size);
-                    prev = actual_size;
-                }
-            }
-            BucketSizesEncoding::VarintDelta => {
-                let mut idx = 0usize;
-                while idx < decompressed.len() {
-                    let delta = read_uvarint(&decompressed, &mut idx).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid varint bucket delta in {}", size_filename),
-                        )
-                    })?;
-                    let actual_size = delta.checked_add(prev).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("bucket size overflow while decoding {}", size_filename),
-                        )
-                    })?;
-                    sizes.push(actual_size);
-                    prev = actual_size;
-                }
-            }
+        let mut prev = 0;
+        for chunk in decompressed.chunks_exact(8) {
+            let delta = usize::from_le_bytes(chunk.try_into().unwrap());
+            let actual_size = delta + prev;
+            sizes.push(actual_size);
+            prev = actual_size;
         }
 
         sizes_map.insert(offset, sizes);
@@ -447,25 +395,6 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
         size_filename
     );
     Ok(sizes_map)
-}
-
-#[inline]
-fn read_uvarint(data: &[u8], idx: &mut usize) -> Option<usize> {
-    let mut value = 0usize;
-    let mut shift = 0u32;
-    while *idx < data.len() {
-        let byte = data[*idx];
-        *idx += 1;
-        value |= ((byte & 0x7f) as usize) << shift;
-        if (byte & 0x80) == 0 {
-            return Some(value);
-        }
-        shift += 7;
-        if shift >= usize::BITS {
-            return None;
-        }
-    }
-    None
 }
 
 /// Decompress the entire archive to individual FASTA shards.
