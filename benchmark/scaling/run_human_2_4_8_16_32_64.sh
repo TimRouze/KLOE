@@ -9,6 +9,7 @@ set -euo pipefail
 #   BIN=target/release/kloe
 #   HUMAN_DIR=logenhuman
 #   OUT_BASE=/tmp/kloe_human_scaling_YYYYmmdd_HHMMSS
+#   SIZES="2 4 8 16 32 64 128"
 #   THREADS=32
 #   MEMORY_GB=40
 #   PARTITION_POWER=10
@@ -16,11 +17,13 @@ set -euo pipefail
 #   M=7
 #   TIG_MODE=simplitig   # one of: simplitig, unitig, matchtig, eulertig
 #   BUILD_RELEASE=1      # 1 => cargo build -r before running
+#   CLEAN_RUN_ARTIFACTS=1 # 1 => remove per-run out/tmp after metrics are captured
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-SIZES=(2 4 8 16 32 64 128)
+SIZES_RAW="${SIZES:-2 4 8 16 32 64 128}"
+read -r -a SIZES <<<"$SIZES_RAW"
 BIN="${BIN:-$ROOT_DIR/target/release/kloe}"
 HUMAN_DIR="${HUMAN_DIR:-$ROOT_DIR/logenhuman}"
 OUT_BASE="${OUT_BASE:-/tmp/kloe_human_scaling_$(date +%Y%m%d_%H%M%S)}"
@@ -31,6 +34,27 @@ K="${K:-31}"
 M="${M:-7}"
 TIG_MODE="${TIG_MODE:-simplitig}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
+CLEAN_RUN_ARTIFACTS="${CLEAN_RUN_ARTIFACTS:-1}"
+
+CURRENT_RUN_OUT=""
+CURRENT_RUN_TMP=""
+
+cleanup_current_run() {
+  if [[ -n "$CURRENT_RUN_OUT" ]]; then
+    rm -rf "$CURRENT_RUN_OUT"
+  fi
+  if [[ -n "$CURRENT_RUN_TMP" ]]; then
+    rm -rf "$CURRENT_RUN_TMP"
+  fi
+  CURRENT_RUN_OUT=""
+  CURRENT_RUN_TMP=""
+}
+
+cleanup_on_exit() {
+  cleanup_current_run
+}
+
+trap cleanup_on_exit EXIT INT TERM
 
 if [[ "$BUILD_RELEASE" == "1" ]]; then
   echo "[build] cargo build -r"
@@ -92,6 +116,8 @@ echo "[info] binary:      $BIN"
 echo "[info] mode:        $TIG_MODE"
 echo "[info] threads:     $THREADS"
 echo "[info] memory GB:   $MEMORY_GB"
+echo "[info] sizes:       ${SIZES[*]}"
+echo "[info] cleanup:     CLEAN_RUN_ARTIFACTS=$CLEAN_RUN_ARTIFACTS"
 
 echo "[info] selected first 128 genomes (sorted):"
 printf '  %s\n' "${GENOMES[@]:0:128}"
@@ -104,6 +130,8 @@ for n in "${SIZES[@]}"; do
   run_tmp="$OUT_BASE/tmp/n${n}"
   log="$OUT_BASE/logs/run_${n}.log"
   tlog="$OUT_BASE/logs/run_${n}_time.txt"
+  CURRENT_RUN_OUT="$run_out"
+  CURRENT_RUN_TMP="$run_tmp"
 
   rm -rf "$run_out" "$run_tmp"
   mkdir -p "$run_out" "$run_tmp"
@@ -151,7 +179,18 @@ for n in "${SIZES[@]}"; do
     "$fof" "$log" "$tlog" >> "$SUMMARY_TSV"
 
   echo "[done n=$n] exit=$exit_code elapsed_s=$elapsed_sec max_rss_kb=$rss_kb archive_bytes=$archive_bytes"
+
+  if [[ "$CLEAN_RUN_ARTIFACTS" == "1" ]]; then
+    cleanup_current_run
+  else
+    CURRENT_RUN_OUT=""
+    CURRENT_RUN_TMP=""
+  fi
 done
+
+if [[ "$CLEAN_RUN_ARTIFACTS" == "1" ]]; then
+  rmdir "$OUT_BASE/out" "$OUT_BASE/tmp" 2>/dev/null || true
+fi
 
 echo ""
 echo "Benchmark complete"
