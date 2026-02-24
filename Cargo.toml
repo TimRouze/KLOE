@@ -54,6 +54,15 @@ opt-level = 3
 [profile.release]
 debug = true
 opt-level = 3
+# Faster iterative release builds on many-core machines.
+# Use `--profile release-lto` for final benchmark binaries.
+lto = "thin"
+codegen-units = 32
+panic = "unwind"
+incremental = true
+
+[profile.release-lto]
+inherits = "release"
 lto = true
 codegen-units = 1
-panic = "unwind"
+incremental = false

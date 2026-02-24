@@ -1,18 +1,16 @@
 use flate2::write::GzEncoder;
 use std::{
+    fmt::Debug,
     fs::File,
     io::{BufWriter, Write},
 };
 
-pub(crate) trait SequencesFileFinish: Write {
+pub(crate) trait SequencesFileFinish: Write + Debug {
     fn finalize(self);
 }
 impl<W: SequencesFileFinish> SequencesFileFinish for BufWriter<W> {
     fn finalize(self) {
-        match self.into_inner() {
-            Ok(writer) => writer.finalize(),
-            Err(_) => panic!("Cannot finalize buffered writer"),
-        }
+        self.into_inner().unwrap().finalize();
     }
 }
 impl SequencesFileFinish for File {
@@ -28,13 +26,6 @@ impl<W: SequencesFileFinish> SequencesFileFinish for lz4::Encoder<W> {
     }
 }
 impl<W: SequencesFileFinish> SequencesFileFinish for GzEncoder<W> {
-    fn finalize(self) {
-        let w = self.finish().unwrap();
-        w.finalize();
-    }
-}
-
-impl<'a, W: SequencesFileFinish> SequencesFileFinish for zstd::stream::write::Encoder<'a, W> {
     fn finalize(self) {
         let w = self.finish().unwrap();
         w.finalize();

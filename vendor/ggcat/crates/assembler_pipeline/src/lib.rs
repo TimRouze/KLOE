@@ -4,12 +4,11 @@ use std::{
     any::Any,
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::Ordering,
 };
 
 use ::dynamic_dispatch::dynamic_dispatch;
 use colors::colors_manager::{ColorsManager, color_types::PartialUnitigsColorStructure};
-use config::{OUTPUT_COMPRESSION_LEVEL, SwapPriority, get_compression_level_info, get_memory_mode};
+use config::{SwapPriority, get_compression_level_info, get_memory_mode};
 use hashes::HashFunctionFactory;
 use io::{
     concurrent::{
@@ -17,7 +16,6 @@ use io::{
             IdentSequenceWriter, StructuredSequenceBackend, StructuredSequenceBackendInit,
             StructuredSequenceBackendWrapper, StructuredSequenceWriter,
             binary::StructSeqBinaryWriter,
-            color_records::ColorRecordsWriterWrapper,
             fasta::FastaWriterWrapper,
             gfa::{GFAWriterWrapperV1, GFAWriterWrapperV2},
         },
@@ -75,15 +73,10 @@ pub fn get_final_output_writer<
 >(
     output_file: &Path,
 ) -> W {
-    let output_compression_level = OUTPUT_COMPRESSION_LEVEL.load(Ordering::Relaxed);
-
     match output_file.extension() {
         Some(ext) => match ext.to_string_lossy().to_string().as_str() {
-            "lz4" => W::new_compressed_lz4(&output_file, output_compression_level.min(16)),
-            "gz" => W::new_compressed_gzip(&output_file, output_compression_level.min(9)),
-            "zst" | "zstd" => {
-                W::new_compressed_zstd(&output_file, output_compression_level.min(22))
-            }
+            "lz4" => W::new_compressed_lz4(&output_file, 2),
+            "gz" => W::new_compressed_gzip(&output_file, 2),
             _ => W::new_plain(&output_file),
         },
         None => W::new_plain(&output_file),
@@ -106,7 +99,6 @@ pub fn get_final_output_writer<
     colors::non_colored::NonColoredManager,
 ], OutputMode = [
     FastaWriterWrapper,
-    ColorRecordsWriterWrapper,
     #[cfg(feature = "enable-gfa")] GFAWriterWrapperV1,
     #[cfg(feature = "enable-gfa")] GFAWriterWrapperV2
 ])]

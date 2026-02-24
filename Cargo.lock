@@ -1225,7 +1225,6 @@ dependencies = [
  "bitbound",
  "bstr",
  "byteorder",
- "bzip2",
  "dynamic-dispatch",
  "flate2",
  "ggcat-logging",
@@ -1240,8 +1239,6 @@ dependencies = [
  "serde",
  "streaming-libdeflate-rs",
  "typenum",
- "xz2",
- "zstd 0.13.3",
 ]
 
 [[package]]
@@ -1313,7 +1310,6 @@ dependencies = [
  "rayon",
  "streaming-libdeflate-rs",
  "typenum",
- "zstd 0.13.3",
 ]
 
 [[package]]
