@@ -121,18 +121,16 @@ impl<
         #[cfg(feature = "support_kmer_counters")]
         counters: io::concurrent::structured_sequences::SequenceAbundance,
     ) {
-        let colors = color_types::ColorsMergeManagerType::<CX>::encode_part_unitigs_colors(
-            &mut colors_data.unitigs_temp_colors,
-            &mut colors_data.temp_color_buffer,
-        );
-
-        let extra_data = PartialUnitigExtraData {
-            colors,
-            #[cfg(feature = "support_kmer_counters")]
-            counters,
-        };
-
         if forward_linked.is_none() && backward_linked.is_none() {
+            let colors = color_types::ColorsMergeManagerType::<CX>::encode_part_unitigs_colors(
+                &mut colors_data.unitigs_temp_colors,
+                &mut colors_data.temp_color_buffer,
+            );
+            let extra_data = PartialUnitigExtraData {
+                colors,
+                #[cfg(feature = "support_kmer_counters")]
+                counters,
+            };
             lonely_unitigs.add_read(
                 out_seq.into_bases_iter(),
                 None,
@@ -150,6 +148,37 @@ impl<
 
             let extremal_hash = hash.get_extremal_hash(out_seq, k, hash_beginning);
             let should_rc = !extremal_hash.is_forward();
+            let mut colors = color_types::ColorsMergeManagerType::<CX>::encode_part_unitigs_colors(
+                &mut colors_data.unitigs_temp_colors,
+                &mut colors_data.temp_color_buffer,
+            );
+
+            if should_rc {
+                // Keep color runs aligned with sequence orientation.
+                CX::ColorsMergeManagerType::reset_unitig_color_structure(
+                    &mut colors_data.unitigs_temp_colors,
+                );
+                CX::ColorsMergeManagerType::join_structures::<true>(
+                    &mut colors_data.unitigs_temp_colors,
+                    &colors,
+                    &colors_data.temp_color_buffer,
+                    0,
+                    None,
+                );
+                color_types::PartialUnitigsColorStructure::<CX>::clear_temp_buffer(
+                    &mut colors_data.temp_color_buffer,
+                );
+                colors = color_types::ColorsMergeManagerType::<CX>::encode_part_unitigs_colors(
+                    &mut colors_data.unitigs_temp_colors,
+                    &mut colors_data.temp_color_buffer,
+                );
+            }
+
+            let extra_data = PartialUnitigExtraData {
+                colors,
+                #[cfg(feature = "support_kmer_counters")]
+                counters,
+            };
 
             let last_align = if hash_beginning ^ should_rc {
                 0

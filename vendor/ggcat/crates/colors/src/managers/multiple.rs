@@ -289,14 +289,14 @@ impl ColorsMergeManager for MultipleColorsManager {
         entry_color: Self::TableColorEntry,
         count: usize,
     ) {
-        if let Some(front_ts) = ts.colors.front_mut() {
-            if front_ts.color == entry_color {
-                front_ts.counter += count;
+        if let Some(back_ts) = ts.colors.back_mut() {
+            if back_ts.color == entry_color {
+                back_ts.counter += count;
                 return;
             }
         }
 
-        ts.colors.push_front(KmerSerializedColor {
+        ts.colors.push_back(KmerSerializedColor {
             color: entry_color,
             counter: count,
         });
