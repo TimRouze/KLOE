@@ -35,6 +35,11 @@ const SPILL_CID_FLUSH_BYTES: usize = 64 * 1024;
 const PRODUCER_PARSE_BATCH_ENTRIES: usize = 4_096;
 const PRODUCER_PARSE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const SUBSET_QUERY_CHUNK_SIZE: usize = 500_000;
+const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
+const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
+const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
+const BUCKET_SIZE_BLOCK_MAX_GROUPS: usize = 8_192;
+const BUCKET_SIZE_BLOCK_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn compress(
     output_dir: &String,
@@ -295,6 +300,27 @@ fn log_phase_timing(phase: &str, timing: PhaseTiming) {
             phase, timing.wall_sec
         );
     }
+}
+
+fn write_varint_u64(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_varint_u64_to_writer(mut value: u64, mut out: impl Write) -> io::Result<()> {
+    let mut buf = [0u8; 10];
+    let mut len = 0usize;
+    while value >= 0x80 {
+        buf[len] = (value as u8 & 0x7f) | 0x80;
+        value >>= 7;
+        len += 1;
+    }
+    buf[len] = value as u8;
+    len += 1;
+    out.write_all(&buf[..len])
 }
 
 #[derive(Debug, Default)]
@@ -804,12 +830,14 @@ struct StreamWriterState {
     size_file: BufWriter<File>,
     spill_writers: Vec<BufWriter<File>>,
     spill_cid_buffers: Vec<Vec<u8>>,
+    size_block_groups: usize,
+    size_block_offsets: Vec<u32>,
+    size_block_uncompressed: Vec<u8>,
     pos_nb_unitig: Vec<(u64, u64)>,
     prev_tigs_size: u64,
     prev_bucket_pos: u64,
     cid: usize,
     encoded_seq_buffer: Vec<u8>,
-    first_group: bool,
 }
 
 impl StreamWriterState {
@@ -837,22 +865,75 @@ impl StreamWriterState {
                     IO_BUFFER_CAPACITY,
                     File::create(unitigs_file_path)?,
                 ),
-                size_file: BufWriter::with_capacity(
-                    IO_BUFFER_CAPACITY,
-                    File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
-                ),
+                size_file: {
+                    let mut out = BufWriter::with_capacity(
+                        IO_BUFFER_CAPACITY,
+                        File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
+                    );
+                    out.write_all(BUCKET_SIZES_MAGIC)?;
+                    out
+                },
                 spill_writers,
                 spill_cid_buffers,
+                size_block_groups: 0,
+                size_block_offsets: vec![0],
+                size_block_uncompressed: Vec::new(),
                 pos_nb_unitig: vec![(0, 0)],
                 prev_tigs_size: 0,
                 prev_bucket_pos: 0,
                 cid: 0,
                 encoded_seq_buffer: Vec::with_capacity(ENCODED_SEQ_BUFFER_TARGET),
-                first_group: true,
             },
             spill_paths,
             spill_dir,
         ))
+    }
+
+    fn flush_size_block(&mut self) -> Result<()> {
+        if self.size_block_groups == 0 {
+            return Ok(());
+        }
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = Encoder::new(&mut compressed, 1)?;
+            encoder.write_all(&self.size_block_uncompressed)?;
+            encoder.finish()?;
+        }
+
+        self.size_file
+            .write_all(&(self.size_block_groups as u32).to_le_bytes())?;
+        self.size_file
+            .write_all(&(compressed.len() as u64).to_le_bytes())?;
+        for &offset in &self.size_block_offsets {
+            self.size_file.write_all(&offset.to_le_bytes())?;
+        }
+        self.size_file.write_all(&compressed)?;
+
+        self.size_block_groups = 0;
+        self.size_block_offsets.clear();
+        self.size_block_offsets.push(0);
+        self.size_block_uncompressed.clear();
+        Ok(())
+    }
+
+    fn append_bucket_group_sizes_payload(&mut self, payload: &[u8]) -> Result<()> {
+        self.size_block_uncompressed.extend_from_slice(payload);
+        let next_offset = u32::try_from(self.size_block_uncompressed.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bucket sizes block exceeds 4GiB uncompressed payload",
+            )
+        })?;
+        self.size_block_offsets.push(next_offset);
+        self.size_block_groups += 1;
+
+        if self.size_block_groups >= BUCKET_SIZE_BLOCK_MAX_GROUPS
+            || self.size_block_uncompressed.len() >= BUCKET_SIZE_BLOCK_MAX_UNCOMPRESSED_BYTES
+        {
+            self.flush_size_block()?;
+        }
+        Ok(())
     }
 
     fn append_cid_for_dataset(&mut self, dataset_id_zero_based: usize, cid: usize) -> Result<()> {
@@ -885,9 +966,6 @@ impl StreamWriterState {
         }
 
         let mut group_sizes_buffer: Vec<u8> = Vec::new();
-        let level = if self.first_group { 4 } else { 1 };
-        let mut group_encoder = Encoder::new(&mut group_sizes_buffer, level)?;
-        self.first_group = false;
 
         let mut prev_size: usize = 0;
         emit_sorted_group_sequences(seqs, run_paths, spill_dir, |seq| {
@@ -906,19 +984,14 @@ impl StreamWriterState {
                     "group sizes are not nondecreasing",
                 )
             })?;
-            group_encoder.write_all(&delta.to_le_bytes())?;
+            write_varint_u64(delta as u64, &mut group_sizes_buffer);
             prev_size = size;
             Ok(())
         })?;
-
-        group_encoder.finish()?;
-
-        self.prev_bucket_pos += (8 + group_sizes_buffer.len()) as u64;
+        self.append_bucket_group_sizes_payload(&group_sizes_buffer)?;
+        self.prev_bucket_pos += 1;
         self.pos_nb_unitig
             .push((self.prev_tigs_size, self.prev_bucket_pos));
-        self.size_file
-            .write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
-        self.size_file.write_all(&group_sizes_buffer)?;
 
         self.append_group_cids(dataset_ids_zero_based)?;
 
@@ -938,13 +1011,14 @@ impl StreamWriterState {
         io::copy(&mut encoded_reader, &mut self.omni_file)?;
         self.prev_tigs_size += encoded_tigs_len;
 
-        self.prev_bucket_pos += 8 + group_sizes_len;
+        self.prev_bucket_pos += 1;
         self.pos_nb_unitig
             .push((self.prev_tigs_size, self.prev_bucket_pos));
-        self.size_file.write_all(&group_sizes_len.to_le_bytes())?;
+        let mut group_sizes_payload = Vec::with_capacity(group_sizes_len as usize);
         let mut sizes_reader =
             BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(group_sizes_path)?);
-        io::copy(&mut sizes_reader, &mut self.size_file)?;
+        sizes_reader.read_to_end(&mut group_sizes_payload)?;
+        self.append_bucket_group_sizes_payload(&group_sizes_payload)?;
 
         self.append_group_cids(dataset_ids_zero_based)?;
         Ok(())
@@ -959,12 +1033,10 @@ impl StreamWriterState {
         self.omni_file.write_all(encoded_tigs)?;
         self.prev_tigs_size += encoded_tigs.len() as u64;
 
-        self.prev_bucket_pos += 8 + group_sizes.len() as u64;
+        self.prev_bucket_pos += 1;
         self.pos_nb_unitig
             .push((self.prev_tigs_size, self.prev_bucket_pos));
-        self.size_file
-            .write_all(&(group_sizes.len() as u64).to_le_bytes())?;
-        self.size_file.write_all(group_sizes)?;
+        self.append_bucket_group_sizes_payload(group_sizes)?;
 
         self.append_group_cids(dataset_ids_zero_based)?;
         Ok(())
@@ -984,6 +1056,7 @@ impl StreamWriterState {
         for writer in &mut self.spill_writers {
             writer.flush()?;
         }
+        self.flush_size_block()?;
         self.omni_file.flush()?;
         self.size_file.flush()?;
 
@@ -1070,12 +1143,10 @@ fn process_single_group_task(
     let group_timer = PhaseTimer::start();
     let seq_bytes = task.seqs.iter().map(Vec::len).sum::<usize>();
     let use_in_memory = task.run_paths.is_empty() && seq_bytes <= GROUP_IN_MEMORY_MAX_SEQ_BYTES;
-    let level = if task.cid == 0 { 4 } else { 1 };
 
     let data = if use_in_memory {
         let mut encoded_tigs = Vec::with_capacity(seq_bytes / 4 + 1024);
         let mut group_sizes = Vec::new();
-        let mut group_encoder = Encoder::new(&mut group_sizes, level)?;
         let mut prev_size: usize = 0;
         emit_sorted_group_sequences(&mut task.seqs, &mut task.run_paths, spill_dir, |seq| {
             let encoded_seq = <Converter as Convert<&[u8]>>::str2num(seq);
@@ -1087,11 +1158,10 @@ fn process_single_group_task(
                     "group sizes are not nondecreasing",
                 )
             })?;
-            group_encoder.write_all(&delta.to_le_bytes())?;
+            write_varint_u64(delta as u64, &mut group_sizes);
             prev_size = size;
             Ok(())
         })?;
-        group_encoder.finish()?;
         GroupWriteData::InMemory {
             encoded_tigs,
             group_sizes,
@@ -1102,9 +1172,8 @@ fn process_single_group_task(
 
         let encoded_file = File::create(&encoded_tigs_path)?;
         let mut encoded_writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, encoded_file);
-        let sizes_file = File::create(&group_sizes_path)?;
-        let sizes_writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, sizes_file);
-        let mut group_encoder = Encoder::new(sizes_writer, level)?;
+        let mut sizes_writer =
+            BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&group_sizes_path)?);
         let mut prev_size: usize = 0;
 
         let emit_res =
@@ -1119,7 +1188,7 @@ fn process_single_group_task(
                         "group sizes are not nondecreasing",
                     )
                 })?;
-                group_encoder.write_all(&delta.to_le_bytes())?;
+                write_varint_u64_to_writer(delta as u64, &mut sizes_writer)?;
                 prev_size = size;
                 Ok(())
             });
@@ -1132,7 +1201,6 @@ fn process_single_group_task(
             let _ = fs::remove_file(&group_sizes_path);
         }
         emit_res?;
-        let mut sizes_writer = group_encoder.finish()?;
         sizes_writer.flush()?;
         encoded_writer.flush()?;
         drop(sizes_writer);
@@ -1472,10 +1540,23 @@ fn write_compressed_from_stream(
 }
 
 fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<()> {
-    let mut pos_file = BufWriter::new(File::create(filepath)?);
-    for elem in &pos_nb_unitigs {
-        pos_file.write_all(&elem.0.to_le_bytes())?;
-        pos_file.write_all(&elem.1.to_le_bytes())?;
+    let mut pos_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(filepath)?);
+    pos_file.write_all(POSITIONS_MAGIC)?;
+    write_varint_u64_to_writer(pos_nb_unitigs.len() as u64, &mut pos_file)?;
+
+    let mut prev_tigs = 0u64;
+    let mut prev_sizes = 0u64;
+    for (tigs_pos, sizes_pos) in &pos_nb_unitigs {
+        if *tigs_pos < prev_tigs || *sizes_pos < prev_sizes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "positions are not monotonic",
+            ));
+        }
+        write_varint_u64_to_writer(*tigs_pos - prev_tigs, &mut pos_file)?;
+        write_varint_u64_to_writer(*sizes_pos - prev_sizes, &mut pos_file)?;
+        prev_tigs = *tigs_pos;
+        prev_sizes = *sizes_pos;
     }
     pos_file.flush()?;
     Ok(())
@@ -1494,46 +1575,44 @@ fn create_id_cid_spill_dir(output_dir: &str) -> Result<PathBuf> {
 
 fn build_id_cid_payload_from_spill(path: &Path, cid_file_path: &str) -> std::io::Result<Vec<u8>> {
     let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(path)?);
+    let mut raw_payload = Vec::new();
+    let mut prev_cid = 0usize;
+    loop {
+        let mut raw = [0u8; 8];
+        match std::io::Read::read_exact(&mut reader, &mut raw) {
+            Ok(()) => {
+                let raw_cid = u64::from_le_bytes(raw);
+                let cid = usize::try_from(raw_cid).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "color id {} cannot be represented as usize while writing {}",
+                            raw_cid, cid_file_path
+                        ),
+                    )
+                })?;
+                if cid < prev_cid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "color ids are not sorted ({} before {}) while writing {}",
+                            prev_cid, cid, cid_file_path
+                        ),
+                    ));
+                }
+                let delta = cid - prev_cid;
+                write_varint_u64(delta as u64, &mut raw_payload);
+                prev_cid = cid;
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+
     let mut payload = Vec::new();
     {
         let mut cid_encoder = Encoder::new(&mut payload, 1)?;
-        let mut first = true;
-        let mut prev_cid = 0usize;
-        loop {
-            let mut raw = [0u8; 8];
-            match std::io::Read::read_exact(&mut reader, &mut raw) {
-                Ok(()) => {
-                    let raw_cid = u64::from_le_bytes(raw);
-                    let cid = usize::try_from(raw_cid).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "color id {} cannot be represented as usize while writing {}",
-                                raw_cid, cid_file_path
-                            ),
-                        )
-                    })?;
-                    if cid < prev_cid {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "color ids are not sorted ({} before {}) while writing {}",
-                                prev_cid, cid, cid_file_path
-                            ),
-                        ));
-                    }
-                    let delta = cid - prev_cid;
-                    if !first {
-                        cid_encoder.write_all(b",")?;
-                    }
-                    first = false;
-                    write!(&mut cid_encoder, "{}", delta)?;
-                    prev_cid = cid;
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-        }
+        cid_encoder.write_all(&raw_payload)?;
         cid_encoder.finish()?;
     }
     Ok(payload)
@@ -1547,8 +1626,9 @@ fn write_id_to_color_id_from_spills(
 ) -> std::io::Result<Vec<usize>> {
     let total_timer = PhaseTimer::start();
     let mut cid_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&cid_file_path)?);
+    cid_file.write_all(ID_TO_CID_MAGIC)?;
     let mut id_cid_line_sizes = Vec::with_capacity(spill_paths.len());
-    let mut tot_size = 0usize;
+    let mut tot_size = ID_TO_CID_MAGIC.len();
     let mut per_dataset_timing = TimingAccumulator::default();
     let mut total_payload_bytes = 0usize;
     let mut payloads: Vec<Option<Vec<u8>>> = vec![None; spill_paths.len()];

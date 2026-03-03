@@ -9,6 +9,10 @@ use zstd::Decoder;
 
 use crate::utils::vec2str;
 
+const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
+const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
+const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
+
 //   =========================================================================================== DECOMPRESSION ==============================================================================
 
 /// High-level decompression entry point.
@@ -304,8 +308,157 @@ pub fn decompress_with_options(
 /// The positions file contains N entries of exactly 16 bytes each:
 /// [u64 tigs_pos LE][u64 sizes_pos LE].
 /// Returns a Vec where index i corresponds to CID i.
+fn read_varint_u64_from_reader(reader: &mut impl Read) -> io::Result<Option<u64>> {
+    let mut shift = 0u32;
+    let mut value = 0u64;
+    let mut saw_byte = false;
+    loop {
+        let mut b = [0u8; 1];
+        match reader.read_exact(&mut b) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !saw_byte => return Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated varint value",
+                ))
+            }
+            Err(err) => return Err(err),
+        }
+        saw_byte = true;
+        let byte = b[0];
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint overflow while decoding u64",
+            ));
+        }
+    }
+}
+
+fn decode_varint_delta_cids(payload: &[u8], context: &str) -> Result<Vec<usize>> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let mut cids = Vec::new();
+    let mut current = 0usize;
+    loop {
+        let Some(delta_u64) = read_varint_u64_from_reader(&mut cursor)? else {
+            break;
+        };
+        let delta = usize::try_from(delta_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cid delta {} cannot fit usize while decoding '{}'",
+                    delta_u64, context
+                ),
+            )
+        })?;
+        current = current.checked_add(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cid delta overflow while decoding '{}'", context),
+            )
+        })?;
+        cids.push(current);
+    }
+    Ok(cids)
+}
+
+fn decode_varint_deltas_to_sizes(payload: &[u8], context: &str) -> Result<Vec<usize>> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let mut sizes = Vec::new();
+    let mut prev = 0usize;
+    loop {
+        let Some(delta_u64) = read_varint_u64_from_reader(&mut cursor)? else {
+            break;
+        };
+        let delta = usize::try_from(delta_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "size delta {} cannot fit usize while decoding '{}'",
+                    delta_u64, context
+                ),
+            )
+        })?;
+        let size = prev.checked_add(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("size delta overflow while decoding '{}'", context),
+            )
+        })?;
+        sizes.push(size);
+        prev = size;
+    }
+    Ok(sizes)
+}
+
 fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
     let mut file = BufReader::new(File::open(positions_filename)?);
+    let mut magic = [0u8; 4];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    }
+
+    if &magic == POSITIONS_MAGIC {
+        let entries = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing positions entry count in compact positions file",
+            )
+        })?;
+        let entries = usize::try_from(entries).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "positions entry count cannot fit usize",
+            )
+        })?;
+        let mut positions = Vec::with_capacity(entries);
+        let mut tigs_pos = 0u64;
+        let mut sizes_pos = 0u64;
+        for _ in 0..entries {
+            let dt = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated tigs delta in positions file",
+                )
+            })?;
+            let ds = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated sizes delta in positions file",
+                )
+            })?;
+            tigs_pos = tigs_pos.checked_add(dt).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tigs position delta overflow in positions file",
+                )
+            })?;
+            sizes_pos = sizes_pos.checked_add(ds).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sizes position delta overflow in positions file",
+                )
+            })?;
+            positions.push((tigs_pos, sizes_pos));
+        }
+        println!(
+            "Preloaded {} compact position entries from {}",
+            positions.len(),
+            positions_filename
+        );
+        return Ok(positions);
+    }
+
+    file.seek(std::io::SeekFrom::Start(0))?;
     let file_size = file.get_ref().metadata()?.len() as usize;
     let num_entries = file_size / 16;
     let mut positions = Vec::with_capacity(num_entries);
@@ -317,7 +470,7 @@ fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
         positions.push((tigs_pos, sizes_pos));
     }
     println!(
-        "Preloaded {} position entries from {}",
+        "Preloaded {} legacy position entries from {}",
         num_entries, positions_filename
     );
     Ok(positions)
@@ -351,6 +504,24 @@ fn decode_delta_cids(text: &str, context: &str) -> Result<Vec<usize>> {
     Ok(cids)
 }
 
+fn decode_cid_entry_payload(
+    payload: &[u8],
+    context: &str,
+    binary_varints: bool,
+) -> Result<Vec<usize>> {
+    if binary_varints {
+        decode_varint_delta_cids(payload, context)
+    } else {
+        let text = String::from_utf8(payload.to_vec()).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid UTF-8 while decoding '{}': {}", context, err),
+            )
+        })?;
+        decode_delta_cids(&text, context)
+    }
+}
+
 /// Preload all bucket sizes from the sizes file into a Vec indexed by byte offset.
 ///
 /// The sizes file format: repeated [u64 compressed_len][compressed_data...].
@@ -358,6 +529,70 @@ fn decode_delta_cids(text: &str, context: &str) -> Result<Vec<usize>> {
 fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
     let mut file = BufReader::new(File::open(size_filename)?);
     let mut sizes_map = HashMap::new();
+    let mut magic = [0u8; 4];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(HashMap::new()),
+        Err(err) => return Err(err),
+    }
+
+    if &magic == BUCKET_SIZES_MAGIC {
+        let mut global_group_index = 0u64;
+        loop {
+            let mut groups_buf = [0u8; 4];
+            match file.read_exact(&mut groups_buf) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err),
+            }
+            let groups = u32::from_le_bytes(groups_buf) as usize;
+            if groups == 0 {
+                break;
+            }
+            let mut compressed_len_buf = [0u8; 8];
+            file.read_exact(&mut compressed_len_buf)?;
+            let compressed_len = u64::from_le_bytes(compressed_len_buf) as usize;
+
+            let offsets_len = groups + 1;
+            let mut offsets = vec![0u32; offsets_len];
+            for off in &mut offsets {
+                let mut buf = [0u8; 4];
+                file.read_exact(&mut buf)?;
+                *off = u32::from_le_bytes(buf);
+            }
+
+            let mut compressed = vec![0u8; compressed_len];
+            file.read_exact(&mut compressed)?;
+
+            let mut decompressed = Vec::new();
+            Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
+
+            for i in 0..groups {
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                if end < start || end > decompressed.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid bucket block offsets while preloading sizes",
+                    ));
+                }
+                let key = global_group_index + i as u64;
+                let context = format!("{}#group{}", size_filename, key);
+                let sizes = decode_varint_deltas_to_sizes(&decompressed[start..end], &context)?;
+                sizes_map.insert(key, sizes);
+            }
+            global_group_index += groups as u64;
+        }
+
+        println!(
+            "Preloaded {} compact size buckets from {}",
+            sizes_map.len(),
+            size_filename
+        );
+        return Ok(sizes_map);
+    }
+
+    file.seek(std::io::SeekFrom::Start(0))?;
     let mut offset: u64 = 0;
     loop {
         let mut len_buf = [0u8; 8];
@@ -366,7 +601,7 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         }
-        let compressed_size = usize::from_le_bytes(len_buf);
+        let compressed_size = u64::from_le_bytes(len_buf) as usize;
         if compressed_size == 0 {
             break;
         }
@@ -378,10 +613,12 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
         decoder.read_to_end(&mut decompressed)?;
 
         let mut sizes = Vec::new();
-        let mut prev = 0;
+        let mut prev = 0usize;
         for chunk in decompressed.chunks_exact(8) {
             let delta = usize::from_le_bytes(chunk.try_into().unwrap());
-            let actual_size = delta + prev;
+            let actual_size = prev
+                .checked_add(delta)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "size overflow"))?;
             sizes.push(actual_size);
             prev = actual_size;
         }
@@ -390,7 +627,7 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
         offset += 8 + compressed_size as u64;
     }
     println!(
-        "Preloaded {} size buckets from {}",
+        "Preloaded {} legacy size buckets from {}",
         sizes_map.len(),
         size_filename
     );
@@ -521,9 +758,21 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
     let mut cid_ids_map = HashMap::new();
     let mut counter: u32 = 0;
     println!("Reading CID to ID file: {}", color_id_filename);
+
+    let mut magic = [0u8; 4];
+    let binary_varints = match color_id_file.read_exact(&mut magic) {
+        Ok(()) if &magic == ID_TO_CID_MAGIC => true,
+        Ok(()) => {
+            color_id_file.seek(std::io::SeekFrom::Start(0))?;
+            false
+        }
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(HashMap::new()),
+        Err(err) => return Err(err),
+    };
+
     let mut buffer_size = [0; 8];
     color_id_file.read_exact(&mut buffer_size)?;
-    let mut size_read = usize::from_le_bytes(buffer_size);
+    let mut size_read = u64::from_le_bytes(buffer_size) as usize;
     while size_read != 0 {
         let mut buffer = vec![0; size_read];
         color_id_file.read_exact(&mut buffer)?;
@@ -532,16 +781,8 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
             let mut decoder = Decoder::new(&buffer[..])?;
             decoder.read_to_end(&mut decompressed_data)?;
         }
-        let str_tmp = String::from_utf8(decompressed_data).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid UTF-8 while decoding '{}' entry: {}",
-                    color_id_filename, err
-                ),
-            )
-        })?;
-        let decoded_cids = decode_delta_cids(&str_tmp, color_id_filename)?;
+        let context = format!("{}#{}", color_id_filename, counter);
+        let decoded_cids = decode_cid_entry_payload(&decompressed_data, &context, binary_varints)?;
         for cid in decoded_cids {
             cid_ids_map
                 .entry(cid)
@@ -549,7 +790,7 @@ fn get_cid_to_id(color_id_filename: &String) -> Result<HashMap<usize, Vec<u32>>>
                 .or_insert(Vec::from([counter]));
         }
         color_id_file.read_exact(&mut buffer_size)?;
-        size_read = usize::from_le_bytes(buffer_size);
+        size_read = u64::from_le_bytes(buffer_size) as usize;
         counter += 1;
     }
 
@@ -569,6 +810,19 @@ fn get_cid_to_id_targeted(
     let mut cid_ids_map = HashMap::new();
     let mut wanted_filenames = Vec::new();
 
+    let mut magic = [0u8; 4];
+    let binary_varints = match color_id_file.read_exact(&mut magic) {
+        Ok(()) if &magic == ID_TO_CID_MAGIC => true,
+        Ok(()) => {
+            color_id_file.seek(std::io::SeekFrom::Start(0))?;
+            false
+        }
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            return Ok((HashMap::new(), Vec::new()))
+        }
+        Err(err) => return Err(err),
+    };
+
     let wanted_file = File::open(wanted_files_path)?;
     let wanted_reader = BufReader::new(wanted_file);
     for line_result in wanted_reader.lines() {
@@ -578,7 +832,7 @@ fn get_cid_to_id_targeted(
             color_id_file.seek(std::io::SeekFrom::Start(entry.1))?;
             let mut buffer_size = [0; 8];
             color_id_file.read_exact(&mut buffer_size)?;
-            let size_read = usize::from_le_bytes(buffer_size);
+            let size_read = u64::from_le_bytes(buffer_size) as usize;
             let mut buffer = vec![0; size_read];
             color_id_file.read_exact(&mut buffer)?;
             let mut decompressed_data = Vec::new();
@@ -586,17 +840,9 @@ fn get_cid_to_id_targeted(
                 let mut decoder = Decoder::new(&buffer[..])?;
                 decoder.read_to_end(&mut decompressed_data)?;
             }
-            let str_tmp = String::from_utf8(decompressed_data).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid UTF-8 while decoding '{}' entry at offset {}: {}",
-                        color_id_filename, entry.1, err
-                    ),
-                )
-            })?;
             let context = format!("{}@{}", color_id_filename, entry.1);
-            let decoded_cids = decode_delta_cids(&str_tmp, &context)?;
+            let decoded_cids =
+                decode_cid_entry_payload(&decompressed_data, &context, binary_varints)?;
             for cid in decoded_cids {
                 cid_ids_map
                     .entry(cid)

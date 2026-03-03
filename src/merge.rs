@@ -12,6 +12,10 @@ use crate::decompress;
 use crate::records;
 use crate::utils::vec2str;
 
+const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
+const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
+const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
+
 const REQUIRED_ARCHIVE_FILES: [&str; 5] = [
     "filenames_id.txt",
     "positions_kloe.bin",
@@ -68,6 +72,7 @@ struct ArchiveInfo {
     cid_to_ids: Vec<Vec<u32>>,
     tigs_path: PathBuf,
     sizes_path: PathBuf,
+    compact_sizes: Option<Arc<Vec<Vec<usize>>>>,
     estimated_kmers_per_cid: Vec<usize>,
 }
 
@@ -129,7 +134,18 @@ impl ArchiveInfo {
             ids.dedup();
         }
 
-        let estimated_kmers_per_cid = estimate_kmers_per_cid(&positions, &sizes_path, k)?;
+        let compact_sizes = if is_compact_bucket_sizes_file(&sizes_path)? {
+            Some(Arc::new(load_compact_bucket_sizes(&sizes_path)?))
+        } else {
+            None
+        };
+
+        let estimated_kmers_per_cid = estimate_kmers_per_cid(
+            &positions,
+            &sizes_path,
+            compact_sizes.as_ref().map(|v| v.as_slice()),
+            k,
+        )?;
 
         Ok(Self {
             filenames,
@@ -137,6 +153,7 @@ impl ArchiveInfo {
             cid_to_ids,
             tigs_path,
             sizes_path,
+            compact_sizes,
             estimated_kmers_per_cid,
         })
     }
@@ -161,7 +178,11 @@ impl ArchiveInfo {
         sorted_cids.sort_unstable();
 
         let mut tigs_reader = BufReader::new(File::open(&self.tigs_path)?);
-        let mut sizes_reader = BufReader::new(File::open(&self.sizes_path)?);
+        let mut sizes_reader = if self.compact_sizes.is_none() {
+            Some(BufReader::new(File::open(&self.sizes_path)?))
+        } else {
+            None
+        };
 
         let cid_limit = self.positions.len().saturating_sub(1);
         for cid in sorted_cids {
@@ -170,7 +191,16 @@ impl ArchiveInfo {
             }
 
             let (tigs_pos, sizes_pos) = self.positions[cid];
-            let sizes = read_bucket_sizes_at(&mut sizes_reader, sizes_pos)?;
+            let sizes = if let Some(compact) = self.compact_sizes.as_deref() {
+                read_compact_bucket_sizes_at(compact, sizes_pos)?
+            } else {
+                read_bucket_sizes_at(
+                    sizes_reader
+                        .as_mut()
+                        .expect("legacy sizes reader must be initialized"),
+                    sizes_pos,
+                )?
+            };
             if sizes.is_empty() {
                 continue;
             }
@@ -669,8 +699,232 @@ fn merge_color_ids(target: &mut Vec<u32>, other: &[u32]) {
     *target = merged;
 }
 
+fn read_varint_u64_from_reader(reader: &mut impl Read) -> io::Result<Option<u64>> {
+    let mut shift = 0u32;
+    let mut value = 0u64;
+    let mut saw_byte = false;
+    loop {
+        let mut b = [0u8; 1];
+        match reader.read_exact(&mut b) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !saw_byte => return Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated varint value",
+                ))
+            }
+            Err(err) => return Err(err),
+        }
+        saw_byte = true;
+        let byte = b[0];
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint overflow while decoding u64",
+            ));
+        }
+    }
+}
+
+fn decode_varint_delta_cids(payload: &[u8], context: &str) -> io::Result<Vec<usize>> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let mut out = Vec::new();
+    let mut current = 0usize;
+    loop {
+        let Some(delta_u64) = read_varint_u64_from_reader(&mut cursor)? else {
+            break;
+        };
+        let delta = usize::try_from(delta_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cid delta {} cannot fit usize while decoding '{}'",
+                    delta_u64, context
+                ),
+            )
+        })?;
+        current = current.checked_add(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cid delta overflow while decoding '{}'", context),
+            )
+        })?;
+        out.push(current);
+    }
+    Ok(out)
+}
+
+fn decode_varint_deltas_to_sizes(payload: &[u8], context: &str) -> io::Result<Vec<usize>> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let mut sizes = Vec::new();
+    let mut prev = 0usize;
+    loop {
+        let Some(delta_u64) = read_varint_u64_from_reader(&mut cursor)? else {
+            break;
+        };
+        let delta = usize::try_from(delta_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "size delta {} cannot fit usize while decoding '{}'",
+                    delta_u64, context
+                ),
+            )
+        })?;
+        let size = prev.checked_add(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("size delta overflow while decoding '{}'", context),
+            )
+        })?;
+        sizes.push(size);
+        prev = size;
+    }
+    Ok(sizes)
+}
+
+fn is_compact_bucket_sizes_file(path: &Path) -> io::Result<bool> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    match reader.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == BUCKET_SIZES_MAGIC),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn load_compact_bucket_sizes(path: &Path) -> io::Result<Vec<Vec<usize>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != BUCKET_SIZES_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected compact bucket sizes magic in '{}'",
+                path.to_string_lossy()
+            ),
+        ));
+    }
+
+    let mut all = Vec::<Vec<usize>>::new();
+    loop {
+        let mut groups_buf = [0u8; 4];
+        match reader.read_exact(&mut groups_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err),
+        }
+        let groups = u32::from_le_bytes(groups_buf) as usize;
+        if groups == 0 {
+            break;
+        }
+
+        let mut compressed_len_buf = [0u8; 8];
+        reader.read_exact(&mut compressed_len_buf)?;
+        let compressed_len = u64::from_le_bytes(compressed_len_buf) as usize;
+
+        let mut offsets = vec![0u32; groups + 1];
+        for off in &mut offsets {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            *off = u32::from_le_bytes(buf);
+        }
+
+        let mut compressed = vec![0u8; compressed_len];
+        reader.read_exact(&mut compressed)?;
+        let mut decompressed = Vec::new();
+        Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
+
+        for group_idx in 0..groups {
+            let start = offsets[group_idx] as usize;
+            let end = offsets[group_idx + 1] as usize;
+            if end < start || end > decompressed.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid compact bucket offsets in '{}'",
+                        path.to_string_lossy()
+                    ),
+                ));
+            }
+            let context = format!("{}#group{}", path.to_string_lossy(), all.len());
+            all.push(decode_varint_deltas_to_sizes(
+                &decompressed[start..end],
+                &context,
+            )?);
+        }
+    }
+    Ok(all)
+}
+
+fn read_compact_bucket_sizes_at(all: &[Vec<usize>], group_index: u64) -> io::Result<Vec<usize>> {
+    let idx = usize::try_from(group_index).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("group index {} cannot fit usize", group_index),
+        )
+    })?;
+    Ok(all.get(idx).cloned().unwrap_or_default())
+}
+
 fn load_positions(path: &Path) -> io::Result<Vec<(u64, u64)>> {
     let mut file = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    }
+
+    if &magic == POSITIONS_MAGIC {
+        let count_u64 = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "missing compact positions count in '{}'",
+                    path.to_string_lossy()
+                ),
+            )
+        })?;
+        let count = usize::try_from(count_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "positions count {} cannot fit usize in '{}'",
+                    count_u64,
+                    path.to_string_lossy()
+                ),
+            )
+        })?;
+        let mut positions = Vec::with_capacity(count);
+        let mut tigs_pos = 0u64;
+        let mut sizes_pos = 0u64;
+        for _ in 0..count {
+            let dt = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated tigs delta")
+            })?;
+            let ds = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated sizes delta")
+            })?;
+            tigs_pos = tigs_pos.checked_add(dt).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "tigs position overflow")
+            })?;
+            sizes_pos = sizes_pos.checked_add(ds).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "sizes position overflow")
+            })?;
+            positions.push((tigs_pos, sizes_pos));
+        }
+        return Ok(positions);
+    }
+
+    file.seek(std::io::SeekFrom::Start(0))?;
     let file_size = file.get_ref().metadata()?.len() as usize;
     if file_size % 16 != 0 {
         return Err(io::Error::new(
@@ -720,6 +974,16 @@ fn load_filenames(path: &Path) -> io::Result<Vec<String>> {
 fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut all = Vec::new();
+    let mut magic = [0u8; 4];
+    let binary_varints = match reader.read_exact(&mut magic) {
+        Ok(()) if &magic == ID_TO_CID_MAGIC => true,
+        Ok(()) => {
+            reader.seek(std::io::SeekFrom::Start(0))?;
+            false
+        }
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
 
     loop {
         let mut len_buf = [0u8; 8];
@@ -728,7 +992,7 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(err) => return Err(err),
         }
-        let payload_len = usize::from_le_bytes(len_buf);
+        let payload_len = u64::from_le_bytes(len_buf) as usize;
         if payload_len == 0 {
             break;
         }
@@ -738,46 +1002,51 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
 
         let mut decompressed = Vec::new();
         Decoder::new(&payload[..])?.read_to_end(&mut decompressed)?;
-        let text = String::from_utf8(decompressed).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid UTF-8 while decoding '{}' entry: {}",
-                    path.to_string_lossy(),
-                    err
-                ),
-            )
-        })?;
-
-        let mut cids = Vec::new();
-        let mut current_cid = 0usize;
-        for token in text.split(',') {
-            let token = token.trim();
-            if token.is_empty() {
-                continue;
-            }
-            let delta = token.parse::<usize>().map_err(|err| {
+        let context = format!("{}#{}", path.to_string_lossy(), all.len());
+        let mut cids = if binary_varints {
+            decode_varint_delta_cids(&decompressed, &context)?
+        } else {
+            let text = String::from_utf8(decompressed).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid cid delta '{}' in '{}': {}",
-                        token,
+                        "invalid UTF-8 while decoding '{}': {}",
                         path.to_string_lossy(),
                         err
                     ),
                 )
             })?;
-            current_cid = current_cid.checked_add(delta).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "cid delta overflow while decoding '{}'",
-                        path.to_string_lossy()
-                    ),
-                )
-            })?;
-            cids.push(current_cid);
-        }
+            let mut out = Vec::new();
+            let mut current_cid = 0usize;
+            for token in text.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                let delta = token.parse::<usize>().map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid cid delta '{}' in '{}': {}",
+                            token,
+                            path.to_string_lossy(),
+                            err
+                        ),
+                    )
+                })?;
+                current_cid = current_cid.checked_add(delta).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "cid delta overflow while decoding '{}'",
+                            path.to_string_lossy()
+                        ),
+                    )
+                })?;
+                out.push(current_cid);
+            }
+            out
+        };
         cids.sort_unstable();
         cids.dedup();
         all.push(cids);
@@ -814,15 +1083,29 @@ fn load_offsets_from_filenames_id(path: &Path) -> io::Result<Vec<usize>> {
 fn estimate_kmers_per_cid(
     positions: &[(u64, u64)],
     sizes_path: &Path,
+    compact_sizes: Option<&[Vec<usize>]>,
     k: usize,
 ) -> io::Result<Vec<usize>> {
     let cid_limit = positions.len().saturating_sub(1);
     let mut estimates = vec![0usize; positions.len()];
-    let mut sizes_reader = BufReader::new(File::open(sizes_path)?);
+    let mut sizes_reader = if compact_sizes.is_none() {
+        Some(BufReader::new(File::open(sizes_path)?))
+    } else {
+        None
+    };
 
     for cid in 0..cid_limit {
         let (_, sizes_pos) = positions[cid];
-        let sizes = read_bucket_sizes_at(&mut sizes_reader, sizes_pos)?;
+        let sizes = if let Some(all) = compact_sizes {
+            read_compact_bucket_sizes_at(all, sizes_pos)?
+        } else {
+            read_bucket_sizes_at(
+                sizes_reader
+                    .as_mut()
+                    .expect("legacy sizes reader must be initialized"),
+                sizes_pos,
+            )?
+        };
         let mut kmers = 0usize;
         for size in sizes {
             if size >= k {
@@ -843,7 +1126,7 @@ fn read_bucket_sizes_at<R: Read + Seek>(reader: &mut R, offset: u64) -> io::Resu
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
         Err(err) => return Err(err),
     }
-    let payload_len = usize::from_le_bytes(len_buf);
+    let payload_len = u64::from_le_bytes(len_buf) as usize;
     if payload_len == 0 {
         return Ok(Vec::new());
     }
@@ -866,7 +1149,7 @@ fn read_bucket_sizes_at<R: Read + Seek>(reader: &mut R, offset: u64) -> io::Resu
     let mut prev = 0usize;
     let mut sizes = Vec::with_capacity(decompressed.len() / 8);
     for chunk in decompressed.chunks_exact(8) {
-        let delta = usize::from_le_bytes(chunk.try_into().unwrap());
+        let delta = u64::from_le_bytes(chunk.try_into().unwrap()) as usize;
         let size = prev.saturating_add(delta);
         sizes.push(size);
         prev = size;
