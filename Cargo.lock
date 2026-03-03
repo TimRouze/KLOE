@@ -1239,6 +1239,7 @@ dependencies = [
  "serde",
  "streaming-libdeflate-rs",
  "typenum",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -1559,6 +1560,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.14.0",
+ "libc",
  "miette",
  "minimizer-iter",
  "niffler",
@@ -2041,8 +2043,6 @@ dependencies = [
 [[package]]
 name = "parallel-processor"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa88e04fbf3cd44be726af21e69b39f30bb3635abea7c23ecc8b615426088a2"
 dependencies = [
  "arc-swap",
  "backtrace",

@@ -12,9 +12,9 @@ set -euo pipefail
 #   SIZES="2 4 8 16 32 64 128"
 #   THREADS=32
 #   MEMORY_GB=40
-#   PARTITION_POWER=10
+#   HARD_MEM_GB=0      # 0 disables hard limit; enforced via ulimit -v
+#   SYSTEMD_MEMORY_MAX=40G   # if set, run each job under systemd-run --user --scope -p MemoryMax=...
 #   K=31
-#   M=7
 #   TIG_MODE=simplitig   # one of: simplitig, unitig, matchtig, eulertig
 #   BUILD_RELEASE=1      # 1 => cargo build -r before running
 #   CLEAN_RUN_ARTIFACTS=1 # 1 => remove per-run out/tmp after metrics are captured
@@ -25,13 +25,13 @@ cd "$ROOT_DIR"
 SIZES_RAW="${SIZES:-2 4 8 16 32 64 128}"
 read -r -a SIZES <<<"$SIZES_RAW"
 BIN="${BIN:-$ROOT_DIR/target/release/kloe}"
-HUMAN_DIR="${HUMAN_DIR:-$ROOT_DIR/logenhuman}"
+HUMAN_DIR="${HUMAN_DIR:-$ROOT_DIR/loganhuman}"
 OUT_BASE="${OUT_BASE:-/tmp/kloe_human_scaling_$(date +%Y%m%d_%H%M%S)}"
 THREADS="${THREADS:-32}"
 MEMORY_GB="${MEMORY_GB:-40}"
-PARTITION_POWER="${PARTITION_POWER:-10}"
+HARD_MEM_GB="${HARD_MEM_GB:-0}"
+SYSTEMD_MEMORY_MAX="${SYSTEMD_MEMORY_MAX:-}"
 K="${K:-31}"
-M="${M:-7}"
 TIG_MODE="${TIG_MODE:-simplitig}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 CLEAN_RUN_ARTIFACTS="${CLEAN_RUN_ARTIFACTS:-1}"
@@ -77,9 +77,14 @@ if [[ ! -x /usr/bin/time ]]; then
 fi
 
 mapfile -t GENOMES < <(find "$HUMAN_DIR" -maxdepth 1 -type f -name '*.unitigs.fa.zst' | sort)
+GENOME_GLOB="*.unitigs.fa.zst"
+if [[ "${#GENOMES[@]}" -lt 128 ]]; then
+  mapfile -t GENOMES < <(find "$HUMAN_DIR" -maxdepth 1 -type f -name '*.u.fa.zst' | sort)
+  GENOME_GLOB="*.u.fa.zst"
+fi
 
 if [[ "${#GENOMES[@]}" -lt 128 ]]; then
-  echo "ERROR: need at least 128 *.unitigs.fa.zst files in $HUMAN_DIR, found ${#GENOMES[@]}" >&2
+  echo "ERROR: need at least 128 human files matching '*.unitigs.fa.zst' or '*.u.fa.zst' in $HUMAN_DIR, found ${#GENOMES[@]}" >&2
   exit 1
 fi
 
@@ -116,8 +121,11 @@ echo "[info] binary:      $BIN"
 echo "[info] mode:        $TIG_MODE"
 echo "[info] threads:     $THREADS"
 echo "[info] memory GB:   $MEMORY_GB"
+echo "[info] hard mem GB: $HARD_MEM_GB"
+echo "[info] systemd mem: ${SYSTEMD_MEMORY_MAX:-disabled}"
 echo "[info] sizes:       ${SIZES[*]}"
 echo "[info] cleanup:     CLEAN_RUN_ARTIFACTS=$CLEAN_RUN_ARTIFACTS"
+echo "[info] input glob:  $GENOME_GLOB"
 
 echo "[info] selected first 128 genomes (sorted):"
 printf '  %s\n' "${GENOMES[@]:0:128}"
@@ -143,15 +151,27 @@ for n in "${SIZES[@]}"; do
     -d "$run_tmp"
     -t "$THREADS"
     -r "$MEMORY_GB"
-    -P "$PARTITION_POWER"
     -k "$K"
-    -m "$M"
     "${tig_flag[@]}"
   )
 
   echo "[run n=$n] ${cmd[*]}"
   set +e
-  /usr/bin/time -v "${cmd[@]}" >"$log" 2>"$tlog"
+  if [[ -n "$SYSTEMD_MEMORY_MAX" ]]; then
+    if ! command -v systemd-run >/dev/null 2>&1; then
+      echo "ERROR: SYSTEMD_MEMORY_MAX is set but systemd-run is unavailable." >&2
+      exit 1
+    fi
+    /usr/bin/time -v systemd-run --user --scope -p "MemoryMax=$SYSTEMD_MEMORY_MAX" "${cmd[@]}" >"$log" 2>"$tlog"
+  elif [[ "$HARD_MEM_GB" -gt 0 ]]; then
+    hard_mem_kb=$((HARD_MEM_GB * 1024 * 1024))
+    (
+      ulimit -Sv "$hard_mem_kb"
+      /usr/bin/time -v "${cmd[@]}"
+    ) >"$log" 2>"$tlog"
+  else
+    /usr/bin/time -v "${cmd[@]}" >"$log" 2>"$tlog"
+  fi
   exit_code=$?
   set -e
 

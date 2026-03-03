@@ -41,8 +41,8 @@ struct Args {
     ///K value, default = 31
     #[arg(short, long, default_value_t = 31)]
     k_size: usize,
-    ///Minimizer size (< k), default = 7
-    #[arg(short, long, default_value_t = 7)]
+    ///Minimizer size (< k), default = 12
+    #[arg(short, long, default_value_t = 12)]
     minimizer_size: usize,
     /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
     #[arg(long = "verify-kmers", default_value_t = false)]

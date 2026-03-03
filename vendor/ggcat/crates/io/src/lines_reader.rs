@@ -3,7 +3,7 @@ use config::DEFAULT_OUTPUT_BUFFER_SIZE;
 use parallel_processor::mt_debug_counters::counter::{AtomicCounter, AvgMode, SumMode};
 use parallel_processor::mt_debug_counters::{declare_avg_counter_i64, declare_counter_i64};
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use streaming_libdeflate_rs::decompress_file_buffered;
 
@@ -82,6 +82,23 @@ impl LinesReader {
             )
             .unwrap();
             self.read_stream_buffered(file, callback)
+                .unwrap_or_else(|_| {
+                    ggcat_logging::error!(
+                        "WARNING: Error while reading file {}",
+                        path.as_ref().display()
+                    );
+                });
+        } else if path
+            .as_ref()
+            .extension()
+            .filter(|x| *x == "zst" || *x == "zstd")
+            .is_some()
+        {
+            let file = File::open(&path)
+                .expect(&format!("Cannot open file {}", path.as_ref().display()));
+            let decoder = zstd::stream::read::Decoder::new(BufReader::new(file))
+                .expect(&format!("Cannot decode zstd file {}", path.as_ref().display()));
+            self.read_stream_buffered(decoder, callback)
                 .unwrap_or_else(|_| {
                     ggcat_logging::error!(
                         "WARNING: Error while reading file {}",

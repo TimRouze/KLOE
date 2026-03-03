@@ -42,7 +42,7 @@ impl Default for MergeConfig {
     fn default() -> Self {
         Self {
             threads: 1,
-            minimizer_size: 7,
+            minimizer_size: 12,
             partition_power: 10,
             temp_dir: String::new(),
             verify_kmers: false,
@@ -307,8 +307,12 @@ pub fn merge_archives_with_config(
         )
     });
 
-    let id_cid_offsets =
-        compress::sort_by_bucket_streaming(&stage_output_dir, total_datasets as u32, rx);
+    let id_cid_offsets = compress::sort_by_bucket_streaming(
+        &stage_output_dir,
+        total_datasets as u32,
+        cfg.threads,
+        rx,
+    );
 
     let stats = match producer.join() {
         Ok(res) => res?,

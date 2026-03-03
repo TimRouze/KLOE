@@ -692,6 +692,10 @@ pub fn extend_unitigs<
                             .as_mut()
                             .unwrap_or(&mut tmp_final_unitigs_buffer);
                         let bases_count = read.bases_count() - 1;
+                        // The circular sequence is linearized by dropping one terminal base.
+                        // Color runs must be truncated to the matching k-mer count of the
+                        // shortened sequence, otherwise dumped C:* counters are +1.
+                        let colors_count = bases_count.saturating_sub(k - 1);
 
                         CX::ColorsMergeManagerType::reset_unitig_color_structure(
                             &mut join_colors_structure,
@@ -701,7 +705,7 @@ pub fn extend_unitigs<
                             &read_struct.extra,
                             &extra_buffer,
                             0,
-                            Some(bases_count),
+                            Some(colors_count),
                         );
                         let writable_color = CX::ColorsMergeManagerType::encode_part_unitigs_colors(
                             &mut join_colors_structure,

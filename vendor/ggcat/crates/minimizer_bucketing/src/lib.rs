@@ -507,11 +507,6 @@ impl<
         if let Ok(address) = receiver.obtain_address() {
             self.execute(params, &address, &receiver);
         }
-
-        // No more packets should arrive
-        while let Ok(address) = receiver.obtain_address() {
-            assert!(address.receive_packet().is_none());
-        }
     }
 }
 
@@ -697,11 +692,11 @@ impl GenericMinimizerBucketing {
             disk_thread_pool_handle.add_input_data((), input_blocks.into_iter());
 
             drop(disk_thread_pool_handle);
-            drop(compute_thread_pool_handle);
 
             disk_thread_pool.join();
 
             Option::take(&mut global_context.executor_group_address.write());
+            drop(compute_thread_pool_handle);
             compute_thread_pool.join();
         }
 

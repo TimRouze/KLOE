@@ -41,6 +41,7 @@ tempfile = "3.23.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ggcat-api = { path = "vendor/ggcat/crates/api" }
 ggcat_colors = { path = "vendor/ggcat/crates/colors" }
+libc = "0.2"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
@@ -59,10 +60,16 @@ opt-level = 3
 lto = "thin"
 codegen-units = 32
 panic = "unwind"
-incremental = true
+# Keep release linking stable on nightly + thin LTO.
+# `incremental=true` has been triggering intermittent rust-lld
+# undefined hidden symbol failures in this workspace.
+incremental = false
 
 [profile.release-lto]
 inherits = "release"
 lto = true
 codegen-units = 1
 incremental = false
+
+[patch.crates-io]
+parallel-processor = { path = "vendor/parallel-processor" }

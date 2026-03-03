@@ -3,11 +3,14 @@ use colors::colors_manager::color_types::{
 };
 use colors::colors_manager::{ColorsManager, MinimizerBucketingSeqColorData};
 use colors::parsers::{SequenceIdent, SingleSequenceInfo};
-use config::BucketIndexType;
+use config::{BucketIndexType, MultiplicityCounterType, READ_FLAG_INCL_END};
+use hashes::default::MNHFactory;
+use hashes::{ExtendableHashTraitType, HashFunction, HashFunctionFactory, HashableSequence};
 use io::concurrent::temp_reads::extra_data::{
     HasEmptyExtraBuffer, SequenceExtraDataCombiner, SequenceExtraDataConsecutiveCompression,
     SequenceExtraDataTempBufferManagement,
 };
+use io::compressed_read::CompressedRead;
 use io::sequences_reader::{DnaSequence, DnaSequencesFileType};
 use io::sequences_stream::SequenceInfo;
 use io::sequences_stream::fasta::FastaFileSequencesStream;
@@ -82,10 +85,11 @@ impl<CX: SequenceExtraDataConsecutiveCompression<TempBuffer = ()> + Clone + Fast
     fn combine_entries(
         &mut self,
         _out_buffer: &mut Self::TempBuffer,
-        _color: Self,
+        color: Self,
         _in_buffer: &Self::TempBuffer,
     ) {
-        unimplemented!()
+        debug_assert_eq!(self.color, color.color);
+        self.color = color.color;
     }
 
     fn to_single(
@@ -93,7 +97,7 @@ impl<CX: SequenceExtraDataConsecutiveCompression<TempBuffer = ()> + Clone + Fast
         _in_buffer: &Self::TempBuffer,
         _out_buffer: &mut <Self::SingleDataType as SequenceExtraDataTempBufferManagement>::TempBuffer,
     ) -> Self::SingleDataType {
-        unimplemented!()
+        self.clone()
     }
 
     fn prepare_for_serialization(&mut self, _buffer: &mut Self::TempBuffer) {}
@@ -138,21 +142,37 @@ pub struct DumperMinimizerBucketingExecutor<CX: ColorsManager> {
 
 pub struct RewriteBucketComputeDumper;
 
+#[inline(always)]
+fn get_superkmer_minimizer(k: usize, m: usize, flags: u8, read: &CompressedRead) -> (usize, u64) {
+    let decr_val = ((read.bases_count() == k) && (flags & READ_FLAG_INCL_END) == 0) as usize;
+
+    let hashes = MNHFactory::new(read.sub_slice((1 - decr_val)..(k - decr_val)), m);
+
+    let minimizer = hashes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, k)| k.to_unextendable())
+        .unwrap();
+
+    (minimizer.0 + 1 - decr_val, minimizer.1.to_unextendable())
+}
+
 impl RewriteBucketCompute for RewriteBucketComputeDumper {
     fn get_rewrite_bucket<C>(
-        _k: usize,
-        _m: usize,
-        _seq_data: &(
+        k: usize,
+        m: usize,
+        seq_data: &(
             u8,
             u8,
             C,
-            io::compressed_read::CompressedRead,
-            config::MultiplicityCounterType,
+            CompressedRead,
+            MultiplicityCounterType,
         ),
-        _used_hash_bits: usize,
-        _bucket_bits_count: usize,
+        used_hash_bits: usize,
+        bucket_bits_count: usize,
     ) -> BucketIndexType {
-        unimplemented!()
+        let minimizer = get_superkmer_minimizer(k, m, seq_data.0, &seq_data.3).1;
+        MNHFactory::get_bucket(used_hash_bits, bucket_bits_count, minimizer)
     }
 }
 
