@@ -24,12 +24,14 @@ const IO_BUFFER_CAPACITY: usize = 16 * 1024 * 1024;
 const ENCODED_SEQ_BUFFER_TARGET: usize = 4 * 1024 * 1024;
 const ID_CID_SPILL_BUFFER_CAPACITY: usize = 1024 * 1024;
 const PAR_SORT_THRESHOLD: usize = 200_000;
-const COLOR_RECORD_BATCH_SIZE: usize = 16_384;
+const COLOR_RECORD_BATCH_SIZE: usize = 65_536;
 const COLOR_CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const GROUP_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 const GROUP_WORKER_QUEUE_DEPTH: usize = 8;
-const GROUP_WORK_BATCH_GROUPS: usize = 256;
+const GROUP_WORK_BATCH_GROUPS: usize = 2048;
+const GROUP_WORK_BATCH_SEQ_BYTES: usize = 256 * 1024 * 1024;
 const GROUP_IN_MEMORY_MAX_SEQ_BYTES: usize = 2 * 1024 * 1024;
+const SPILL_CID_FLUSH_BYTES: usize = 64 * 1024;
 const PRODUCER_PARSE_BATCH_ENTRIES: usize = 4_096;
 const PRODUCER_PARSE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const SUBSET_QUERY_CHUNK_SIZE: usize = 500_000;
@@ -94,7 +96,7 @@ impl Eq for ChunkHeapItem {}
 
 impl PartialEq for ChunkHeapItem {
     fn eq(&self, other: &Self) -> bool {
-        self.record.subset == other.record.subset && self.record.seq == other.record.seq
+        self.record.subset == other.record.subset && self.chunk_index == other.chunk_index
     }
 }
 
@@ -104,7 +106,7 @@ impl Ord for ChunkHeapItem {
             .record
             .subset
             .cmp(&self.record.subset)
-            .then_with(|| other.record.seq.cmp(&self.record.seq))
+            .then_with(|| other.chunk_index.cmp(&self.chunk_index))
     }
 }
 
@@ -475,17 +477,9 @@ fn flush_sorted_chunk(
     }
 
     if records.len() >= PAR_SORT_THRESHOLD {
-        records.par_sort_unstable_by(|left, right| {
-            left.subset
-                .cmp(&right.subset)
-                .then_with(|| left.seq.cmp(&right.seq))
-        });
+        records.par_sort_unstable_by(|left, right| left.subset.cmp(&right.subset));
     } else {
-        records.sort_unstable_by(|left, right| {
-            left.subset
-                .cmp(&right.subset)
-                .then_with(|| left.seq.cmp(&right.seq))
-        });
+        records.sort_unstable_by(|left, right| left.subset.cmp(&right.subset));
     }
 
     let chunk_path = chunk_dir.join(format!("chunk_{:08}.bin", chunk_files.len()));
@@ -809,6 +803,7 @@ struct StreamWriterState {
     omni_file: BufWriter<File>,
     size_file: BufWriter<File>,
     spill_writers: Vec<BufWriter<File>>,
+    spill_cid_buffers: Vec<Vec<u8>>,
     pos_nb_unitig: Vec<(u64, u64)>,
     prev_tigs_size: u64,
     prev_bucket_pos: u64,
@@ -825,6 +820,7 @@ impl StreamWriterState {
     ) -> Result<(Self, Vec<PathBuf>, PathBuf)> {
         let mut spill_paths = Vec::with_capacity(nb_files);
         let mut spill_writers = Vec::with_capacity(nb_files);
+        let mut spill_cid_buffers = Vec::with_capacity(nb_files);
         let spill_dir = create_id_cid_spill_dir(output_dir)?;
         for id in 0..nb_files {
             let path = spill_dir.join(format!("id_{id}.cids.bin"));
@@ -832,6 +828,7 @@ impl StreamWriterState {
                 BufWriter::with_capacity(ID_CID_SPILL_BUFFER_CAPACITY, File::create(&path)?);
             spill_paths.push(path);
             spill_writers.push(writer);
+            spill_cid_buffers.push(Vec::with_capacity(SPILL_CID_FLUSH_BYTES));
         }
 
         Ok((
@@ -845,6 +842,7 @@ impl StreamWriterState {
                     File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
                 ),
                 spill_writers,
+                spill_cid_buffers,
                 pos_nb_unitig: vec![(0, 0)],
                 prev_tigs_size: 0,
                 prev_bucket_pos: 0,
@@ -855,6 +853,24 @@ impl StreamWriterState {
             spill_paths,
             spill_dir,
         ))
+    }
+
+    fn append_cid_for_dataset(&mut self, dataset_id_zero_based: usize, cid: usize) -> Result<()> {
+        let buf = &mut self.spill_cid_buffers[dataset_id_zero_based];
+        buf.extend_from_slice(&(cid as u64).to_le_bytes());
+        if buf.len() >= SPILL_CID_FLUSH_BYTES {
+            self.spill_writers[dataset_id_zero_based].write_all(buf)?;
+            buf.clear();
+        }
+        Ok(())
+    }
+
+    fn append_group_cids(&mut self, dataset_ids_zero_based: &[usize]) -> Result<()> {
+        for &id in dataset_ids_zero_based {
+            self.append_cid_for_dataset(id, self.cid)?;
+        }
+        self.cid += 1;
+        Ok(())
     }
 
     fn write_group(
@@ -904,10 +920,7 @@ impl StreamWriterState {
             .write_all(&(group_sizes_buffer.len() as u64).to_le_bytes())?;
         self.size_file.write_all(&group_sizes_buffer)?;
 
-        for &id in dataset_ids_zero_based {
-            self.spill_writers[id].write_all(&(self.cid as u64).to_le_bytes())?;
-        }
-        self.cid += 1;
+        self.append_group_cids(dataset_ids_zero_based)?;
 
         Ok(())
     }
@@ -933,10 +946,7 @@ impl StreamWriterState {
             BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(group_sizes_path)?);
         io::copy(&mut sizes_reader, &mut self.size_file)?;
 
-        for &id in dataset_ids_zero_based {
-            self.spill_writers[id].write_all(&(self.cid as u64).to_le_bytes())?;
-        }
-        self.cid += 1;
+        self.append_group_cids(dataset_ids_zero_based)?;
         Ok(())
     }
 
@@ -956,10 +966,7 @@ impl StreamWriterState {
             .write_all(&(group_sizes.len() as u64).to_le_bytes())?;
         self.size_file.write_all(group_sizes)?;
 
-        for &id in dataset_ids_zero_based {
-            self.spill_writers[id].write_all(&(self.cid as u64).to_le_bytes())?;
-        }
-        self.cid += 1;
+        self.append_group_cids(dataset_ids_zero_based)?;
         Ok(())
     }
 
@@ -967,6 +974,12 @@ impl StreamWriterState {
         if !self.encoded_seq_buffer.is_empty() {
             self.omni_file.write_all(&self.encoded_seq_buffer)?;
             self.encoded_seq_buffer.clear();
+        }
+        for (idx, buf) in self.spill_cid_buffers.iter_mut().enumerate() {
+            if !buf.is_empty() {
+                self.spill_writers[idx].write_all(buf)?;
+                buf.clear();
+            }
         }
         for writer in &mut self.spill_writers {
             writer.flush()?;
@@ -1288,16 +1301,22 @@ fn write_compressed_from_stream(
     let mut group_seqs: Vec<Vec<u8>> = Vec::new();
     let mut group_run_paths: Vec<PathBuf> = Vec::new();
     let mut pending_group_tasks: Vec<GroupTask> = Vec::with_capacity(GROUP_WORK_BATCH_GROUPS);
+    let mut pending_group_task_seq_bytes: usize = 0;
     let mut group_bytes: usize = 0;
+    let mut group_total_seq_bytes: usize = 0;
     let mut submitted_groups: usize = 0;
     let mut rr_index = 0usize;
     let dispatch_timer = PhaseTimer::start();
 
     for batch in record_rx {
         for record in batch {
-            let key_changed = current_color_ids
-                .as_ref()
-                .is_none_or(|ids| ids.as_ref() != record.color_ids.as_ref());
+            let key_changed = match current_color_ids.as_ref() {
+                None => true,
+                Some(ids) => {
+                    !(Arc::ptr_eq(ids, &record.color_ids)
+                        || ids.as_ref() == record.color_ids.as_ref())
+                }
+            };
 
             if key_changed {
                 if let Some(ids) = current_ids_zero_based.take() {
@@ -1308,12 +1327,17 @@ fn write_compressed_from_stream(
                             seqs: std::mem::take(&mut group_seqs),
                             run_paths: std::mem::take(&mut group_run_paths),
                         });
+                        pending_group_task_seq_bytes =
+                            pending_group_task_seq_bytes.saturating_add(group_total_seq_bytes);
                         submitted_groups += 1;
-                        if pending_group_tasks.len() >= GROUP_WORK_BATCH_GROUPS {
+                        if pending_group_tasks.len() >= GROUP_WORK_BATCH_GROUPS
+                            || pending_group_task_seq_bytes >= GROUP_WORK_BATCH_SEQ_BYTES
+                        {
                             let work = GroupWorkItem {
                                 tasks: std::mem::take(&mut pending_group_tasks),
                                 spill_dir: group_spill_dir.clone(),
                             };
+                            pending_group_task_seq_bytes = 0;
                             worker_inputs[rr_index % worker_inputs.len()]
                                 .send(Some(work))
                                 .map_err(|err| {
@@ -1337,9 +1361,11 @@ fn write_compressed_from_stream(
                 )?);
                 current_color_ids = Some(Arc::clone(&record.color_ids));
                 group_bytes = 0;
+                group_total_seq_bytes = 0;
             }
 
             group_bytes += record.seq.len();
+            group_total_seq_bytes += record.seq.len();
             group_seqs.push(record.seq);
             if group_bytes >= GROUP_SORT_SPILL_BYTES {
                 sort_and_spill_sequence_run(
@@ -1466,10 +1492,58 @@ fn create_id_cid_spill_dir(output_dir: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn build_id_cid_payload_from_spill(path: &Path, cid_file_path: &str) -> std::io::Result<Vec<u8>> {
+    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(path)?);
+    let mut payload = Vec::new();
+    {
+        let mut cid_encoder = Encoder::new(&mut payload, 1)?;
+        let mut first = true;
+        let mut prev_cid = 0usize;
+        loop {
+            let mut raw = [0u8; 8];
+            match std::io::Read::read_exact(&mut reader, &mut raw) {
+                Ok(()) => {
+                    let raw_cid = u64::from_le_bytes(raw);
+                    let cid = usize::try_from(raw_cid).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "color id {} cannot be represented as usize while writing {}",
+                                raw_cid, cid_file_path
+                            ),
+                        )
+                    })?;
+                    if cid < prev_cid {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "color ids are not sorted ({} before {}) while writing {}",
+                                prev_cid, cid, cid_file_path
+                            ),
+                        ));
+                    }
+                    let delta = cid - prev_cid;
+                    if !first {
+                        cid_encoder.write_all(b",")?;
+                    }
+                    first = false;
+                    write!(&mut cid_encoder, "{}", delta)?;
+                    prev_cid = cid;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+        cid_encoder.finish()?;
+    }
+    Ok(payload)
+}
+
 fn write_id_to_color_id_from_spills(
     cid_file_path: String,
     spill_paths: &[PathBuf],
     spill_dir: &Path,
+    worker_threads: usize,
 ) -> std::io::Result<Vec<usize>> {
     let total_timer = PhaseTimer::start();
     let mut cid_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&cid_file_path)?);
@@ -1477,61 +1551,53 @@ fn write_id_to_color_id_from_spills(
     let mut tot_size = 0usize;
     let mut per_dataset_timing = TimingAccumulator::default();
     let mut total_payload_bytes = 0usize;
+    let mut payloads: Vec<Option<Vec<u8>>> = vec![None; spill_paths.len()];
 
-    for path in spill_paths {
-        let dataset_timer = PhaseTimer::start();
-        let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(path)?);
-        let mut payload = Vec::new();
-        {
-            let mut cid_encoder = Encoder::new(&mut payload, 1)?;
-            let mut first = true;
-            let mut prev_cid = 0usize;
-            loop {
-                let mut raw = [0u8; 8];
-                match std::io::Read::read_exact(&mut reader, &mut raw) {
-                    Ok(()) => {
-                        let raw_cid = u64::from_le_bytes(raw);
-                        let cid = usize::try_from(raw_cid).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "color id {} cannot be represented as usize while writing {}",
-                                    raw_cid, cid_file_path
-                                ),
-                            )
-                        })?;
-                        if cid < prev_cid {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "color ids are not sorted ({} before {}) while writing {}",
-                                    prev_cid, cid, cid_file_path
-                                ),
-                            ));
-                        }
-                        let delta = cid - prev_cid;
-                        if !first {
-                            cid_encoder.write_all(b",")?;
-                        }
-                        first = false;
-                        write!(&mut cid_encoder, "{}", delta)?;
-                        prev_cid = cid;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            cid_encoder.finish()?;
+    if spill_paths.len() <= 1 || worker_threads <= 1 {
+        for (idx, path) in spill_paths.iter().enumerate() {
+            let dataset_timer = PhaseTimer::start();
+            let payload = build_id_cid_payload_from_spill(path, &cid_file_path)?;
+            let _ = fs::remove_file(path);
+            per_dataset_timing.add(dataset_timer.finish());
+            payloads[idx] = Some(payload);
         }
+    } else {
+        let max_threads = worker_threads.max(1).min(spill_paths.len());
+        let build_payloads = || -> io::Result<Vec<(usize, Vec<u8>, PhaseTiming)>> {
+            spill_paths
+                .par_iter()
+                .enumerate()
+                .map(|(idx, path)| -> io::Result<(usize, Vec<u8>, PhaseTiming)> {
+                    let dataset_timer = PhaseTimer::start();
+                    let payload = build_id_cid_payload_from_spill(path, &cid_file_path)?;
+                    let _ = fs::remove_file(path);
+                    Ok((idx, payload, dataset_timer.finish()))
+                })
+                .collect()
+        };
 
+        let results = match rayon::ThreadPoolBuilder::new()
+            .num_threads(max_threads)
+            .build()
+        {
+            Ok(pool) => pool.install(build_payloads),
+            Err(_) => build_payloads(),
+        }?;
+
+        for (idx, payload, timing) in results {
+            per_dataset_timing.add(timing);
+            payloads[idx] = Some(payload);
+        }
+    }
+
+    for payload in payloads {
+        let payload = payload
+            .ok_or_else(|| io::Error::other("missing id->cid payload after spill processing"))?;
         id_cid_line_sizes.push(tot_size);
         tot_size += 8 + payload.len();
         total_payload_bytes += payload.len();
         cid_file.write_all(&(payload.len() as u64).to_le_bytes())?;
         cid_file.write_all(&payload)?;
-
-        let _ = fs::remove_file(path);
-        per_dataset_timing.add(dataset_timer.finish());
     }
 
     cid_file.write_all(&(0_u64).to_le_bytes())?;
@@ -1601,6 +1667,7 @@ pub(crate) fn sort_by_bucket_streaming(
         output_dir.clone() + "id_to_color_id.txt.zst",
         &spill_paths,
         &spill_dir,
+        worker_threads,
     ) {
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
