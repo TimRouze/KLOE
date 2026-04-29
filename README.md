@@ -68,10 +68,10 @@ Default is current directory
 When running kloe in compression mode, add "decompress" before any other parameter.
 
 #### Omnicolored file --omnicolor-file
-The file containing omnicolored monochromatigs
+The file containing monochromatigs seen in ALL input files
 
 #### Multicolored file --multicolor-file
-The file containing multicolored monochromatigs
+The file containing monochromatigs seen in at least one input file but not ALL
 
 #### Input directory -i
 The directory where kloe should fetch the interfacing file.
