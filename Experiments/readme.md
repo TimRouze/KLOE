@@ -4,7 +4,7 @@
 
 For experiments, we used 2 datasets.
 - A collection of 256 human unitigs downloaded from [Logan](https://github.com/IndexThePlanet/Logan). [Human unitigs accession file](fof_logan_unitigs.txt)
-- A collection of 2048 Salmonella genomes downloaded from the NCBI. [Salmonellas accession file](fof_2048_salmo.txt)
+- A collection of 2048 Salmonella genomes downloaded from [Logan](https://github.com/IndexThePlanet/Logan). [Salmonellas accession file](fof_2048_salmo.txt)
 
 ## Command lines
 ### KLOE
