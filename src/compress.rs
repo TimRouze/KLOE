@@ -1,5 +1,6 @@
 use ggcat_api::{
-    ColorIndexType, ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData,
+    install_plain_fasta_output_callback, ColorIndexType, ExtraElaboration, GGCATConfig,
+    GGCATInstance, GeneralSequenceBlockData, PlainFastaOutputRecord,
 };
 use ggcat_colors::colors_manager::ColorMapReader;
 use ggcat_colors::storage::deserializer::ColorsDeserializer;
@@ -1796,6 +1797,207 @@ fn stream_sorted_records_from_chunks(
     Ok(())
 }
 
+struct FastaBlockReader {
+    receiver: mpsc::Receiver<Option<Vec<u8>>>,
+    current: io::Cursor<Vec<u8>>,
+}
+
+impl FastaBlockReader {
+    fn new(receiver: mpsc::Receiver<Option<Vec<u8>>>) -> Self {
+        Self {
+            receiver,
+            current: io::Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for FastaBlockReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let read = self.current.read(output)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            match self.receiver.recv() {
+                Ok(Some(block)) => self.current = io::Cursor::new(block),
+                Ok(None) | Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+fn read_structured_varint(data: &[u8], position: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *data.get(*position).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated GGCAT structured color payload",
+            )
+        })?;
+        *position += 1;
+        if shift >= 64 && byte & 0x7f != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overflow in GGCAT structured color payload",
+            ));
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
+fn parse_structured_color_segments(
+    record: PlainFastaOutputRecord,
+    k: usize,
+) -> Result<Vec<SortedColorRecord>> {
+    let PlainFastaOutputRecord {
+        sequence,
+        color_data,
+    } = record;
+    if sequence.len() < k {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "GGCAT structured sequence shorter than k (len={}, k={})",
+                sequence.len(),
+                k
+            ),
+        ));
+    }
+
+    let mut position = 0usize;
+    let runs_count = usize::try_from(read_structured_varint(&color_data, &mut position)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many GGCAT color runs"))?;
+    if runs_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGCAT emitted structured sequence without color runs",
+        ));
+    }
+
+    let mut total_run_kmers = 0usize;
+    let mut merged_runs: Vec<(ColorIndexType, usize)> = Vec::with_capacity(runs_count);
+    for _ in 0..runs_count {
+        let subset = ColorIndexType::try_from(read_structured_varint(
+            &color_data,
+            &mut position,
+        )?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "GGCAT subset id overflow"))?;
+        let count = usize::try_from(read_structured_varint(&color_data, &mut position)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "GGCAT run length overflow"))?;
+        total_run_kmers = total_run_kmers.checked_add(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overflow while summing GGCAT structured color-run lengths",
+            )
+        })?;
+        if let Some((last_subset, last_count)) = merged_runs.last_mut() {
+            if *last_subset == subset {
+                *last_count += count;
+                continue;
+            }
+        }
+        if count > 0 {
+            merged_runs.push((subset, count));
+        }
+    }
+    if position != color_data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in GGCAT structured color payload",
+        ));
+    }
+
+    let seq_kmers = sequence.len() - k + 1;
+    if total_run_kmers != seq_kmers {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "GGCAT structured color-run lengths mismatch: runs={}, expected={}",
+                total_run_kmers, seq_kmers
+            ),
+        ));
+    }
+
+    let mut segments = Vec::with_capacity(merged_runs.len());
+    let mut run_start = 0usize;
+    for (subset, count) in merged_runs {
+        let run_end = run_start + count;
+        segments.push(SortedColorRecord {
+            subset,
+            seq: sequence[run_start..(run_end + k - 1)].to_vec(),
+        });
+        run_start = run_end;
+    }
+    Ok(segments)
+}
+
+fn push_grouped_record(
+    groups_by_subset: &mut Vec<Vec<Vec<u8>>>,
+    unique_subsets: &mut HashSet<ColorIndexType>,
+    record: SortedColorRecord,
+) -> Result<()> {
+    let subset_index = usize::try_from(record.subset).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "GGCAT subset id overflow")
+    })?;
+    if subset_index >= groups_by_subset.len() {
+        groups_by_subset.resize_with(subset_index + 1, Vec::new);
+    }
+    unique_subsets.insert(record.subset);
+    groups_by_subset[subset_index].push(record.seq);
+    Ok(())
+}
+
+struct ParsedColorRecords {
+    groups_by_subset: Vec<Vec<Vec<u8>>>,
+    input_sequences_count: usize,
+    emitted_segments_count: usize,
+    unique_subsets: HashSet<ColorIndexType>,
+    parse_timing: PhaseTiming,
+}
+
+fn parse_streamed_color_records(
+    receiver: mpsc::Receiver<Option<Vec<PlainFastaOutputRecord>>>,
+    k: usize,
+) -> Result<ParsedColorRecords> {
+    let parse_timer = PhaseTimer::start();
+    let mut groups_by_subset = Vec::<Vec<Vec<u8>>>::new();
+    let mut input_sequences_count = 0usize;
+    let mut emitted_segments_count = 0usize;
+    let mut unique_subsets = HashSet::<ColorIndexType>::new();
+
+    while let Ok(message) = receiver.recv() {
+        let Some(batch) = message else {
+            break;
+        };
+        input_sequences_count += batch.len();
+        let parsed_batches = batch
+            .into_par_iter()
+            .map(|record| parse_structured_color_segments(record, k))
+            .collect::<Result<Vec<_>>>()?;
+
+        for segments in parsed_batches {
+            emitted_segments_count += segments.len();
+            for record in segments {
+                push_grouped_record(&mut groups_by_subset, &mut unique_subsets, record)?;
+            }
+        }
+    }
+
+    Ok(ParsedColorRecords {
+        groups_by_subset,
+        input_sequences_count,
+        emitted_segments_count,
+        unique_subsets,
+        parse_timing: parse_timer.finish(),
+    })
+}
+
 fn produce_ggcat_records(
     filenames: Vec<String>,
     threads: usize,
@@ -1856,31 +2058,61 @@ fn produce_ggcat_records(
         .map(|idx| idx.to_string())
         .collect::<Vec<_>>();
 
+    let total_threads = threads.max(1);
+    let parser_threads = if total_threads >= 4 {
+        (total_threads / 4).max(1)
+    } else {
+        1
+    };
+    let ggcat_threads = total_threads.saturating_sub(parser_threads).max(1);
     println!(
-        "Running embedded ggcat build-colored-fasta path (k={}, m={}, threads={}, memory={}GB)",
+        "Running embedded ggcat streaming path (k={}, m={}, ggcat_threads={}, parser_threads={}, memory={}GB)",
         k,
         m,
-        threads.max(1),
+        ggcat_threads,
+        parser_threads,
         ggcat_cfg.memory_gb.max(1)
     );
 
+    let (fasta_block_tx, fasta_block_rx) =
+        mpsc::sync_channel::<Option<Vec<PlainFastaOutputRecord>>>(16);
+    let fasta_block_end_tx = fasta_block_tx.clone();
+    let parser_handle = thread::spawn(move || {
+        let parser_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(parser_threads)
+            .build()
+            .map_err(|err| io::Error::other(format!("build GGCAT parser pool: {err}")))?;
+        parser_pool.install(|| parse_streamed_color_records(fasta_block_rx, k))
+    });
+    let callback_guard = install_plain_fasta_output_callback(
+        &raw_records_file,
+        Arc::new(move |block| {
+            let _ = fasta_block_tx.send(Some(block));
+        }),
+    )?;
+
     let ggcat_build_timer = PhaseTimer::start();
-    let records_output = instance
-        .build_graph(
-            input_streams,
-            raw_records_file,
-            Some(&color_names),
-            k,
-            threads.max(1),
-            false,
-            Some(m),
-            true,
-            1,
-            ggcat_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
-            None,
-        )
-        .map_err(|e| to_io_err("ggcat build_graph", e))?;
+    let build_result = instance.build_graph(
+        input_streams,
+        raw_records_file,
+        Some(&color_names),
+        k,
+        ggcat_threads,
+        false,
+        Some(m),
+        true,
+        1,
+        ggcat_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
+        None,
+    );
     log_phase_timing("ggcat.build_graph_api_call", ggcat_build_timer.finish());
+    let _ = fasta_block_end_tx.send(None);
+    drop(callback_guard);
+
+    let parsed_records = parser_handle
+        .join()
+        .map_err(|_| io::Error::other("streamed GGCAT parser panicked"))??;
+    let records_output = build_result.map_err(|e| to_io_err("ggcat build_graph", e))?;
 
     let colormap_file = GGCATInstance::get_colormap_file(&records_output);
     let colors_deserializer =
@@ -1936,98 +2168,13 @@ fn produce_ggcat_records(
     let keep_ggcat = std::env::var_os("KLOE_KEEP_GGCAT").is_some();
     let process_result = (|| -> Result<()> {
         let producer_total_timer = PhaseTimer::start();
-        let mut records = Vec::new();
-        let mut chunk_files = Vec::new();
-        let mut chunk_bytes = 0usize;
-        let mut chunk_flush_metrics = ChunkFlushMetrics::default();
-        let mut input_sequences_count = 0usize;
-        let mut emitted_segments_count = 0usize;
-        let mut unique_subsets = HashSet::<ColorIndexType>::new();
-
-        let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(&records_output)?);
-        let mut line = Vec::new();
-        let mut current_header: Option<Vec<u8>> = None;
-        let mut current_seq: Vec<u8> = Vec::new();
-        let mut entry_batch: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(PRODUCER_PARSE_BATCH_ENTRIES);
-        let mut entry_batch_bytes = 0usize;
-        let parse_timer = PhaseTimer::start();
-
-        let mut flush_entry_batch =
-            |entries: &mut Vec<(Vec<u8>, Vec<u8>)>, batch_bytes: &mut usize| -> Result<()> {
-                if entries.is_empty() {
-                    return Ok(());
-                }
-                let entries_local = std::mem::take(entries);
-                *batch_bytes = 0;
-
-                let parsed_batches = entries_local
-                    .into_par_iter()
-                    .map(|(header, seq)| parse_entry_color_segments(&header, &seq, k))
-                    .collect::<Result<Vec<_>>>()?;
-
-                input_sequences_count += parsed_batches.len();
-                for mut segments in parsed_batches {
-                    emitted_segments_count += segments.len();
-                    for record in segments.drain(..) {
-                        unique_subsets.insert(record.subset);
-                        chunk_bytes += std::mem::size_of::<ColorIndexType>() + record.seq.len();
-                        records.push(record);
-                        if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
-                            flush_sorted_chunk_timed(
-                                &mut records,
-                                &mut chunk_files,
-                                &chunk_dir,
-                                &mut chunk_flush_metrics,
-                            )?;
-                            chunk_bytes = 0;
-                        }
-                    }
-                }
-                Ok(())
-            };
-
-        loop {
-            line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
-                if let Some(header) = current_header.take() {
-                    entry_batch_bytes += header.len() + current_seq.len();
-                    entry_batch.push((header, std::mem::take(&mut current_seq)));
-                }
-                flush_entry_batch(&mut entry_batch, &mut entry_batch_bytes)?;
-                break;
-            }
-
-            while matches!(line.last(), Some(b'\n' | b'\r')) {
-                line.pop();
-            }
-            if line.is_empty() {
-                continue;
-            }
-            if line[0] == b'>' {
-                if let Some(header) = current_header.take() {
-                    entry_batch_bytes += header.len() + current_seq.len();
-                    entry_batch.push((header, std::mem::take(&mut current_seq)));
-                    if entry_batch.len() >= PRODUCER_PARSE_BATCH_ENTRIES
-                        || entry_batch_bytes >= PRODUCER_PARSE_BATCH_BYTES
-                    {
-                        flush_entry_batch(&mut entry_batch, &mut entry_batch_bytes)?;
-                    }
-                }
-                current_header = Some(line[1..].to_vec());
-            } else {
-                current_seq.extend_from_slice(&line);
-            }
-        }
-
-        flush_sorted_chunk_timed(
-            &mut records,
-            &mut chunk_files,
-            &chunk_dir,
-            &mut chunk_flush_metrics,
-        )?;
-        let parse_timing = parse_timer.finish();
+        let ParsedColorRecords {
+            groups_by_subset,
+            input_sequences_count,
+            emitted_segments_count,
+            unique_subsets,
+            parse_timing,
+        } = parsed_records;
 
         let resolve_subsets_timer = PhaseTimer::start();
         let subset_to_dataset_ids = resolve_subsets_to_dataset_ids(
@@ -2039,59 +2186,47 @@ fn produce_ggcat_records(
         )?;
         let resolve_subsets_timing = resolve_subsets_timer.finish();
 
-        let mut current_subset: Option<ColorIndexType> = None;
-        let mut current_color_ids: Option<Arc<Vec<u32>>> = None;
         let mut batch: SimplitigBatch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
-        let mut merged_records_count = 0usize;
+        let mut grouped_records_count = 0usize;
         let mut emitted_batches_count = 0usize;
         let mut emitted_records_count = 0usize;
-        let merge_emit_timer = PhaseTimer::start();
+        let grouped_emit_timer = PhaseTimer::start();
 
-        stream_sorted_records_from_chunks(&chunk_files, |record| {
-            merged_records_count += 1;
-            let color_ids = match current_subset {
-                Some(active_subset) if active_subset == record.subset => {
-                    Arc::clone(current_color_ids.as_ref().expect("color ids must be set"))
-                }
-                _ => {
-                    let ids = subset_to_dataset_ids
-                        .get(&record.subset)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "missing resolved dataset ids for subset {}",
-                                    record.subset
-                                ),
-                            )
-                        })?
-                        .clone();
-                    current_subset = Some(record.subset);
-                    current_color_ids = Some(Arc::clone(&ids));
-                    ids
+        for (subset_index, sequences) in groups_by_subset.into_iter().enumerate() {
+            if sequences.is_empty() {
+                continue;
+            }
+            let subset = ColorIndexType::try_from(subset_index).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "GGCAT subset id overflow")
+            })?;
+            let color_ids = subset_to_dataset_ids.get(&subset).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing resolved dataset ids for subset {}", subset),
+                )
+            })?;
+
+            for seq in sequences {
+                grouped_records_count += 1;
+                batch.push(SimplitigRecord {
+                    color_ids: Arc::clone(color_ids),
+                    seq,
+                });
+
+                if batch.len() >= COLOR_RECORD_BATCH_SIZE {
+                    let out = std::mem::take(&mut batch);
+                    emitted_batches_count += 1;
+                    emitted_records_count += out.len();
+                    sender.send(out).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("record receiver dropped: {e}"),
+                        )
+                    })?;
+                    batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
                 }
             };
-
-            batch.push(SimplitigRecord {
-                color_ids,
-                seq: record.seq,
-            });
-
-            if batch.len() >= COLOR_RECORD_BATCH_SIZE {
-                let out = std::mem::take(&mut batch);
-                emitted_batches_count += 1;
-                emitted_records_count += out.len();
-                sender.send(out).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("record receiver dropped: {e}"),
-                    )
-                })?;
-                batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
-            }
-
-            Ok(())
-        })?;
+        }
 
         if !batch.is_empty() {
             emitted_batches_count += 1;
@@ -2104,30 +2239,20 @@ fn produce_ggcat_records(
             })?;
         }
 
-        let merge_emit_timing = merge_emit_timer.finish();
-        log_phase_timing("producer.parse_headers_chunk_sort", parse_timing);
-        log_phase_timing(
-            "producer.chunk_flush_total",
-            PhaseTiming {
-                wall_sec: chunk_flush_metrics.timing.wall_sec,
-                cpu_sec: chunk_flush_metrics.timing.cpu_sec,
-            },
-        );
+        let grouped_emit_timing = grouped_emit_timer.finish();
+        log_phase_timing("producer.parse_structured_direct_group", parse_timing);
         log_phase_timing(
             "producer.resolve_subsets_dataset_ids",
             resolve_subsets_timing,
         );
-        log_phase_timing("producer.merge_chunks_emit_records", merge_emit_timing);
+        log_phase_timing("producer.emit_grouped_records", grouped_emit_timing);
         log_phase_timing("producer.total_post_ggcat", producer_total_timer.finish());
         println!(
-            "[phase-stats] phase=producer input_sequences={} emitted_segments={} subsets_unique={} chunks={} chunk_flush_calls={} chunk_flush_records={} merged_records={} emitted_batches={} emitted_records={}",
+            "[phase-stats] phase=producer input_sequences={} emitted_segments={} subsets_unique={} grouped_records={} emitted_batches={} emitted_records={}",
             input_sequences_count,
             emitted_segments_count,
             unique_subsets.len(),
-            chunk_files.len(),
-            chunk_flush_metrics.calls,
-            chunk_flush_metrics.records,
-            merged_records_count,
+            grouped_records_count,
             emitted_batches_count,
             emitted_records_count
         );

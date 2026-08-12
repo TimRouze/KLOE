@@ -11,6 +11,9 @@ pub use ggcat_logging::MessageLevel;
 use ggcat_logging::{UnrecoverableErrorLogging, info, warn};
 use io::concurrent::structured_sequences::StructuredSequenceBackendWrapper;
 use io::concurrent::structured_sequences::fasta::FastaWriterWrapper;
+pub use io::concurrent::structured_sequences::fasta::{
+    PlainFastaOutputCallbackGuard, PlainFastaOutputRecord, install_plain_fasta_output_callback,
+};
 use io::concurrent::structured_sequences::gfa::{GFAWriterWrapperV1, GFAWriterWrapperV2};
 use io::sequences_stream::GenericSequencesStream;
 use io::sequences_stream::fasta::FastaFileSequencesStream;

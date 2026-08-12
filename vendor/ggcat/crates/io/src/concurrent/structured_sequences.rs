@@ -137,7 +137,7 @@ pub trait StructuredSequenceBackend<ColorInfo: IdentSequenceWriter, LinksInfo: I
 {
     type SequenceTempBuffer;
 
-    fn alloc_temp_buffer(k: usize) -> Self::SequenceTempBuffer;
+    fn alloc_temp_buffer(&self, k: usize) -> Self::SequenceTempBuffer;
 
     fn write_sequence(
         k: usize,
@@ -243,6 +243,10 @@ impl<
         }
 
         start_sequence_index
+    }
+
+    pub fn alloc_temp_buffer(&self, k: usize) -> Backend::SequenceTempBuffer {
+        self.backend.lock().alloc_temp_buffer(k)
     }
 
     pub fn get_path(&self) -> PathBuf {

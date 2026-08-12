@@ -196,7 +196,7 @@ impl<ColorInfo: IdentSequenceWriter> StructuredSequenceBackend<ColorInfo, Double
 {
     type SequenceTempBuffer = StructuredUnitigsStorage<ColorInfo>;
 
-    fn alloc_temp_buffer(_: usize) -> Self::SequenceTempBuffer {
+    fn alloc_temp_buffer(&self, _: usize) -> Self::SequenceTempBuffer {
         StructuredUnitigsStorage::new()
     }
 
