@@ -174,7 +174,7 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
     let instance = GGCATInstance::create(GGCATConfig {
         temp_dir: Some(temp_dir.clone()),
         memory: ggcat_memory_gb as f64,
-        prefer_memory: true,
+        prefer_memory: false,
         total_threads_count: cfg.threads.max(1),
         intermediate_compression_level: None,
         stats_file: None,

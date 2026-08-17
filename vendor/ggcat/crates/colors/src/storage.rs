@@ -17,7 +17,7 @@ pub trait ColorsSerializerTrait: Sized + Sync + Send + 'static {
     type CheckpointBuffer: Default;
     type CompressedCheckpointBuffer: Default;
 
-    type CheckpointWriter<'a>;
+    type CheckpointWriter: Send + 'static;
 
     fn decode_color(reader: impl Read, out_vec: Option<&mut Vec<ColorIndexType>>);
     // fn decode_colors(reader: impl Read) -> ;
@@ -32,23 +32,23 @@ pub trait ColorsSerializerTrait: Sized + Sync + Send + 'static {
     fn preserialize_colors(pre_serializer: &mut Self::PreSerializer, colors: &[ColorIndexType]);
 
     // Write a new color subset to a temporary checkpoint buffer (single-threaded)
-    fn write_color_subset<'a>(
+    fn write_color_subset(
         tracker: &mut Self::CheckpointTracker,
-        buffer: &'a mut Self::CheckpointBuffer,
+        buffer: &mut Self::CheckpointBuffer,
         pre_serializer: &Self::PreSerializer,
-    ) -> Option<Self::CheckpointWriter<'a>>;
+    ) -> Option<Self::CheckpointWriter>;
 
     fn flush_checkpoint(
         &self,
-        checkpoint: Self::CheckpointWriter<'_>,
+        checkpoint: Self::CheckpointWriter,
         compressed_buffer: &mut Self::CompressedCheckpointBuffer,
+        wait_for_previous: crossbeam::channel::Receiver<()>,
+        release_next: crossbeam::channel::Sender<()>,
     );
-    fn final_flush_buffer(
-        &self,
+    fn take_final_checkpoint(
         tracker: &mut Self::CheckpointTracker,
         buffer: Self::CheckpointBuffer,
-        compressed_buffer: Self::CompressedCheckpointBuffer,
-    );
+    ) -> Option<Self::CheckpointWriter>;
 
     fn get_subsets_count(tracker: &mut Self::CheckpointTracker) -> u64;
     fn print_stats(tracker: &Self::CheckpointTracker);

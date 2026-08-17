@@ -8,7 +8,6 @@ use config::ColorIndexType;
 use config::DEFAULT_OUTPUT_BUFFER_SIZE;
 use desse::Desse;
 use io::varint::{decode_varint, encode_varint};
-use parking_lot::Condvar;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::io::Seek;
@@ -112,8 +111,7 @@ impl ColorIndexSerializer {
 }
 
 pub struct RunLengthColorsSerializer {
-    writer: Mutex<(u64, ColorsFlushProcessing)>,
-    condvar: Condvar,
+    writer: Mutex<ColorsFlushProcessing>,
     colors_count: u64,
 }
 
@@ -121,13 +119,11 @@ pub struct RunLengthCheckpointTracker {
     checkpoint_distance: u64,
     chunk_written_subsets: u64,
     total_flushed_subsets: u64,
-    total_checkpoints: u64,
 }
 
-pub struct RunLengthCheckpointWriter<'a> {
-    checkpoint_index: u64,
+pub struct RunLengthCheckpointWriter {
     checkpoint_subset_start: u64,
-    checkpoint_buffer: &'a mut ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>,
+    checkpoint_buffer: ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>,
 }
 
 impl ColorsSerializerTrait for RunLengthColorsSerializer {
@@ -137,7 +133,7 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
     type CheckpointTracker = RunLengthCheckpointTracker;
     type CheckpointBuffer = ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>;
     type CompressedCheckpointBuffer = ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>;
-    type CheckpointWriter<'a> = RunLengthCheckpointWriter<'a>;
+    type CheckpointWriter = RunLengthCheckpointWriter;
 
     fn decode_color(mut reader: impl Read, out_vec: Option<&mut Vec<u32>>) {
         match out_vec {
@@ -157,15 +153,13 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
     ) -> (Self, Self::CheckpointTracker) {
         (
             Self {
-                writer: Mutex::new((0, writer)),
-                condvar: Condvar::new(),
+                writer: Mutex::new(writer),
                 colors_count,
             },
             RunLengthCheckpointTracker {
                 checkpoint_distance: checkpoint_distance as u64,
                 chunk_written_subsets: 0,
                 total_flushed_subsets: 0,
-                total_checkpoints: 0,
             },
         )
     }
@@ -176,25 +170,21 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
     }
 
     #[inline(always)]
-    fn write_color_subset<'a>(
+    fn write_color_subset(
         tracker: &mut Self::CheckpointTracker,
-        buffer: &'a mut Self::CheckpointBuffer,
+        buffer: &mut Self::CheckpointBuffer,
         pre_serializer: &Self::PreSerializer,
-    ) -> Option<Self::CheckpointWriter<'a>> {
+    ) -> Option<Self::CheckpointWriter> {
         buffer.extend_from_slice(&pre_serializer);
         tracker.chunk_written_subsets += 1;
         if tracker.chunk_written_subsets == tracker.checkpoint_distance {
             let checkpoint_subset_start = tracker.total_flushed_subsets;
-            let checkpoint_index = tracker.total_checkpoints;
-
-            tracker.total_checkpoints += 1;
             tracker.total_flushed_subsets += tracker.chunk_written_subsets;
             tracker.chunk_written_subsets = 0;
 
             Some(RunLengthCheckpointWriter {
-                checkpoint_index,
                 checkpoint_subset_start,
-                checkpoint_buffer: buffer,
+                checkpoint_buffer: std::mem::take(buffer),
             })
         } else {
             None
@@ -203,17 +193,16 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
 
     fn flush_checkpoint(
         &self,
-        checkpoint: Self::CheckpointWriter<'_>,
+        mut checkpoint: Self::CheckpointWriter,
         compressed_buffer: &mut Self::CheckpointBuffer,
+        wait_for_previous: crossbeam::channel::Receiver<()>,
+        release_next: crossbeam::channel::Sender<()>,
     ) {
         ColorsFlushProcessing::compress_chunk(&checkpoint.checkpoint_buffer, compressed_buffer);
 
+        wait_for_previous.recv().unwrap();
         let mut writer = self.writer.lock();
-        while writer.0 != checkpoint.checkpoint_index {
-            self.condvar.wait(&mut writer);
-        }
-
-        writer.1.write_compressed_chunk(
+        writer.write_compressed_chunk(
             checkpoint.checkpoint_subset_start as ColorIndexType,
             checkpoint.checkpoint_buffer.len(),
             &compressed_buffer,
@@ -221,27 +210,21 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
         checkpoint.checkpoint_buffer.clear();
         compressed_buffer.clear();
 
-        writer.0 += 1;
-        self.condvar.notify_all();
+        drop(writer);
+        let _ = release_next.send(());
     }
 
-    fn final_flush_buffer(
-        &self,
+    fn take_final_checkpoint(
         tracker: &mut Self::CheckpointTracker,
-        mut buffer: Self::CheckpointBuffer,
-        mut compressed_buffer: Self::CheckpointBuffer,
-    ) {
+        buffer: Self::CheckpointBuffer,
+    ) -> Option<Self::CheckpointWriter> {
         if buffer.len() == 0 {
-            return;
+            return None;
         }
-        self.flush_checkpoint(
-            RunLengthCheckpointWriter {
-                checkpoint_index: tracker.total_checkpoints,
-                checkpoint_subset_start: tracker.total_flushed_subsets,
-                checkpoint_buffer: &mut buffer,
-            },
-            &mut compressed_buffer,
-        );
+        Some(RunLengthCheckpointWriter {
+            checkpoint_subset_start: tracker.total_flushed_subsets,
+            checkpoint_buffer: buffer,
+        })
     }
 
     fn get_subsets_count(tracker: &mut Self::CheckpointTracker) -> u64 {
@@ -255,7 +238,7 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
     }
 
     fn finalize(self, tracker: Self::CheckpointTracker) {
-        let mut colormap_writer = self.writer.into_inner().1;
+        let mut colormap_writer = self.writer.into_inner();
 
         let colors_file = &mut colormap_writer.colormap_file;
         let index_map = &mut colormap_writer.colormap_index;

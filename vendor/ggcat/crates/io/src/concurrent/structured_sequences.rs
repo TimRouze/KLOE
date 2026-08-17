@@ -17,6 +17,7 @@ use {
 };
 
 pub mod binary;
+pub mod channel;
 pub mod concurrent;
 pub mod fasta;
 pub mod gfa;

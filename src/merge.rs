@@ -1,16 +1,15 @@
-use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
-use std::thread;
+use std::sync::Arc;
 
+use ggcat_api::{
+    ColorIndexType, DnaSequence, DnaSequencesFileType, DynamicSequencesStream,
+    GeneralSequenceBlockData, SequenceInfo,
+};
 use zstd::Decoder;
 
 use crate::compress;
-use crate::decompress;
-use crate::records;
-use crate::utils::vec2str;
 
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
@@ -24,10 +23,27 @@ const REQUIRED_ARCHIVE_FILES: [&str; 5] = [
     "tigs_kloe.fa",
 ];
 
-const INDEX_BYTES_PER_KMER_ESTIMATE: usize = 24;
-const INDEX_BUDGET_FRACTION_NUMERATOR: usize = 7;
-const INDEX_BUDGET_FRACTION_DENOMINATOR: usize = 10;
-const PRODUCER_BATCH_SIZE: usize = 2048;
+const DECODE_BASES: [[u8; 4]; 256] = {
+    let mut table = [[b'A'; 4]; 256];
+    let mut byte = 0usize;
+    while byte < table.len() {
+        let mut base = 0usize;
+        while base < 4 {
+            table[byte][base] = [b'A', b'C', b'G', b'T'][(byte >> (2 * base)) & 0b11];
+            base += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
+fn decode_packed_sequence(encoded: &[u8], size: usize, sequence: &mut Vec<u8>) {
+    sequence.resize(size, b'A');
+    for (&packed, output) in encoded.iter().zip(sequence.chunks_mut(4)) {
+        let output_len = output.len();
+        output.copy_from_slice(&DECODE_BASES[packed as usize][..output_len]);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MergeConfig {
@@ -59,25 +75,217 @@ impl Default for MergeConfig {
 }
 
 #[derive(Debug)]
-struct MergeStats {
-    passes: usize,
-    emitted_records: u64,
-    matched_kmers: usize,
+struct ArchiveInfo {
+    filenames: Vec<String>,
+    positions: Arc<ArchivePositions>,
+    cid_to_ids: CidDatasetIds,
+    tigs_path: PathBuf,
+    sizes_path: PathBuf,
+    compact_sizes: Option<Arc<CompactSizesIndex>>,
 }
 
 #[derive(Debug)]
-struct ArchiveInfo {
-    filenames: Vec<String>,
-    positions: Vec<(u64, u64)>,
-    cid_to_ids: Vec<Vec<u32>>,
-    tigs_path: PathBuf,
-    sizes_path: PathBuf,
-    compact_sizes: Option<Arc<Vec<Vec<usize>>>>,
-    estimated_kmers_per_cid: Vec<usize>,
+struct ArchivePositions {
+    tigs: Vec<u64>,
+    legacy_sizes: Option<Vec<u64>>,
 }
 
+impl ArchivePositions {
+    fn len(&self) -> usize {
+        self.tigs.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tigs.is_empty()
+    }
+
+    fn tigs(&self, cid: usize) -> Option<u64> {
+        self.tigs.get(cid).copied()
+    }
+
+    fn sizes(&self, cid: usize) -> Option<u64> {
+        match &self.legacy_sizes {
+            Some(sizes) => sizes.get(cid).copied(),
+            None => u64::try_from(cid).ok(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CidDatasetIds {
+    offsets: Vec<usize>,
+    values: Arc<Vec<u32>>,
+}
+
+impl CidDatasetIds {
+    fn span(&self, cid: usize) -> Option<(usize, usize)> {
+        Some((*self.offsets.get(cid)?, *self.offsets.get(cid + 1)?))
+    }
+
+    fn active_cids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.offsets
+            .windows(2)
+            .enumerate()
+            .filter_map(|(cid, range)| (range[0] != range[1]).then_some(cid))
+    }
+}
+
+#[derive(Debug)]
+struct CompactSizesBlock {
+    first_group: usize,
+    group_count: usize,
+    offsets: Vec<u32>,
+    data_offset: u64,
+    data_len: usize,
+}
+
+#[derive(Debug)]
+struct CompactSizesIndex {
+    path: PathBuf,
+    blocks: Vec<CompactSizesBlock>,
+}
+
+#[derive(Clone)]
+struct ArchiveSequencesStream {
+    positions: Arc<ArchivePositions>,
+    tigs_path: PathBuf,
+    sizes_path: PathBuf,
+    compact_sizes: Option<Arc<CompactSizesIndex>>,
+    blocks: Vec<ArchiveSequenceBlock>,
+}
+
+#[derive(Clone)]
+struct ArchiveSequenceBlock {
+    cids: Vec<(usize, ColorIndexType)>,
+    estimated_bases: u64,
+}
+
+impl ArchiveSequencesStream {
+    fn read_block_inner(
+        &self,
+        block: usize,
+        callback: &mut dyn FnMut(DnaSequence, SequenceInfo),
+    ) -> io::Result<()> {
+        let block_data = self.blocks.get(block).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("archive input block {} is outside the configured block range", block),
+            )
+        })?;
+        let mut tigs_reader = BufReader::with_capacity(1024 * 1024, File::open(&self.tigs_path)?);
+        let mut legacy_sizes_reader = if self.compact_sizes.is_none() {
+            Some(BufReader::with_capacity(
+                1024 * 1024,
+                File::open(&self.sizes_path)?,
+            ))
+        } else {
+            None
+        };
+        let mut compact_sizes_reader = if self.compact_sizes.is_some() {
+            Some(File::open(&self.sizes_path)?)
+        } else {
+            None
+        };
+        let mut cached_block_index = usize::MAX;
+        let mut cached_block_data = Vec::new();
+        let mut encoded = Vec::new();
+        let mut sequence = Vec::new();
+        let mut sizes = Vec::new();
+        let mut current_tigs_pos = None;
+
+        for &(cid, color) in &block_data.cids {
+            if cid >= self.positions.len().saturating_sub(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("archive CID {} is outside the sequence range", cid),
+                ));
+            }
+            let tigs_pos = self.positions.tigs(cid).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "archive CID has no tig position")
+            })?;
+            let sizes_pos = self.positions.sizes(cid).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "archive CID has no size position")
+            })?;
+            if let Some(compact) = self.compact_sizes.as_deref() {
+                let group = usize::try_from(sizes_pos).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "size group cannot fit usize")
+                })?;
+                let block_index = compact.block_index_for_group(group)?;
+                if cached_block_index != block_index {
+                    cached_block_data = compact.load_block_from(
+                        block_index,
+                        compact_sizes_reader
+                            .as_mut()
+                            .expect("compact sizes reader must be initialized"),
+                    )?;
+                    cached_block_index = block_index;
+                }
+                compact.decode_group_into(block_index, group, &cached_block_data, &mut sizes)?;
+            } else {
+                read_bucket_sizes_at_into(
+                    legacy_sizes_reader
+                        .as_mut()
+                        .expect("legacy sizes reader must be initialized"),
+                    sizes_pos,
+                    &mut sizes,
+                )?;
+            }
+
+            if current_tigs_pos != Some(tigs_pos) {
+                tigs_reader.seek(std::io::SeekFrom::Start(tigs_pos))?;
+                current_tigs_pos = Some(tigs_pos);
+            }
+            for &size in &sizes {
+                if size == 0 {
+                    continue;
+                }
+                encoded.resize(size.div_ceil(4), 0);
+                tigs_reader.read_exact(&mut encoded)?;
+                current_tigs_pos = Some(
+                    current_tigs_pos
+                        .unwrap_or(tigs_pos)
+                        .saturating_add(encoded.len() as u64),
+                );
+                decode_packed_sequence(&encoded, size, &mut sequence);
+                callback(
+                    DnaSequence {
+                        ident_data: &[],
+                        seq: &sequence,
+                        format: DnaSequencesFileType::FASTA,
+                    },
+                    SequenceInfo { color: Some(color) },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn estimated_block_bases(&self, block: usize) -> io::Result<u64> {
+        let block = self.blocks.get(block).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid archive input block")
+        })?;
+        Ok(block.estimated_bases.max(1))
+    }
+}
+
+impl DynamicSequencesStream for ArchiveSequencesStream {
+    fn read_block(
+        &self,
+        block: usize,
+        _copy_ident_data: bool,
+        _partial_read_copyback: Option<usize>,
+        callback: &mut dyn FnMut(DnaSequence, SequenceInfo),
+    ) {
+        self.read_block_inner(block, callback)
+            .unwrap_or_else(|err| panic!("cannot stream archive block {block} into ggcat: {err}"));
+    }
+
+    fn estimated_base_count(&self, block: usize) -> u64 {
+        self.estimated_block_bases(block).unwrap_or(1).max(1)
+    }
+}
 impl ArchiveInfo {
-    fn load(root: &Path, k: usize) -> io::Result<Self> {
+    fn load(root: &Path, _k: usize) -> io::Result<Self> {
         ensure_archive_complete(root)?;
 
         let positions_path = root.join("positions_kloe.bin");
@@ -86,7 +294,12 @@ impl ArchiveInfo {
         let tigs_path = root.join("tigs_kloe.fa");
         let filenames_path = root.join("filenames_id.txt");
 
-        let positions = load_positions(&positions_path)?;
+        let compact_sizes = if is_compact_bucket_sizes_file(&sizes_path)? {
+            Some(Arc::new(load_compact_bucket_sizes_index(&sizes_path)?))
+        } else {
+            None
+        };
+        let positions = Arc::new(load_positions(&positions_path, compact_sizes.is_some())?);
         if positions.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -98,53 +311,10 @@ impl ArchiveInfo {
         }
 
         let filenames = load_filenames(&filenames_path)?;
-        let dataset_to_cids = load_dataset_to_cids(&cid_path)?;
-        if dataset_to_cids.len() != filenames.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "filenames count ({}) differs from id_to_color_id count ({}) in '{}'",
-                    filenames.len(),
-                    dataset_to_cids.len(),
-                    root.to_string_lossy()
-                ),
-            ));
-        }
-
-        let mut cid_to_ids = vec![Vec::<u32>::new(); positions.len()];
-        for (dataset_idx, cids) in dataset_to_cids.iter().enumerate() {
-            let dataset_id = (dataset_idx + 1) as u32;
-            for &cid in cids {
-                if cid >= cid_to_ids.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "cid index {} outside [0, {}) in '{}'",
-                            cid,
-                            cid_to_ids.len(),
-                            cid_path.to_string_lossy()
-                        ),
-                    ));
-                }
-                cid_to_ids[cid].push(dataset_id);
-            }
-        }
-        for ids in &mut cid_to_ids {
-            ids.sort_unstable();
-            ids.dedup();
-        }
-
-        let compact_sizes = if is_compact_bucket_sizes_file(&sizes_path)? {
-            Some(Arc::new(load_compact_bucket_sizes(&sizes_path)?))
-        } else {
-            None
-        };
-
-        let estimated_kmers_per_cid = estimate_kmers_per_cid(
-            &positions,
-            &sizes_path,
-            compact_sizes.as_ref().map(|v| v.as_slice()),
-            k,
+        let cid_to_ids = load_cid_to_ids(
+            &cid_path,
+            filenames.len(),
+            positions.len().saturating_sub(1),
         )?;
 
         Ok(Self {
@@ -154,77 +324,57 @@ impl ArchiveInfo {
             tigs_path,
             sizes_path,
             compact_sizes,
-            estimated_kmers_per_cid,
         })
     }
 
-    fn active_cids(&self) -> Vec<usize> {
-        self.cid_to_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(cid, ids)| if ids.is_empty() { None } else { Some(cid) })
-            .collect()
+    fn sequence_stream(
+        &self,
+        colored_cids: Vec<(usize, ColorIndexType)>,
+        target_blocks: usize,
+    ) -> ArchiveSequencesStream {
+        let total_bytes = colored_cids.iter().fold(0u64, |total, &(cid, _)| {
+            let start = self.positions.tigs(cid).unwrap_or(0);
+            let end = self.positions.tigs(cid + 1).unwrap_or(start);
+            total.saturating_add(end.saturating_sub(start))
+        });
+        let target_bytes = total_bytes
+            .div_ceil(target_blocks.max(1) as u64)
+            .max(1);
+        let mut blocks = Vec::with_capacity(target_blocks.min(colored_cids.len()).max(1));
+        let mut current_cids = Vec::new();
+        let mut current_bytes = 0u64;
+        for colored_cid in colored_cids {
+            let start = self.positions.tigs(colored_cid.0).unwrap_or(0);
+            let end = self.positions.tigs(colored_cid.0 + 1).unwrap_or(start);
+            let cid_bytes = end.saturating_sub(start);
+            if !current_cids.is_empty()
+                && current_bytes >= target_bytes
+                && blocks.len() + 1 < target_blocks.max(1)
+            {
+                blocks.push(ArchiveSequenceBlock {
+                    cids: std::mem::take(&mut current_cids),
+                    estimated_bases: current_bytes.saturating_mul(4).max(1),
+                });
+                current_bytes = 0;
+            }
+            current_cids.push(colored_cid);
+            current_bytes = current_bytes.saturating_add(cid_bytes);
+        }
+        if !current_cids.is_empty() {
+            blocks.push(ArchiveSequenceBlock {
+                cids: current_cids,
+                estimated_bases: current_bytes.saturating_mul(4).max(1),
+            });
+        }
+        ArchiveSequencesStream {
+            positions: Arc::clone(&self.positions),
+            tigs_path: self.tigs_path.clone(),
+            sizes_path: self.sizes_path.clone(),
+            compact_sizes: self.compact_sizes.clone(),
+            blocks,
+        }
     }
 
-    fn for_each_kmer_in_cids<F>(&self, cids: &[usize], k: usize, mut f: F) -> io::Result<()>
-    where
-        F: FnMut(usize, u64),
-    {
-        if cids.is_empty() {
-            return Ok(());
-        }
-
-        let mut sorted_cids = cids.to_vec();
-        sorted_cids.sort_unstable();
-
-        let mut tigs_reader = BufReader::new(File::open(&self.tigs_path)?);
-        let mut sizes_reader = if self.compact_sizes.is_none() {
-            Some(BufReader::new(File::open(&self.sizes_path)?))
-        } else {
-            None
-        };
-
-        let cid_limit = self.positions.len().saturating_sub(1);
-        for cid in sorted_cids {
-            if cid >= cid_limit {
-                continue;
-            }
-
-            let (tigs_pos, sizes_pos) = self.positions[cid];
-            let sizes = if let Some(compact) = self.compact_sizes.as_deref() {
-                read_compact_bucket_sizes_at(compact, sizes_pos)?
-            } else {
-                read_bucket_sizes_at(
-                    sizes_reader
-                        .as_mut()
-                        .expect("legacy sizes reader must be initialized"),
-                    sizes_pos,
-                )?
-            };
-            if sizes.is_empty() {
-                continue;
-            }
-
-            tigs_reader.seek(std::io::SeekFrom::Start(tigs_pos))?;
-            for size in sizes {
-                if size == 0 {
-                    continue;
-                }
-
-                let read_size = size.div_ceil(4);
-                let mut encoded = vec![0u8; read_size];
-                tigs_reader.read_exact(&mut encoded)?;
-
-                if size < k {
-                    continue;
-                }
-
-                let seq = vec2str(&encoded, &size);
-                for_each_canonical_kmer(seq.as_bytes(), k, |kmer| f(cid, kmer));
-            }
-        }
-        Ok(())
-    }
 }
 
 pub fn merge_archives(
@@ -288,99 +438,103 @@ pub fn merge_archives_with_config(
     merged_filenames.extend(archive_a.filenames.iter().cloned());
     merged_filenames.extend(archive_b.filenames.iter().cloned());
 
-    let offset = archive_a.filenames.len() as u32;
-    let mut shifted_b_cid_to_ids = Vec::with_capacity(archive_b.cid_to_ids.len());
-    for ids in &archive_b.cid_to_ids {
-        let mut shifted = Vec::with_capacity(ids.len());
-        for &id in ids {
-            shifted.push(id.saturating_add(offset));
-        }
-        shifted_b_cid_to_ids.push(shifted);
-    }
-
-    let a_cids = archive_a.active_cids();
-    let b_cids = archive_b.active_cids();
-    let index_budget_bytes = index_budget_bytes(memory_gb);
-    let batches = plan_a_batches(
-        &a_cids,
-        &archive_a.estimated_kmers_per_cid,
-        index_budget_bytes,
-    );
-
-    println!(
-        "Starting merge with {} A color sets, {} B color sets, {} pass(es), index budget ~{} MB/pass",
-        a_cids.len(),
-        b_cids.len(),
-        batches.len(),
-        index_budget_bytes / (1024 * 1024)
-    );
-
-    let merge_tmp_root = create_merge_temp_root(output_root, &cfg.temp_dir)?;
-    let stage_archive_dir = merge_tmp_root.join("stage_archive");
-    let stage_dumps_dir = merge_tmp_root.join("stage_dumps");
-    fs::create_dir_all(&stage_archive_dir)?;
-    fs::create_dir_all(&stage_dumps_dir)?;
-
-    let stage_output_dir = normalize_output_dir(&stage_archive_dir);
-    let total_datasets = merged_filenames.len();
-    let (tx, rx) = mpsc::sync_channel::<records::SimplitigBatch>(16);
-
-    let producer = thread::spawn(move || {
-        produce_merged_records(
-            archive_a,
-            archive_b,
-            shifted_b_cid_to_ids,
-            batches,
-            b_cids,
-            k,
-            tx,
+    let offset = u32::try_from(archive_a.filenames.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive A has more than u32::MAX datasets",
         )
-    });
+    })?;
+    u32::try_from(merged_filenames.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merged archive has more than u32::MAX datasets",
+        )
+    })?;
 
-    let id_cid_offsets = compress::sort_by_bucket_streaming(
-        &stage_output_dir,
-        total_datasets as u32,
-        cfg.threads,
-        rx,
-    );
+    let source_count = archive_a.cid_to_ids.active_cids().count()
+        + archive_b.cid_to_ids.active_cids().count();
+    let mut source_dataset_ids = compress::SourceDatasetMap::new();
+    let a_storage = source_dataset_ids.add_storage(Arc::clone(&archive_a.cid_to_ids.values));
+    let b_storage = source_dataset_ids.add_storage(Arc::clone(&archive_b.cid_to_ids.values));
+    let mut a_colored_cids = Vec::with_capacity(archive_a.cid_to_ids.active_cids().count());
+    let mut b_colored_cids = Vec::with_capacity(archive_b.cid_to_ids.active_cids().count());
 
-    let stats = match producer.join() {
-        Ok(res) => res?,
-        Err(_) => {
-            return Err(io::Error::other(
-                "merge producer thread panicked while generating records",
-            ))
-        }
-    };
+    for cid in archive_a.cid_to_ids.active_cids() {
+        let color = ColorIndexType::try_from(source_dataset_ids.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "too many merge source colors")
+        })?;
+        a_colored_cids.push((cid, color));
+        let (start, end) = archive_a
+            .cid_to_ids
+            .span(cid)
+            .expect("active archive CID must have a dataset span");
+        source_dataset_ids.push_span(a_storage, start, end, 0)?;
+    }
+    for cid in archive_b.cid_to_ids.active_cids() {
+        let color = ColorIndexType::try_from(source_dataset_ids.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "too many merge source colors")
+        })?;
+        b_colored_cids.push((cid, color));
+        let (start, end) = archive_b
+            .cid_to_ids
+            .span(cid)
+            .expect("active archive CID must have a dataset span");
+        source_dataset_ids.push_span(b_storage, start, end, offset)?;
+    }
+    debug_assert_eq!(source_dataset_ids.len(), source_count);
 
-    let stage_names = (0..total_datasets)
-        .map(stage_dataset_name)
-        .collect::<Vec<_>>();
-    compress::write_filenames_id_offsets(&stage_output_dir, &stage_names, &id_cid_offsets)?;
+    let blocks_per_archive = cfg.threads.max(1).div_ceil(2);
+    let a_stream = Arc::new(archive_a.sequence_stream(a_colored_cids, blocks_per_archive));
+    let b_stream = Arc::new(archive_b.sequence_stream(b_colored_cids, blocks_per_archive));
+    let a_block_count = a_stream.blocks.len();
+    let b_block_count = b_stream.blocks.len();
+    let a_stream: Arc<dyn DynamicSequencesStream> = a_stream;
+    let b_stream: Arc<dyn DynamicSequencesStream> = b_stream;
+    drop(archive_a);
+    drop(archive_b);
+    let mut input_streams = Vec::with_capacity(a_block_count + b_block_count);
+    for block in 0..a_block_count {
+        input_streams.push(GeneralSequenceBlockData::Dynamic((
+            Arc::clone(&a_stream),
+            block,
+        )));
+    }
+    for block in 0..b_block_count {
+        input_streams.push(GeneralSequenceBlockData::Dynamic((
+            Arc::clone(&b_stream),
+            block,
+        )));
+    }
 
     println!(
-        "Merge k-mer stage complete: passes={}, emitted_records={}, matched_kmers={}",
-        stats.passes, stats.emitted_records, stats.matched_kmers
+        "Starting direct merge with {} archive color sets in {} input blocks and {} output datasets; packed SPSS input is streamed directly into ggcat",
+        source_dataset_ids.len(),
+        input_streams.len(),
+        merged_filenames.len()
     );
-
-    recompact_stage_archive(
-        &stage_archive_dir,
-        &stage_dumps_dir,
-        &merge_tmp_root,
-        &output_dir_norm,
-        &merged_filenames,
-        k,
-        memory_gb,
-        &cfg,
-    )?;
-
-    if let Err(err) = fs::remove_dir_all(&merge_tmp_root) {
-        eprintln!(
-            "Warning: could not remove merge temp directory '{}': {}",
-            merge_tmp_root.to_string_lossy(),
-            err
-        );
+    if cfg.verify_kmers {
+        eprintln!("Warning: --verify-kmers is ignored by the embedded ggcat merge backend.");
     }
+    if cfg.skip_sort {
+        eprintln!("Warning: --skip-sort is ignored; merged GGCAT records are grouped by colors.");
+    }
+
+    compress::compress_ggcat_sources(
+        &output_dir_norm,
+        merged_filenames,
+        input_streams,
+        source_dataset_ids,
+        cfg.threads.max(1),
+        k,
+        cfg.minimizer_size,
+        cfg.use_unitigs,
+        cfg.use_matchtigs,
+        cfg.use_eulertigs,
+        compress::GgcatCompressionConfig {
+            memory_gb,
+            temp_dir: cfg.temp_dir.clone(),
+        },
+    )?;
 
     println!(
         "Merge complete: output archive written to {} ({})",
@@ -388,315 +542,6 @@ pub fn merge_archives_with_config(
         merge_mode_name(&cfg)
     );
     Ok(())
-}
-
-fn produce_merged_records(
-    archive_a: ArchiveInfo,
-    archive_b: ArchiveInfo,
-    shifted_b_cid_to_ids: Vec<Vec<u32>>,
-    a_batches: Vec<Vec<usize>>,
-    b_cids: Vec<usize>,
-    k: usize,
-    sender: mpsc::SyncSender<records::SimplitigBatch>,
-) -> io::Result<MergeStats> {
-    let mut matched_b_kmers: HashSet<u64> = HashSet::new();
-    let mut emitted_records = 0u64;
-
-    for (pass_idx, batch) in a_batches.iter().enumerate() {
-        println!(
-            "Merge pass {}/{}: indexing {} A color set(s), then scanning all B color sets",
-            pass_idx + 1,
-            a_batches.len(),
-            batch.len()
-        );
-
-        let mut indexed_kmers: HashMap<u64, Vec<u32>> = HashMap::new();
-        archive_a.for_each_kmer_in_cids(batch, k, |cid, kmer| {
-            let a_ids = &archive_a.cid_to_ids[cid];
-            match indexed_kmers.entry(kmer) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(a_ids.clone());
-                }
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    merge_color_ids(slot.get_mut(), a_ids);
-                }
-            }
-        })?;
-
-        archive_b.for_each_kmer_in_cids(&b_cids, k, |b_cid, kmer| {
-            if let Some(merged_ids) = indexed_kmers.get_mut(&kmer) {
-                merge_color_ids(merged_ids, &shifted_b_cid_to_ids[b_cid]);
-                matched_b_kmers.insert(kmer);
-            }
-        })?;
-
-        emitted_records += emit_indexed_pass_records(indexed_kmers, k, &sender)?;
-    }
-
-    println!(
-        "Final B-only scan for non-overlapping k-mers across {} color set(s)",
-        b_cids.len()
-    );
-    emitted_records += emit_b_only_records(
-        &archive_b,
-        &b_cids,
-        &shifted_b_cid_to_ids,
-        &matched_b_kmers,
-        k,
-        &sender,
-    )?;
-
-    drop(sender);
-    Ok(MergeStats {
-        passes: a_batches.len(),
-        emitted_records,
-        matched_kmers: matched_b_kmers.len(),
-    })
-}
-
-fn recompact_stage_archive(
-    stage_archive_dir: &Path,
-    stage_dumps_dir: &Path,
-    merge_tmp_root: &Path,
-    output_dir_norm: &str,
-    merged_filenames: &[String],
-    k: usize,
-    memory_gb: usize,
-    cfg: &MergeConfig,
-) -> io::Result<()> {
-    let stage_archive_dir_norm = normalize_output_dir(stage_archive_dir);
-    let stage_dumps_dir_norm = normalize_output_dir(stage_dumps_dir);
-
-    println!(
-        "Recompacting merged k-mer stage into {}",
-        merge_mode_name(cfg)
-    );
-    decompress::decompress(
-        &String::from("bucket_sizes.txt"),
-        &String::from("id_to_color_id.txt.zst"),
-        &String::from("tigs_kloe.fa"),
-        &String::from("positions_kloe.bin"),
-        &String::from("filenames_id.txt"),
-        &stage_dumps_dir_norm,
-        &String::from(""),
-        stage_archive_dir_norm,
-    )?;
-
-    let fof_path = merge_tmp_root.join("merge_stage.fof");
-    let mut fof_writer = BufWriter::new(File::create(&fof_path)?);
-    for idx in 0..merged_filenames.len() {
-        let dump_path = stage_dump_path(stage_dumps_dir, idx);
-        if !dump_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "expected stage dump '{}' not found",
-                    dump_path.to_string_lossy()
-                ),
-            ));
-        }
-        writeln!(fof_writer, "{}", dump_path.to_string_lossy())?;
-    }
-    fof_writer.flush()?;
-
-    let ggcat_cfg = compress::GgcatCompressionConfig {
-        memory_gb,
-        temp_dir: cfg.temp_dir.clone(),
-    };
-    compress::compress_with_ggcat(
-        &output_dir_norm.to_string(),
-        &fof_path.to_string_lossy().to_string(),
-        cfg.threads.max(1),
-        k,
-        cfg.minimizer_size,
-        cfg.partition_power,
-        cfg.verify_kmers,
-        cfg.skip_sort,
-        cfg.use_unitigs,
-        cfg.use_matchtigs,
-        cfg.use_eulertigs,
-        ggcat_cfg,
-    )?;
-
-    let final_offsets =
-        load_offsets_from_filenames_id(&Path::new(output_dir_norm).join("filenames_id.txt"))?;
-    compress::write_filenames_id_offsets(output_dir_norm, merged_filenames, &final_offsets)?;
-
-    Ok(())
-}
-
-fn emit_indexed_pass_records(
-    indexed_kmers: HashMap<u64, Vec<u32>>,
-    k: usize,
-    sender: &mpsc::SyncSender<records::SimplitigBatch>,
-) -> io::Result<u64> {
-    let mut records = indexed_kmers
-        .into_iter()
-        .map(|(kmer, ids)| (ids, kmer))
-        .collect::<Vec<_>>();
-    records.sort_unstable_by(|(ids_a, kmer_a), (ids_b, kmer_b)| {
-        ids_a.cmp(ids_b).then_with(|| kmer_a.cmp(kmer_b))
-    });
-
-    let mut emitted = 0u64;
-    let mut batch = Vec::with_capacity(PRODUCER_BATCH_SIZE);
-    let mut current_color: Option<Arc<Vec<u32>>> = None;
-
-    for (ids, kmer) in records {
-        let color = match current_color.as_ref() {
-            Some(active) if active.as_ref() == &ids => Arc::clone(active),
-            _ => {
-                let arc = Arc::new(ids);
-                current_color = Some(Arc::clone(&arc));
-                arc
-            }
-        };
-        batch.push(records::SimplitigRecord {
-            color_ids: color,
-            seq: decode_kmer_bits(kmer, k),
-        });
-        emitted += 1;
-
-        if batch.len() >= PRODUCER_BATCH_SIZE {
-            let out = std::mem::take(&mut batch);
-            sender.send(out).map_err(channel_send_error)?;
-            batch = Vec::with_capacity(PRODUCER_BATCH_SIZE);
-        }
-    }
-    if !batch.is_empty() {
-        sender.send(batch).map_err(channel_send_error)?;
-    }
-    Ok(emitted)
-}
-
-fn emit_b_only_records(
-    archive_b: &ArchiveInfo,
-    b_cids: &[usize],
-    shifted_b_cid_to_ids: &[Vec<u32>],
-    matched_b_kmers: &HashSet<u64>,
-    k: usize,
-    sender: &mpsc::SyncSender<records::SimplitigBatch>,
-) -> io::Result<u64> {
-    let mut emitted = 0u64;
-    let mut batch = Vec::with_capacity(PRODUCER_BATCH_SIZE);
-    let mut current_cid: Option<usize> = None;
-    let mut current_color: Option<Arc<Vec<u32>>> = None;
-    let mut send_error: Option<io::Error> = None;
-
-    archive_b.for_each_kmer_in_cids(b_cids, k, |b_cid, kmer| {
-        if send_error.is_some() || matched_b_kmers.contains(&kmer) {
-            return;
-        }
-
-        let color = if current_cid == Some(b_cid) {
-            Arc::clone(current_color.as_ref().expect("color must be initialized"))
-        } else {
-            let arc = Arc::new(shifted_b_cid_to_ids[b_cid].clone());
-            current_cid = Some(b_cid);
-            current_color = Some(Arc::clone(&arc));
-            arc
-        };
-
-        batch.push(records::SimplitigRecord {
-            color_ids: color,
-            seq: decode_kmer_bits(kmer, k),
-        });
-        emitted += 1;
-
-        if batch.len() >= PRODUCER_BATCH_SIZE {
-            let out = std::mem::take(&mut batch);
-            if let Err(err) = sender.send(out) {
-                send_error = Some(channel_send_error(err));
-                return;
-            }
-            batch = Vec::with_capacity(PRODUCER_BATCH_SIZE);
-        }
-    })?;
-
-    if let Some(err) = send_error {
-        return Err(err);
-    }
-    if !batch.is_empty() {
-        sender.send(batch).map_err(channel_send_error)?;
-    }
-    Ok(emitted)
-}
-
-fn plan_a_batches(
-    a_cids: &[usize],
-    estimated_kmers_per_cid: &[usize],
-    budget_bytes: usize,
-) -> Vec<Vec<usize>> {
-    if a_cids.is_empty() {
-        return vec![Vec::new()];
-    }
-
-    let budget = budget_bytes.max(16 * 1024 * 1024);
-    let mut batches = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes = 0usize;
-
-    for &cid in a_cids {
-        let est_kmers = estimated_kmers_per_cid
-            .get(cid)
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        let est_bytes = est_kmers.saturating_mul(INDEX_BYTES_PER_KMER_ESTIMATE);
-
-        if !current.is_empty() && current_bytes.saturating_add(est_bytes) > budget {
-            batches.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-
-        current.push(cid);
-        current_bytes = current_bytes.saturating_add(est_bytes);
-    }
-
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    if batches.is_empty() {
-        batches.push(Vec::new());
-    }
-    batches
-}
-
-fn merge_color_ids(target: &mut Vec<u32>, other: &[u32]) {
-    if other.is_empty() {
-        return;
-    }
-    if target.is_empty() {
-        target.extend_from_slice(other);
-        return;
-    }
-
-    let mut merged = Vec::with_capacity(target.len() + other.len());
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < target.len() && j < other.len() {
-        let a = target[i];
-        let b = other[j];
-        if a == b {
-            merged.push(a);
-            i += 1;
-            j += 1;
-        } else if a < b {
-            merged.push(a);
-            i += 1;
-        } else {
-            merged.push(b);
-            j += 1;
-        }
-    }
-    if i < target.len() {
-        merged.extend_from_slice(&target[i..]);
-    }
-    if j < other.len() {
-        merged.extend_from_slice(&other[j..]);
-    }
-    merged.dedup();
-    *target = merged;
 }
 
 fn read_varint_u64_from_reader(reader: &mut impl Read) -> io::Result<Option<u64>> {
@@ -760,9 +605,13 @@ fn decode_varint_delta_cids(payload: &[u8], context: &str) -> io::Result<Vec<usi
     Ok(out)
 }
 
-fn decode_varint_deltas_to_sizes(payload: &[u8], context: &str) -> io::Result<Vec<usize>> {
+fn decode_varint_deltas_to_sizes_into(
+    payload: &[u8],
+    context: &str,
+    sizes: &mut Vec<usize>,
+) -> io::Result<()> {
     let mut cursor = std::io::Cursor::new(payload);
-    let mut sizes = Vec::new();
+    sizes.clear();
     let mut prev = 0usize;
     loop {
         let Some(delta_u64) = read_varint_u64_from_reader(&mut cursor)? else {
@@ -786,7 +635,7 @@ fn decode_varint_deltas_to_sizes(payload: &[u8], context: &str) -> io::Result<Ve
         sizes.push(size);
         prev = size;
     }
-    Ok(sizes)
+    Ok(())
 }
 
 fn is_compact_bucket_sizes_file(path: &Path) -> io::Result<bool> {
@@ -799,21 +648,88 @@ fn is_compact_bucket_sizes_file(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn load_compact_bucket_sizes(path: &Path) -> io::Result<Vec<Vec<usize>>> {
+impl CompactSizesIndex {
+    fn block_index_for_group(&self, group: usize) -> io::Result<usize> {
+        let index = self
+            .blocks
+            .partition_point(|block| block.first_group + block.group_count <= group);
+        match self.blocks.get(index) {
+            Some(block) if group >= block.first_group => Ok(index),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("compact size group {} is not indexed", group),
+            )),
+        }
+    }
+
+    fn load_block_from(&self, block_index: usize, file: &mut File) -> io::Result<Vec<u8>> {
+        let block = self.blocks.get(block_index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact size block is not indexed")
+        })?;
+        file.seek(std::io::SeekFrom::Start(block.data_offset))?;
+        let mut compressed = vec![0u8; block.data_len];
+        file.read_exact(&mut compressed)?;
+        let mut decompressed = Vec::new();
+        Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
+        let expected_min = block.offsets.last().copied().unwrap_or(0) as usize;
+        if decompressed.len() < expected_min {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated compact size block in '{}'", self.path.display()),
+            ));
+        }
+        Ok(decompressed)
+    }
+
+    fn decode_group_into(
+        &self,
+        block_index: usize,
+        group: usize,
+        decompressed: &[u8],
+        sizes: &mut Vec<usize>,
+    ) -> io::Result<()> {
+        let block = self.blocks.get(block_index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact size block is not indexed")
+        })?;
+        let local = group.checked_sub(block.first_group).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact size group precedes block")
+        })?;
+        if local >= block.group_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compact size group exceeds block",
+            ));
+        }
+        let start = block.offsets[local] as usize;
+        let end = block.offsets[local + 1] as usize;
+        if end < start || end > decompressed.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid compact size offsets in '{}'", self.path.display()),
+            ));
+        }
+        decode_varint_deltas_to_sizes_into(
+            &decompressed[start..end],
+            &format!("{}#group{}", self.path.display(), group),
+            sizes,
+        )
+    }
+
+}
+
+fn load_compact_bucket_sizes_index(path: &Path) -> io::Result<CompactSizesIndex> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if &magic != BUCKET_SIZES_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "expected compact bucket sizes magic in '{}'",
-                path.to_string_lossy()
-            ),
+            format!("expected compact bucket sizes magic in '{}'", path.display()),
         ));
     }
 
-    let mut all = Vec::<Vec<usize>>::new();
+    let mut blocks = Vec::new();
+    let mut first_group = 0usize;
     loop {
         let mut groups_buf = [0u8; 4];
         match reader.read_exact(&mut groups_buf) {
@@ -821,65 +737,53 @@ fn load_compact_bucket_sizes(path: &Path) -> io::Result<Vec<Vec<usize>>> {
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(err) => return Err(err),
         }
-        let groups = u32::from_le_bytes(groups_buf) as usize;
-        if groups == 0 {
+        let group_count = u32::from_le_bytes(groups_buf) as usize;
+        if group_count == 0 {
             break;
         }
 
         let mut compressed_len_buf = [0u8; 8];
         reader.read_exact(&mut compressed_len_buf)?;
-        let compressed_len = u64::from_le_bytes(compressed_len_buf) as usize;
-
-        let mut offsets = vec![0u32; groups + 1];
-        for off in &mut offsets {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
-            *off = u32::from_le_bytes(buf);
+        let data_len = usize::try_from(u64::from_le_bytes(compressed_len_buf)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact size block is too large")
+        })?;
+        let mut offsets = vec![0u32; group_count + 1];
+        for offset in &mut offsets {
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes)?;
+            *offset = u32::from_le_bytes(bytes);
         }
-
-        let mut compressed = vec![0u8; compressed_len];
-        reader.read_exact(&mut compressed)?;
-        let mut decompressed = Vec::new();
-        Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
-
-        for group_idx in 0..groups {
-            let start = offsets[group_idx] as usize;
-            let end = offsets[group_idx + 1] as usize;
-            if end < start || end > decompressed.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid compact bucket offsets in '{}'",
-                        path.to_string_lossy()
-                    ),
-                ));
-            }
-            let context = format!("{}#group{}", path.to_string_lossy(), all.len());
-            all.push(decode_varint_deltas_to_sizes(
-                &decompressed[start..end],
-                &context,
-            )?);
-        }
+        let data_offset = reader.stream_position()?;
+        let next_offset = data_offset.checked_add(data_len as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact size file offset overflow")
+        })?;
+        reader.seek(std::io::SeekFrom::Start(next_offset))?;
+        blocks.push(CompactSizesBlock {
+            first_group,
+            group_count,
+            offsets,
+            data_offset,
+            data_len,
+        });
+        first_group = first_group.saturating_add(group_count);
     }
-    Ok(all)
-}
 
-fn read_compact_bucket_sizes_at(all: &[Vec<usize>], group_index: u64) -> io::Result<Vec<usize>> {
-    let idx = usize::try_from(group_index).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("group index {} cannot fit usize", group_index),
-        )
-    })?;
-    Ok(all.get(idx).cloned().unwrap_or_default())
+    Ok(CompactSizesIndex {
+        path: path.to_path_buf(),
+        blocks,
+    })
 }
-
-fn load_positions(path: &Path) -> io::Result<Vec<(u64, u64)>> {
+fn load_positions(path: &Path, compact_sizes: bool) -> io::Result<ArchivePositions> {
     let mut file = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
     match file.read_exact(&mut magic) {
         Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            return Ok(ArchivePositions {
+                tigs: Vec::new(),
+                legacy_sizes: (!compact_sizes).then(Vec::new),
+            })
+        }
         Err(err) => return Err(err),
     }
 
@@ -903,7 +807,8 @@ fn load_positions(path: &Path) -> io::Result<Vec<(u64, u64)>> {
                 ),
             )
         })?;
-        let mut positions = Vec::with_capacity(count);
+        let mut tigs = Vec::with_capacity(count);
+        let mut legacy_sizes = (!compact_sizes).then(|| Vec::with_capacity(count));
         let mut tigs_pos = 0u64;
         let mut sizes_pos = 0u64;
         for _ in 0..count {
@@ -919,9 +824,12 @@ fn load_positions(path: &Path) -> io::Result<Vec<(u64, u64)>> {
             sizes_pos = sizes_pos.checked_add(ds).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "sizes position overflow")
             })?;
-            positions.push((tigs_pos, sizes_pos));
+            tigs.push(tigs_pos);
+            if let Some(positions) = &mut legacy_sizes {
+                positions.push(sizes_pos);
+            }
         }
-        return Ok(positions);
+        return Ok(ArchivePositions { tigs, legacy_sizes });
     }
 
     file.seek(std::io::SeekFrom::Start(0))?;
@@ -937,15 +845,19 @@ fn load_positions(path: &Path) -> io::Result<Vec<(u64, u64)>> {
         ));
     }
     let num_entries = file_size / 16;
-    let mut positions = Vec::with_capacity(num_entries);
+    let mut tigs = Vec::with_capacity(num_entries);
+    let mut legacy_sizes = (!compact_sizes).then(|| Vec::with_capacity(num_entries));
     let mut buf = [0u8; 16];
     for _ in 0..num_entries {
         file.read_exact(&mut buf)?;
         let tigs_pos = u64::from_le_bytes(buf[..8].try_into().unwrap());
         let sizes_pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        positions.push((tigs_pos, sizes_pos));
+        tigs.push(tigs_pos);
+        if let Some(positions) = &mut legacy_sizes {
+            positions.push(sizes_pos);
+        }
     }
-    Ok(positions)
+    Ok(ArchivePositions { tigs, legacy_sizes })
 }
 
 fn load_filenames(path: &Path) -> io::Result<Vec<String>> {
@@ -971,9 +883,13 @@ fn load_filenames(path: &Path) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
+fn for_each_dataset_cids(
+    path: &Path,
+    expected_dataset_count: usize,
+    mut visit: impl FnMut(usize, &[usize]) -> io::Result<()>,
+) -> io::Result<()> {
     let mut reader = BufReader::new(File::open(path)?);
-    let mut all = Vec::new();
+    let mut dataset_idx = 0usize;
     let mut magic = [0u8; 4];
     let binary_varints = match reader.read_exact(&mut magic) {
         Ok(()) if &magic == ID_TO_CID_MAGIC => true,
@@ -981,7 +897,7 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
             reader.seek(std::io::SeekFrom::Start(0))?;
             false
         }
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => false,
         Err(err) => return Err(err),
     };
 
@@ -992,28 +908,35 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(err) => return Err(err),
         }
-        let payload_len = u64::from_le_bytes(len_buf) as usize;
+        let payload_len = usize::try_from(u64::from_le_bytes(len_buf)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "dataset CID payload is too large")
+        })?;
         if payload_len == 0 {
             break;
+        }
+        if dataset_idx >= expected_dataset_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "id_to_color_id contains more than {} datasets in '{}'",
+                    expected_dataset_count,
+                    path.to_string_lossy()
+                ),
+            ));
         }
 
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload)?;
-
         let mut decompressed = Vec::new();
         Decoder::new(&payload[..])?.read_to_end(&mut decompressed)?;
-        let context = format!("{}#{}", path.to_string_lossy(), all.len());
+        let context = format!("{}#{}", path.to_string_lossy(), dataset_idx);
         let mut cids = if binary_varints {
             decode_varint_delta_cids(&decompressed, &context)?
         } else {
             let text = String::from_utf8(decompressed).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid UTF-8 while decoding '{}': {}",
-                        path.to_string_lossy(),
-                        err
-                    ),
+                    format!("invalid UTF-8 while decoding '{}': {}", context, err),
                 )
             })?;
             let mut out = Vec::new();
@@ -1026,114 +949,133 @@ fn load_dataset_to_cids(path: &Path) -> io::Result<Vec<Vec<usize>>> {
                 let delta = token.parse::<usize>().map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid cid delta '{}' in '{}': {}",
-                            token,
-                            path.to_string_lossy(),
-                            err
-                        ),
+                        format!("invalid cid delta '{}' in '{}': {}", token, context, err),
                     )
                 })?;
                 current_cid = current_cid.checked_add(delta).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "cid delta overflow while decoding '{}'",
-                            path.to_string_lossy()
-                        ),
+                        format!("cid delta overflow while decoding '{}'", context),
                     )
                 })?;
                 out.push(current_cid);
             }
             out
         };
-        cids.sort_unstable();
         cids.dedup();
-        all.push(cids);
+        visit(dataset_idx, &cids)?;
+        dataset_idx += 1;
     }
 
-    Ok(all)
+    if dataset_idx != expected_dataset_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "filenames count ({}) differs from id_to_color_id count ({}) in '{}'",
+                expected_dataset_count,
+                dataset_idx,
+                path.to_string_lossy()
+            ),
+        ));
+    }
+    Ok(())
 }
 
-fn load_offsets_from_filenames_id(path: &Path) -> io::Result<Vec<usize>> {
-    let reader = BufReader::new(File::open(path)?);
-    let mut offsets = Vec::new();
-    for line_result in reader.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() {
-            continue;
+fn load_cid_to_ids(
+    path: &Path,
+    expected_dataset_count: usize,
+    cid_count: usize,
+) -> io::Result<CidDatasetIds> {
+    let mut counts = vec![0usize; cid_count];
+    for_each_dataset_cids(path, expected_dataset_count, |_, cids| {
+        for &cid in cids {
+            let count = counts.get_mut(cid).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "cid index {} outside [0, {}) in '{}'",
+                        cid,
+                        cid_count,
+                        path.to_string_lossy()
+                    ),
+                )
+            })?;
+            *count = count.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID membership count overflow")
+            })?;
         }
-        let Some((_, offset_str)) = line.rsplit_once(':') else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid filenames_id row '{}'", line),
-            ));
-        };
-        let offset = offset_str.trim().parse::<usize>().map_err(|err| {
+        Ok(())
+    })?;
+
+    let mut offsets = Vec::with_capacity(cid_count + 1);
+    offsets.push(0usize);
+    for &count in &counts {
+        let next = offsets.last().copied().unwrap().checked_add(count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "CID membership storage overflow")
+        })?;
+        offsets.push(next);
+    }
+    let mut values = vec![0u32; offsets.last().copied().unwrap_or(0)];
+    counts.fill(0);
+    for_each_dataset_cids(path, expected_dataset_count, |dataset_idx, cids| {
+        let dataset_id = u32::try_from(dataset_idx + 1).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid filenames_id offset '{}' ({})", offset_str, err),
+                "merge supports at most u32::MAX datasets",
             )
         })?;
-        offsets.push(offset);
-    }
-    Ok(offsets)
-}
-
-fn estimate_kmers_per_cid(
-    positions: &[(u64, u64)],
-    sizes_path: &Path,
-    compact_sizes: Option<&[Vec<usize>]>,
-    k: usize,
-) -> io::Result<Vec<usize>> {
-    let cid_limit = positions.len().saturating_sub(1);
-    let mut estimates = vec![0usize; positions.len()];
-    let mut sizes_reader = if compact_sizes.is_none() {
-        Some(BufReader::new(File::open(sizes_path)?))
-    } else {
-        None
-    };
-
-    for cid in 0..cid_limit {
-        let (_, sizes_pos) = positions[cid];
-        let sizes = if let Some(all) = compact_sizes {
-            read_compact_bucket_sizes_at(all, sizes_pos)?
-        } else {
-            read_bucket_sizes_at(
-                sizes_reader
-                    .as_mut()
-                    .expect("legacy sizes reader must be initialized"),
-                sizes_pos,
-            )?
-        };
-        let mut kmers = 0usize;
-        for size in sizes {
-            if size >= k {
-                kmers = kmers.saturating_add(size - k + 1);
-            }
+        for &cid in cids {
+            let written = counts.get_mut(cid).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID disappeared between passes")
+            })?;
+            let index = offsets[cid].checked_add(*written).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID membership offset overflow")
+            })?;
+            let slot = values.get_mut(index).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID membership count changed")
+            })?;
+            *slot = dataset_id;
+            *written += 1;
         }
-        estimates[cid] = kmers;
+        Ok(())
+    })?;
+    if counts
+        .iter()
+        .zip(offsets.windows(2))
+        .any(|(&written, span)| written != span[1] - span[0])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CID membership counts changed while loading the archive",
+        ));
     }
-    Ok(estimates)
+
+    Ok(CidDatasetIds {
+        offsets,
+        values: Arc::new(values),
+    })
 }
 
-fn read_bucket_sizes_at<R: Read + Seek>(reader: &mut R, offset: u64) -> io::Result<Vec<usize>> {
+fn read_bucket_sizes_at_into<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    sizes: &mut Vec<usize>,
+) -> io::Result<()> {
     reader.seek(std::io::SeekFrom::Start(offset))?;
-
+    sizes.clear();
     let mut len_buf = [0u8; 8];
     match reader.read_exact(&mut len_buf) {
         Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(err) => return Err(err),
     }
     let payload_len = u64::from_le_bytes(len_buf) as usize;
     if payload_len == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload)?;
-
     let mut decompressed = Vec::new();
     Decoder::new(&payload[..])?.read_to_end(&mut decompressed)?;
     if decompressed.len() % 8 != 0 {
@@ -1146,78 +1088,15 @@ fn read_bucket_sizes_at<R: Read + Seek>(reader: &mut R, offset: u64) -> io::Resu
         ));
     }
 
-    let mut prev = 0usize;
-    let mut sizes = Vec::with_capacity(decompressed.len() / 8);
+    let mut previous = 0usize;
+    sizes.reserve(decompressed.len() / 8);
     for chunk in decompressed.chunks_exact(8) {
         let delta = u64::from_le_bytes(chunk.try_into().unwrap()) as usize;
-        let size = prev.saturating_add(delta);
+        let size = previous.saturating_add(delta);
         sizes.push(size);
-        prev = size;
+        previous = size;
     }
-    Ok(sizes)
-}
-
-fn for_each_canonical_kmer<F>(seq: &[u8], k: usize, mut f: F)
-where
-    F: FnMut(u64),
-{
-    if seq.len() < k {
-        return;
-    }
-
-    let mask = if k == 32 {
-        u64::MAX
-    } else {
-        (1u64 << (2 * k)) - 1
-    };
-    let rev_shift = 2 * (k - 1);
-
-    let mut fw = 0u64;
-    let mut rc = 0u64;
-    let mut valid = 0usize;
-
-    for &b in seq {
-        let Some(bits) = base_to_bits(b) else {
-            fw = 0;
-            rc = 0;
-            valid = 0;
-            continue;
-        };
-
-        fw = ((fw << 2) | bits) & mask;
-        let comp = 3u64 - bits;
-        rc = (rc >> 2) | (comp << rev_shift);
-        valid += 1;
-
-        if valid >= k {
-            f(fw.min(rc));
-        }
-    }
-}
-
-fn base_to_bits(base: u8) -> Option<u64> {
-    match base {
-        b'A' => Some(0),
-        b'C' => Some(1),
-        b'G' => Some(2),
-        b'T' => Some(3),
-        _ => None,
-    }
-}
-
-fn decode_kmer_bits(kmer: u64, k: usize) -> Vec<u8> {
-    let mut seq = vec![b'A'; k];
-    for (i, slot) in seq.iter_mut().enumerate() {
-        let shift = 2 * (k - 1 - i);
-        let base = ((kmer >> shift) & 0b11) as u8;
-        *slot = match base {
-            0 => b'A',
-            1 => b'C',
-            2 => b'G',
-            _ => b'T',
-        };
-    }
-    seq
+    Ok(())
 }
 
 fn ensure_archive_complete(root: &Path) -> io::Result<()> {
@@ -1239,48 +1118,6 @@ fn normalize_output_dir(root: &Path) -> String {
         s.push('/');
     }
     s
-}
-
-fn index_budget_bytes(memory_gb: usize) -> usize {
-    let total = memory_gb.saturating_mul(1024 * 1024 * 1024);
-    total
-        .saturating_mul(INDEX_BUDGET_FRACTION_NUMERATOR)
-        .checked_div(INDEX_BUDGET_FRACTION_DENOMINATOR)
-        .unwrap_or(total)
-}
-
-fn channel_send_error<T>(_: mpsc::SendError<T>) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::BrokenPipe,
-        "merge writer receiver closed while sending records",
-    )
-}
-
-fn create_merge_temp_root(output_root: &Path, configured_temp_dir: &str) -> io::Result<PathBuf> {
-    let base = if configured_temp_dir.is_empty() {
-        output_root.to_path_buf()
-    } else {
-        PathBuf::from(configured_temp_dir)
-    };
-    fs::create_dir_all(&base)?;
-
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let root = base.join(format!(".kloe-merge-{pid}-{nanos}"));
-    fs::create_dir_all(&root)?;
-    Ok(root)
-}
-
-fn stage_dataset_name(idx: usize) -> String {
-    format!("__kloe_merge_ds_{idx:08}.fa")
-}
-
-fn stage_dump_path(stage_dumps_dir: &Path, idx: usize) -> PathBuf {
-    let stem = format!("__kloe_merge_ds_{idx:08}");
-    stage_dumps_dir.join(format!("Dump_{stem}.fa"))
 }
 
 fn merge_mode_name(cfg: &MergeConfig) -> &'static str {

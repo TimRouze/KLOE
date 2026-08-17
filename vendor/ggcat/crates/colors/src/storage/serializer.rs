@@ -16,6 +16,12 @@ use std::thread::JoinHandle;
 
 pub const COLORMAP_STORAGE_VERSION: u64 = 1;
 
+struct OrderedCheckpoint<C> {
+    checkpoint: C,
+    wait_for_previous: crossbeam::channel::Receiver<()>,
+    release_next: crossbeam::channel::Sender<()>,
+}
+
 #[derive(Debug, Desse, DesseSized, Default)]
 pub(crate) struct ColorsFileHeader {
     pub magic: [u8; 16],
@@ -40,13 +46,14 @@ pub(crate) struct ColorsIndexMap {
 }
 
 pub struct ColorsSerializer<SI: ColorsSerializerTrait> {
+    // This lock intentionally covers both ID assignment and channel enqueue: concurrent
+    // producers must enqueue subsets in exactly the same order as their assigned IDs.
     colors_subset_count: Mutex<ColorIndexType>,
     buffers_pool: ObjectsPool<SI::PreSerializer>,
     colors_sender: Sender<PoolObject<SI::PreSerializer>>,
 
-    checkpoint_tracker: Arc<Mutex<SI::CheckpointTracker>>,
     serializer: Arc<SI>,
-
+    checkpoint_thread: JoinHandle<SI::CheckpointTracker>,
     writing_threads: Vec<JoinHandle<()>>,
     print_stats: bool,
     _phantom: PhantomData<SI>,
@@ -119,55 +126,88 @@ impl<SI: ColorsSerializerTrait> ColorsSerializer<SI> {
             colors_count,
         );
 
-        let checkpoint_tracker = Arc::new(Mutex::new(checkpoint_tracker));
         let serializer = Arc::new(serializer);
 
-        let mut writing_threads = Vec::with_capacity(threads_count);
-        for thread in 0..threads_count {
-            let checkpoint_tracker = checkpoint_tracker.clone();
+        // Subsets must enter checkpoints in color-ID order. A single inexpensive
+        // checkpoint builder provides that ordering, while completed checkpoints are
+        // compressed concurrently by the writer pool below.
+        let (checkpoint_sender, checkpoint_receiver) =
+            crossbeam::channel::bounded::<OrderedCheckpoint<SI::CheckpointWriter>>(
+                (threads_count.max(1) * 2).max(2),
+            );
+
+        let mut writing_threads = Vec::with_capacity(threads_count.max(1));
+        for thread in 0..threads_count.max(1) {
             let serializer = serializer.clone();
-            let receiver = receiver.clone();
+            let checkpoint_receiver = checkpoint_receiver.clone();
 
             writing_threads.push(
                 std::thread::Builder::new()
                     .name(format!("cmap-write-{}", thread))
                     .spawn(move || {
-                        let mut checkpoint_tracker_guard = checkpoint_tracker.lock();
-                        let mut checkpoint_buffer = SI::CheckpointBuffer::default();
                         let mut compressed_checkpoint_buffer =
                             SI::CompressedCheckpointBuffer::default();
-
-                        while let Ok(colors) = receiver.recv() {
-                            if let Some(flush_checkpoint) = SI::write_color_subset(
-                                &mut checkpoint_tracker_guard,
-                                &mut checkpoint_buffer,
-                                &colors,
-                            ) {
-                                drop(checkpoint_tracker_guard);
-                                serializer.flush_checkpoint(
-                                    flush_checkpoint,
-                                    &mut compressed_checkpoint_buffer,
-                                );
-                                checkpoint_tracker_guard = checkpoint_tracker.lock();
-                            }
+                        while let Ok(checkpoint) = checkpoint_receiver.recv() {
+                            serializer.flush_checkpoint(
+                                checkpoint.checkpoint,
+                                &mut compressed_checkpoint_buffer,
+                                checkpoint.wait_for_previous,
+                                checkpoint.release_next,
+                            );
                         }
-
-                        serializer.final_flush_buffer(
-                            &mut checkpoint_tracker_guard,
-                            checkpoint_buffer,
-                            compressed_checkpoint_buffer,
-                        );
                     })
                     .unwrap(),
             );
         }
 
+        let checkpoint_thread = std::thread::Builder::new()
+            .name("cmap-checkpoints".to_string())
+            .spawn(move || {
+                let mut checkpoint_tracker = checkpoint_tracker;
+                let mut checkpoint_buffer = SI::CheckpointBuffer::default();
+                let (first_release, first_wait) = crossbeam::channel::bounded(1);
+                first_release.send(()).unwrap();
+                let mut wait_for_previous = Some(first_wait);
+                while let Ok(colors) = receiver.recv() {
+                    if let Some(checkpoint) = SI::write_color_subset(
+                        &mut checkpoint_tracker,
+                        &mut checkpoint_buffer,
+                        &colors,
+                    ) {
+                        let (release_next, next_wait) = crossbeam::channel::bounded(1);
+                        checkpoint_sender
+                            .send(OrderedCheckpoint {
+                                checkpoint,
+                                wait_for_previous: wait_for_previous.take().unwrap(),
+                                release_next,
+                            })
+                            .unwrap();
+                        wait_for_previous = Some(next_wait);
+                    }
+                }
+                if let Some(checkpoint) =
+                    SI::take_final_checkpoint(&mut checkpoint_tracker, checkpoint_buffer)
+                {
+                    let (release_next, _next_wait) = crossbeam::channel::bounded(1);
+                    checkpoint_sender
+                        .send(OrderedCheckpoint {
+                            checkpoint,
+                            wait_for_previous: wait_for_previous.take().unwrap(),
+                            release_next,
+                        })
+                        .unwrap();
+                }
+                drop(checkpoint_sender);
+                checkpoint_tracker
+            })
+            .unwrap();
+
         Ok(Self {
             colors_subset_count: Mutex::new(0),
             buffers_pool,
             colors_sender,
-            checkpoint_tracker,
             serializer,
+            checkpoint_thread,
             writing_threads,
             print_stats,
             _phantom: PhantomData,
@@ -189,13 +229,11 @@ impl<SI: ColorsSerializerTrait> ColorsSerializer<SI> {
         // Drop the sender to free the writing threads
         drop(self.colors_sender);
 
+        let tracker = self.checkpoint_thread.join().unwrap();
         for thread in self.writing_threads {
             thread.join().unwrap();
         }
 
-        let tracker = Arc::try_unwrap(self.checkpoint_tracker)
-            .unwrap_or_else(|_| unreachable!())
-            .into_inner();
         let serializer = Arc::try_unwrap(self.serializer).unwrap_or_else(|_| unreachable!());
 
         if self.print_stats {

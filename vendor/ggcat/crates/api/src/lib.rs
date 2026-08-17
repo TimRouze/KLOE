@@ -10,6 +10,9 @@ use config::{KEEP_FILES, MEMORY_THRESHOLD_CLEAR_START_OFFSET, MINIMUM_GLOBAL_MEM
 pub use ggcat_logging::MessageLevel;
 use ggcat_logging::{UnrecoverableErrorLogging, info, warn};
 use io::concurrent::structured_sequences::StructuredSequenceBackendWrapper;
+use io::concurrent::structured_sequences::channel::{
+    ChannelWriterWrapper, has_channel_output,
+};
 use io::concurrent::structured_sequences::fasta::FastaWriterWrapper;
 use io::concurrent::structured_sequences::gfa::{GFAWriterWrapperV1, GFAWriterWrapperV2};
 use io::sequences_stream::GenericSequencesStream;
@@ -33,6 +36,9 @@ pub use io::sequences_reader::{DnaSequence, DnaSequencesFileType};
 pub use io::sequences_stream::{
     SequenceInfo,
     general::{DynamicSequencesStream, GeneralSequenceBlockData},
+};
+pub use io::concurrent::structured_sequences::channel::{
+    register_channel_output, unregister_channel_output,
 };
 pub use querier::ColoredQueryOutputFormat;
 
@@ -261,6 +267,7 @@ impl GGCATInstance {
         }
 
         let output_mode = match gfa_output_version {
+            None if has_channel_output(&output_file) => ChannelWriterWrapper::dynamic_dispatch_id(),
             None => FastaWriterWrapper::dynamic_dispatch_id(),
             Some(GfaVersion::V1) => GFAWriterWrapperV1::dynamic_dispatch_id(),
             Some(GfaVersion::V2) => GFAWriterWrapperV2::dynamic_dispatch_id(),

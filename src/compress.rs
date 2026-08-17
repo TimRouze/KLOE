@@ -1,5 +1,6 @@
 use ggcat_api::{
     ColorIndexType, ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData,
+    register_channel_output, unregister_channel_output,
 };
 use ggcat_colors::colors_manager::ColorMapReader;
 use ggcat_colors::storage::deserializer::ColorsDeserializer;
@@ -7,9 +8,9 @@ use ggcat_colors::DefaultColorsSerializer;
 use rayon::prelude::*;
 use rayon::slice::ParallelSliceMut;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -22,19 +23,23 @@ use crate::utils::{Convert, Converter};
 
 const IO_BUFFER_CAPACITY: usize = 16 * 1024 * 1024;
 const ENCODED_SEQ_BUFFER_TARGET: usize = 4 * 1024 * 1024;
-const ID_CID_SPILL_BUFFER_CAPACITY: usize = 1024 * 1024;
 const PAR_SORT_THRESHOLD: usize = 200_000;
 const COLOR_RECORD_BATCH_SIZE: usize = 65_536;
 const COLOR_CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const GROUP_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
-const GROUP_WORKER_QUEUE_DEPTH: usize = 8;
 const GROUP_WORK_BATCH_GROUPS: usize = 2048;
-const GROUP_WORK_BATCH_SEQ_BYTES: usize = 256 * 1024 * 1024;
 const GROUP_IN_MEMORY_MAX_SEQ_BYTES: usize = 2 * 1024 * 1024;
-const SPILL_CID_FLUSH_BYTES: usize = 64 * 1024;
-const PRODUCER_PARSE_BATCH_ENTRIES: usize = 4_096;
-const PRODUCER_PARSE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const SUBSET_QUERY_CHUNK_SIZE: usize = 500_000;
+const MIN_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const MIN_GROUP_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GROUP_BATCH_BYTES: usize = 512 * 1024 * 1024;
+const MIN_SORT_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+const DATASETS_PER_CID_PARTITION: usize = 512;
+const MAX_CID_PARTITIONS: usize = 256;
+const CID_PARTITION_BUFFER_BYTES: usize = 256 * 1024;
+const CID_TRANSPOSE_BLOCK_BYTES: usize = 64 * 1024;
+const COLOR_RUN_BUFFER_BYTES: usize = 64 * 1024;
+const COLOR_MERGE_FAN_IN: usize = 64;
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
@@ -74,6 +79,46 @@ pub fn compress(
 pub struct GgcatCompressionConfig {
     pub memory_gb: usize,
     pub temp_dir: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompressionMemoryBudget {
+    total_bytes: usize,
+}
+
+impl CompressionMemoryBudget {
+    fn from_gb(memory_gb: usize) -> Self {
+        Self {
+            total_bytes: memory_gb
+                .max(1)
+                .saturating_mul(1024 * 1024 * 1024)
+                .max(MIN_MEMORY_BUDGET_BYTES),
+        }
+    }
+
+    fn group_batch_bytes(self) -> usize {
+        (self.total_bytes / 8).clamp(MIN_GROUP_BATCH_BYTES, MAX_GROUP_BATCH_BYTES)
+    }
+
+    fn color_chunk_bytes(self) -> usize {
+        (self.total_bytes / 16).clamp(MIN_SORT_CHUNK_BYTES, COLOR_CHUNK_TARGET_BYTES)
+    }
+
+    fn subset_window_sequence_bytes(self) -> usize {
+        (self.total_bytes / 16).clamp(8 * 1024 * 1024, 256 * 1024 * 1024)
+    }
+
+    fn subset_window_count(self, dataset_count: usize) -> usize {
+        let worst_case_subset_bytes = dataset_count
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(96)
+            .max(1);
+        (self.total_bytes / 32 / worst_case_subset_bytes).clamp(1, SUBSET_QUERY_CHUNK_SIZE)
+    }
+
+    fn ggcat_memory_gb(self) -> f64 {
+        ((self.total_bytes as f64) / (1024.0 * 1024.0 * 1024.0) * 0.75).max(0.25)
+    }
 }
 
 impl Default for GgcatCompressionConfig {
@@ -339,9 +384,11 @@ struct WorkerStats {
 }
 
 impl WorkerStats {
-    fn record_group(&mut self, wall_sec: f64, cpu_sec: Option<f64>) {
-        self.groups += 1;
-        self.timing.add(PhaseTiming { wall_sec, cpu_sec });
+    fn record_batch(&mut self, groups: usize, timing: PhaseTiming) {
+        self.groups += groups;
+        self.timing.add(timing);
+        let wall_sec = timing.wall_sec;
+        let cpu_sec = timing.cpu_sec;
         if wall_sec > self.max_wall_sec {
             self.max_wall_sec = wall_sec;
         }
@@ -432,67 +479,6 @@ fn read_color_record(
     Ok(Some((subsets, seq)))
 }
 
-fn parse_color_runs_from_header(header: &[u8]) -> Result<Vec<(ColorIndexType, usize)>> {
-    let mut runs = Vec::new();
-    for token in header.split(|b| *b == b' ') {
-        if token.len() < 4 || token[0] != b'C' || token[1] != b':' {
-            continue;
-        }
-        let rest = &token[2..];
-        let Some(colon_pos) = rest.iter().position(|b| *b == b':') else {
-            continue;
-        };
-        if colon_pos == 0 || colon_pos + 1 >= rest.len() {
-            continue;
-        }
-        let color_hex = std::str::from_utf8(&rest[..colon_pos]).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid color tag '{}' in header '{}': {err}",
-                    String::from_utf8_lossy(token),
-                    String::from_utf8_lossy(header)
-                ),
-            )
-        })?;
-        let count_text = std::str::from_utf8(&rest[(colon_pos + 1)..]).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid color count tag '{}' in header '{}': {err}",
-                    String::from_utf8_lossy(token),
-                    String::from_utf8_lossy(header)
-                ),
-            )
-        })?;
-
-        let subset = ColorIndexType::from_str_radix(color_hex, 16).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid color subset '{}' in header '{}': {err}",
-                    color_hex,
-                    String::from_utf8_lossy(header)
-                ),
-            )
-        })?;
-        let count = count_text.parse::<usize>().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid color run count '{}' in header '{}': {err}",
-                    count_text,
-                    String::from_utf8_lossy(header)
-                ),
-            )
-        })?;
-        if count > 0 {
-            runs.push((subset, count));
-        }
-    }
-    Ok(runs)
-}
-
 fn flush_sorted_chunk(
     records: &mut Vec<SortedColorRecord>,
     chunk_files: &mut Vec<PathBuf>,
@@ -537,31 +523,23 @@ fn flush_sorted_chunk_timed(
     Ok(())
 }
 
-fn parse_entry_color_segments(
-    header: &[u8],
+fn split_color_run_segments(
+    runs: Vec<(ColorIndexType, usize)>,
     seq: &[u8],
     k: usize,
+    source: &str,
 ) -> Result<Vec<SortedColorRecord>> {
-    let runs = parse_color_runs_from_header(header)?;
     if runs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "ggcat emitted colored sequence without color runs: '{}'",
-                String::from_utf8_lossy(header)
-            ),
+            format!("ggcat emitted colored sequence without color runs: {source}"),
         ));
     }
 
     if seq.len() < k {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "ggcat sequence shorter than k (len={}, k={}) for '{}'",
-                seq.len(),
-                k,
-                String::from_utf8_lossy(header)
-            ),
+            format!("ggcat sequence shorter than k (len={}, k={k}) for {source}", seq.len()),
         ));
     }
 
@@ -590,8 +568,7 @@ fn parse_entry_color_segments(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "GGCAT header color-run lengths mismatch sequence k-mers for '{}': runs={}, expected={}",
-                String::from_utf8_lossy(header),
+                "GGCAT color-run lengths mismatch sequence k-mers for {source}: runs={}, expected={}",
                 total_run_kmers,
                 seq_kmers
             ),
@@ -606,8 +583,7 @@ fn parse_entry_color_segments(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "GGCAT color run exceeds sequence k-mers for '{}': end={}, total={}",
-                    String::from_utf8_lossy(header),
+                    "GGCAT color run exceeds sequence k-mers for {source}: end={}, total={}",
                     run_end,
                     seq_kmers
                 ),
@@ -624,8 +600,7 @@ fn parse_entry_color_segments(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "GGCAT color runs do not fully cover sequence k-mers for '{}': covered={}, total={}",
-                String::from_utf8_lossy(header),
+                "GGCAT color runs do not fully cover sequence k-mers for {source}: covered={}, total={}",
                 run_start,
                 seq_kmers
             ),
@@ -635,11 +610,279 @@ fn parse_entry_color_segments(
     Ok(segments)
 }
 
+fn read_u64_field(block: &[u8], cursor: &mut usize, field: &str) -> Result<u64> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or_else(|| io::Error::other("structured-output cursor overflow"))?;
+    let bytes = block.get(*cursor..end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("truncated GGCAT structured-output {field}"),
+        )
+    })?;
+    *cursor = end;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_varint_field(data: &[u8], cursor: &mut usize, field: &str) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *data.get(*cursor).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated GGCAT structured-output {field}"),
+            )
+        })?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("overflow in GGCAT structured-output {field}"),
+            ));
+        }
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unterminated GGCAT structured-output {field}"),
+    ))
+}
+
+fn visit_structured_ggcat_block(
+    block: &[u8],
+    k: usize,
+    mut emit: impl FnMut(SortedColorRecord) -> Result<()>,
+) -> Result<(usize, usize)> {
+    let mut cursor = 0usize;
+    let mut sequences = 0usize;
+    let mut segments = 0usize;
+    while cursor < block.len() {
+        let sequence_index = read_u64_field(block, &mut cursor, "sequence index")?;
+        let sequence_len = usize::try_from(read_u64_field(
+            block,
+            &mut cursor,
+            "sequence length",
+        )?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sequence length overflow"))?;
+        let color_len = usize::try_from(read_u64_field(block, &mut cursor, "color length")?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "color length overflow"))?;
+        let links_len = usize::try_from(read_u64_field(block, &mut cursor, "links length")?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "links length overflow"))?;
+        let record_len = sequence_len
+            .checked_add(color_len)
+            .and_then(|len| len.checked_add(links_len))
+            .ok_or_else(|| io::Error::other("structured-output record length overflow"))?;
+        let record_end = cursor
+            .checked_add(record_len)
+            .ok_or_else(|| io::Error::other("structured-output cursor overflow"))?;
+        if record_end > block.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated GGCAT structured-output sequence {sequence_index}"),
+            ));
+        }
+        let seq = &block[cursor..cursor + sequence_len];
+        cursor += sequence_len;
+        let color_data = &block[cursor..cursor + color_len];
+        cursor += color_len;
+        cursor += links_len;
+
+        let mut color_cursor = 0usize;
+        let colors_count = usize::try_from(read_varint_field(
+            color_data,
+            &mut color_cursor,
+            "color count",
+        )?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "color count overflow"))?;
+        let mut runs = Vec::with_capacity(colors_count);
+        for _ in 0..colors_count {
+            let subset = ColorIndexType::try_from(read_varint_field(
+                color_data,
+                &mut color_cursor,
+                "color subset",
+            )?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "color subset overflow"))?;
+            let count = usize::try_from(read_varint_field(
+                color_data,
+                &mut color_cursor,
+                "color run length",
+            )?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "color run overflow"))?;
+            if count > 0 {
+                runs.push((subset, count));
+            }
+        }
+        if color_cursor != color_data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unused bytes in GGCAT structured-output colors for sequence {sequence_index}"
+                ),
+            ));
+        }
+        let parsed = split_color_run_segments(
+            runs,
+            seq,
+            k,
+            &format!("structured sequence {sequence_index}"),
+        )?;
+        sequences += 1;
+        segments += parsed.len();
+        for record in parsed {
+            emit(record)?;
+        }
+    }
+    Ok((sequences, segments))
+}
+
+fn merge_sorted_dataset_ids_with_offset(
+    target: &mut Vec<u32>,
+    other: &[u32],
+    offset: u32,
+) -> io::Result<()> {
+    if offset != 0 && other.last().copied().unwrap_or(0) > u32::MAX - offset {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merged dataset id overflow",
+        ));
+    }
+    if target.is_empty() {
+        target.reserve(other.len());
+        target.extend(other.iter().map(|&id| id + offset));
+        return Ok(());
+    }
+    if other.is_empty() {
+        return Ok(());
+    }
+    let mut merged = Vec::with_capacity(target.len().saturating_add(other.len()));
+    let (mut left, mut right) = (0usize, 0usize);
+    while left < target.len() && right < other.len() {
+        let right_id = other[right] + offset;
+        match target[left].cmp(&right_id) {
+            CmpOrdering::Less => {
+                merged.push(target[left]);
+                left += 1;
+            }
+            CmpOrdering::Greater => {
+                merged.push(right_id);
+                right += 1;
+            }
+            CmpOrdering::Equal => {
+                merged.push(target[left]);
+                left += 1;
+                right += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&target[left..]);
+    merged.extend(other[right..].iter().map(|&id| id + offset));
+    *target = merged;
+    Ok(())
+}
+
+fn merge_sorted_dataset_ids(target: &mut Vec<u32>, other: &[u32]) {
+    merge_sorted_dataset_ids_with_offset(target, other, 0)
+        .expect("zero-offset dataset IDs cannot overflow");
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceDatasetSpan {
+    storage: usize,
+    start: usize,
+    end: usize,
+    offset: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct SourceDatasetMap {
+    storages: Vec<Arc<Vec<u32>>>,
+    spans: Vec<SourceDatasetSpan>,
+}
+
+impl SourceDatasetMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            storages: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    pub(crate) fn add_storage(&mut self, values: Arc<Vec<u32>>) -> usize {
+        let index = self.storages.len();
+        self.storages.push(values);
+        index
+    }
+
+    pub(crate) fn push_span(
+        &mut self,
+        storage: usize,
+        start: usize,
+        end: usize,
+        offset: u32,
+    ) -> io::Result<()> {
+        let values = self.storages.get(storage).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source dataset storage is missing")
+        })?;
+        if start > end || end > values.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source dataset span is outside its storage",
+            ));
+        }
+        self.spans.push(SourceDatasetSpan {
+            storage,
+            start,
+            end,
+            offset,
+        });
+        Ok(())
+    }
+
+    fn from_singletons(dataset_count: usize) -> io::Result<Self> {
+        let mut values = Vec::with_capacity(dataset_count);
+        for dataset in 1..=dataset_count {
+            values.push(u32::try_from(dataset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many input datasets")
+            })?);
+        }
+        let mut map = Self::new();
+        let storage = map.add_storage(Arc::new(values));
+        for dataset in 0..dataset_count {
+            map.push_span(storage, dataset, dataset + 1, 0)?;
+        }
+        Ok(map)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    fn merge_source_into(&self, source: usize, target: &mut Vec<u32>) -> io::Result<()> {
+        let span = self.spans.get(source).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ggcat source index {} is out of range", source),
+            )
+        })?;
+        let values = self.storages.get(span.storage).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "source dataset storage is missing")
+        })?;
+        let values = values.get(span.start..span.end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "source dataset span is invalid")
+        })?;
+        merge_sorted_dataset_ids_with_offset(target, values, span.offset)
+    }
+}
+
 fn resolve_subsets_to_dataset_ids(
     instance: &GGCATInstance,
     colormap_file: &Path,
-    subsets: &HashSet<ColorIndexType>,
-    color_index_to_dataset_index: &[usize],
+    subsets: &[ColorIndexType],
+    color_index_to_source_index: &[usize],
+    source_dataset_ids: &SourceDatasetMap,
     dataset_count: usize,
 ) -> Result<HashMap<ColorIndexType, Arc<Vec<u32>>>> {
     if subsets.is_empty() {
@@ -649,8 +892,9 @@ fn resolve_subsets_to_dataset_ids(
         ));
     }
 
-    let mut subset_list = subsets.iter().copied().collect::<Vec<_>>();
+    let mut subset_list = subsets.to_vec();
     subset_list.sort_unstable();
+    subset_list.dedup();
 
     let resolved = Mutex::new(HashMap::<ColorIndexType, Arc<Vec<u32>>>::with_capacity(
         subset_list.len(),
@@ -672,10 +916,10 @@ fn resolve_subsets_to_dataset_ids(
                         return;
                     }
 
-                    let mut dataset_ids = Vec::with_capacity(colors.len());
+                    let mut dataset_ids = Vec::new();
                     for &color in colors {
                         let color_idx = color as usize;
-                        let Some(&dataset_idx) = color_index_to_dataset_index.get(color_idx) else {
+                        let Some(&source_idx) = color_index_to_source_index.get(color_idx) else {
                             *callback_err.lock().expect("callback error lock poisoned") =
                                 Some(io::Error::new(
                                     io::ErrorKind::InvalidData,
@@ -683,15 +927,12 @@ fn resolve_subsets_to_dataset_ids(
                                 ));
                             return;
                         };
-                        if dataset_idx >= dataset_count {
-                            *callback_err.lock().expect("callback error lock poisoned") =
-                                Some(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("dataset index {} out of range", dataset_idx),
-                                ));
+                        if let Err(err) =
+                            source_dataset_ids.merge_source_into(source_idx, &mut dataset_ids)
+                        {
+                            *callback_err.lock().expect("callback error lock poisoned") = Some(err);
                             return;
                         }
-                        dataset_ids.push((dataset_idx + 1) as u32);
                     }
 
                     if dataset_ids.is_empty() {
@@ -702,7 +943,20 @@ fn resolve_subsets_to_dataset_ids(
                             ));
                         return;
                     }
-                    dataset_ids.sort_unstable();
+                    if let Some(&invalid) = dataset_ids
+                        .iter()
+                        .find(|&&dataset_id| dataset_id == 0 || dataset_id as usize > dataset_count)
+                    {
+                        *callback_err.lock().expect("callback error lock poisoned") =
+                            Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "source color maps to dataset id {} outside [1, {}]",
+                                    invalid, dataset_count
+                                ),
+                            ));
+                        return;
+                    }
 
                     resolved
                         .lock()
@@ -724,17 +978,95 @@ fn resolve_subsets_to_dataset_ids(
     let map = resolved
         .into_inner()
         .expect("resolved-subset lock poisoned");
-    if map.len() != subsets.len() {
+    if map.len() != subset_list.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "resolved {} color subsets but expected {}",
                 map.len(),
-                subsets.len()
+                subset_list.len()
             ),
         ));
     }
     Ok(map)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_resolved_record_window(
+    records: &mut Vec<SortedColorRecord>,
+    instance: &GGCATInstance,
+    colormap_file: &Path,
+    color_index_to_source_index: &[usize],
+    source_dataset_ids: &SourceDatasetMap,
+    dataset_count: usize,
+    sender: &mpsc::SyncSender<SimplitigBatch>,
+    output_batch: &mut SimplitigBatch,
+    output_batch_bytes: &mut usize,
+    output_batch_byte_limit: usize,
+    emitted_batches_count: &mut usize,
+    emitted_records_count: &mut usize,
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut subsets = Vec::new();
+    let mut previous = None;
+    for record in records.iter() {
+        if previous != Some(record.subset) {
+            subsets.push(record.subset);
+            previous = Some(record.subset);
+        }
+    }
+    let resolved = resolve_subsets_to_dataset_ids(
+        instance,
+        colormap_file,
+        &subsets,
+        color_index_to_source_index,
+        source_dataset_ids,
+        dataset_count,
+    )?;
+    for record in records.drain(..) {
+        let color_ids = resolved.get(&record.subset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing resolved dataset ids for subset {}", record.subset),
+            )
+        })?;
+        *output_batch_bytes = output_batch_bytes.saturating_add(record.seq.len());
+        output_batch.push(SimplitigRecord {
+            color_ids: Arc::clone(color_ids),
+            seq: record.seq,
+        });
+        if output_batch.len() >= COLOR_RECORD_BATCH_SIZE
+            || *output_batch_bytes >= output_batch_byte_limit
+        {
+            let out = std::mem::take(output_batch);
+            *emitted_batches_count += 1;
+            *emitted_records_count += out.len();
+            sender.send(out).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("record receiver dropped: {err}"),
+                )
+            })?;
+            *output_batch_bytes = 0;
+            *output_batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
+        }
+    }
+    if !output_batch.is_empty() {
+        let out = std::mem::take(output_batch);
+        *emitted_batches_count += 1;
+        *emitted_records_count += out.len();
+        sender.send(out).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("record receiver dropped: {err}"),
+            )
+        })?;
+        *output_batch_bytes = 0;
+        *output_batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
+    }
+    Ok(())
 }
 
 fn sort_and_spill_sequence_run(
@@ -825,15 +1157,181 @@ fn emit_sorted_group_sequences(
     Ok(())
 }
 
+struct DatasetCidSpill {
+    paths: Vec<PathBuf>,
+    writers: Vec<BufWriter<File>>,
+    last_cids: Vec<u64>,
+    directory: PathBuf,
+    datasets_per_partition: usize,
+    dataset_count: usize,
+}
+
+struct DatasetCidSpillFiles {
+    paths: Vec<PathBuf>,
+    directory: PathBuf,
+    datasets_per_partition: usize,
+    dataset_count: usize,
+}
+
+impl DatasetCidSpill {
+    fn new(output_dir: &str, dataset_count: usize) -> Result<Self> {
+        let directory = create_id_cid_spill_dir(output_dir)?;
+        let partition_count = dataset_count
+            .div_ceil(DATASETS_PER_CID_PARTITION)
+            .clamp(1, MAX_CID_PARTITIONS);
+        let datasets_per_partition = dataset_count.div_ceil(partition_count).max(1);
+        let mut paths = Vec::with_capacity(partition_count);
+        let mut writers = Vec::with_capacity(partition_count);
+        let last_cids = vec![0u64; partition_count];
+        for partition in 0..partition_count {
+            let path = directory.join(format!("partition_{partition:04}.pairs.bin"));
+            writers.push(BufWriter::with_capacity(
+                CID_PARTITION_BUFFER_BYTES,
+                File::create(&path)?,
+            ));
+            paths.push(path);
+        }
+        println!(
+            "Dataset-to-CID spill: datasets={}, partitions={}, datasets_per_partition={}",
+            dataset_count, partition_count, datasets_per_partition
+        );
+        Ok(Self {
+            paths,
+            writers,
+            last_cids,
+            directory,
+            datasets_per_partition,
+            dataset_count,
+        })
+    }
+
+    fn append_group(&mut self, dataset_ids: &[usize], cid: usize) -> Result<()> {
+        let cid = u64::try_from(cid).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID cannot be represented as u64",
+            )
+        })?;
+        let mut start = 0usize;
+        while start < dataset_ids.len() {
+            let first_dataset = dataset_ids[start];
+            if first_dataset >= self.dataset_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "dataset id {} outside [0, {}) while spilling CID {}",
+                        first_dataset, self.dataset_count, cid
+                    ),
+                ));
+            }
+            let partition =
+                (first_dataset / self.datasets_per_partition).min(self.writers.len() - 1);
+            let mut end = start + 1;
+            while end < dataset_ids.len()
+                && dataset_ids[end] / self.datasets_per_partition == partition
+            {
+                end += 1;
+            }
+
+            let cid_delta = cid.checked_sub(self.last_cids[partition]).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CID order regressed while writing dataset transpose spill",
+                )
+            })?;
+            let writer = &mut self.writers[partition];
+            write_varint_u64_to_writer(cid_delta, &mut *writer)?;
+            write_varint_u64_to_writer((end - start) as u64, &mut *writer)?;
+            let partition_start = partition.saturating_mul(self.datasets_per_partition);
+            let mut previous_dataset = partition_start;
+            for &dataset in &dataset_ids[start..end] {
+                if dataset >= self.dataset_count || dataset < previous_dataset {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "dataset IDs are not sorted within a color set",
+                    ));
+                }
+                write_varint_u64_to_writer((dataset - previous_dataset) as u64, &mut *writer)?;
+                previous_dataset = dataset;
+            }
+            self.last_cids[partition] = cid;
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn finalize(mut self) -> Result<DatasetCidSpillFiles> {
+        for writer in &mut self.writers {
+            writer.flush()?;
+        }
+        drop(self.writers);
+        Ok(DatasetCidSpillFiles {
+            paths: self.paths,
+            directory: self.directory,
+            datasets_per_partition: self.datasets_per_partition,
+            dataset_count: self.dataset_count,
+        })
+    }
+}
+
+struct PositionSpill {
+    path: PathBuf,
+    writer: BufWriter<File>,
+    entries: u64,
+    previous_tigs: u64,
+    previous_sizes: u64,
+}
+
+impl PositionSpill {
+    fn new(directory: &Path) -> Result<Self> {
+        let path = directory.join("positions.deltas.tmp");
+        let writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&path)?);
+        let mut spill = Self {
+            path,
+            writer,
+            entries: 0,
+            previous_tigs: 0,
+            previous_sizes: 0,
+        };
+        spill.append(0, 0)?;
+        Ok(spill)
+    }
+
+    fn append(&mut self, tigs: u64, sizes: u64) -> Result<()> {
+        if tigs < self.previous_tigs || sizes < self.previous_sizes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "positions are not monotonic",
+            ));
+        }
+        write_varint_u64_to_writer(tigs - self.previous_tigs, &mut self.writer)?;
+        write_varint_u64_to_writer(sizes - self.previous_sizes, &mut self.writer)?;
+        self.previous_tigs = tigs;
+        self.previous_sizes = sizes;
+        self.entries += 1;
+        Ok(())
+    }
+
+    fn finalize(mut self) -> Result<(PathBuf, u64)> {
+        self.writer.flush()?;
+        Ok((self.path, self.entries))
+    }
+}
+
+struct StreamFinalize {
+    position_path: PathBuf,
+    position_entries: u64,
+    cid_spill: DatasetCidSpillFiles,
+}
+
 struct StreamWriterState {
     omni_file: BufWriter<File>,
     size_file: BufWriter<File>,
-    spill_writers: Vec<BufWriter<File>>,
-    spill_cid_buffers: Vec<Vec<u8>>,
+    cid_spill: DatasetCidSpill,
+    position_spill: PositionSpill,
     size_block_groups: usize,
     size_block_offsets: Vec<u32>,
     size_block_uncompressed: Vec<u8>,
-    pos_nb_unitig: Vec<(u64, u64)>,
     prev_tigs_size: u64,
     prev_bucket_pos: u64,
     cid: usize,
@@ -841,52 +1339,32 @@ struct StreamWriterState {
 }
 
 impl StreamWriterState {
-    fn new(
-        unitigs_file_path: String,
-        output_dir: &str,
-        nb_files: usize,
-    ) -> Result<(Self, Vec<PathBuf>, PathBuf)> {
-        let mut spill_paths = Vec::with_capacity(nb_files);
-        let mut spill_writers = Vec::with_capacity(nb_files);
-        let mut spill_cid_buffers = Vec::with_capacity(nb_files);
-        let spill_dir = create_id_cid_spill_dir(output_dir)?;
-        for id in 0..nb_files {
-            let path = spill_dir.join(format!("id_{id}.cids.bin"));
-            let writer =
-                BufWriter::with_capacity(ID_CID_SPILL_BUFFER_CAPACITY, File::create(&path)?);
-            spill_paths.push(path);
-            spill_writers.push(writer);
-            spill_cid_buffers.push(Vec::with_capacity(SPILL_CID_FLUSH_BYTES));
-        }
-
-        Ok((
-            Self {
-                omni_file: BufWriter::with_capacity(
+    fn new(unitigs_file_path: String, output_dir: &str, nb_files: usize) -> Result<Self> {
+        let cid_spill = DatasetCidSpill::new(output_dir, nb_files)?;
+        let position_spill = PositionSpill::new(&cid_spill.directory)?;
+        Ok(Self {
+            omni_file: BufWriter::with_capacity(
+                IO_BUFFER_CAPACITY,
+                File::create(unitigs_file_path)?,
+            ),
+            size_file: {
+                let mut out = BufWriter::with_capacity(
                     IO_BUFFER_CAPACITY,
-                    File::create(unitigs_file_path)?,
-                ),
-                size_file: {
-                    let mut out = BufWriter::with_capacity(
-                        IO_BUFFER_CAPACITY,
-                        File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
-                    );
-                    out.write_all(BUCKET_SIZES_MAGIC)?;
-                    out
-                },
-                spill_writers,
-                spill_cid_buffers,
-                size_block_groups: 0,
-                size_block_offsets: vec![0],
-                size_block_uncompressed: Vec::new(),
-                pos_nb_unitig: vec![(0, 0)],
-                prev_tigs_size: 0,
-                prev_bucket_pos: 0,
-                cid: 0,
-                encoded_seq_buffer: Vec::with_capacity(ENCODED_SEQ_BUFFER_TARGET),
+                    File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
+                );
+                out.write_all(BUCKET_SIZES_MAGIC)?;
+                out
             },
-            spill_paths,
-            spill_dir,
-        ))
+            cid_spill,
+            position_spill,
+            size_block_groups: 0,
+            size_block_offsets: vec![0],
+            size_block_uncompressed: Vec::new(),
+            prev_tigs_size: 0,
+            prev_bucket_pos: 0,
+            cid: 0,
+            encoded_seq_buffer: Vec::with_capacity(ENCODED_SEQ_BUFFER_TARGET),
+        })
     }
 
     fn flush_size_block(&mut self) -> Result<()> {
@@ -936,20 +1414,9 @@ impl StreamWriterState {
         Ok(())
     }
 
-    fn append_cid_for_dataset(&mut self, dataset_id_zero_based: usize, cid: usize) -> Result<()> {
-        let buf = &mut self.spill_cid_buffers[dataset_id_zero_based];
-        buf.extend_from_slice(&(cid as u64).to_le_bytes());
-        if buf.len() >= SPILL_CID_FLUSH_BYTES {
-            self.spill_writers[dataset_id_zero_based].write_all(buf)?;
-            buf.clear();
-        }
-        Ok(())
-    }
-
     fn append_group_cids(&mut self, dataset_ids_zero_based: &[usize]) -> Result<()> {
-        for &id in dataset_ids_zero_based {
-            self.append_cid_for_dataset(id, self.cid)?;
-        }
+        self.cid_spill
+            .append_group(dataset_ids_zero_based, self.cid)?;
         self.cid += 1;
         Ok(())
     }
@@ -990,8 +1457,8 @@ impl StreamWriterState {
         })?;
         self.append_bucket_group_sizes_payload(&group_sizes_buffer)?;
         self.prev_bucket_pos += 1;
-        self.pos_nb_unitig
-            .push((self.prev_tigs_size, self.prev_bucket_pos));
+        self.position_spill
+            .append(self.prev_tigs_size, self.prev_bucket_pos)?;
 
         self.append_group_cids(dataset_ids_zero_based)?;
 
@@ -1012,8 +1479,8 @@ impl StreamWriterState {
         self.prev_tigs_size += encoded_tigs_len;
 
         self.prev_bucket_pos += 1;
-        self.pos_nb_unitig
-            .push((self.prev_tigs_size, self.prev_bucket_pos));
+        self.position_spill
+            .append(self.prev_tigs_size, self.prev_bucket_pos)?;
         let mut group_sizes_payload = Vec::with_capacity(group_sizes_len as usize);
         let mut sizes_reader =
             BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(group_sizes_path)?);
@@ -1034,27 +1501,18 @@ impl StreamWriterState {
         self.prev_tigs_size += encoded_tigs.len() as u64;
 
         self.prev_bucket_pos += 1;
-        self.pos_nb_unitig
-            .push((self.prev_tigs_size, self.prev_bucket_pos));
+        self.position_spill
+            .append(self.prev_tigs_size, self.prev_bucket_pos)?;
         self.append_bucket_group_sizes_payload(group_sizes)?;
 
         self.append_group_cids(dataset_ids_zero_based)?;
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<Vec<(u64, u64)>> {
+    fn finalize(mut self) -> Result<StreamFinalize> {
         if !self.encoded_seq_buffer.is_empty() {
             self.omni_file.write_all(&self.encoded_seq_buffer)?;
             self.encoded_seq_buffer.clear();
-        }
-        for (idx, buf) in self.spill_cid_buffers.iter_mut().enumerate() {
-            if !buf.is_empty() {
-                self.spill_writers[idx].write_all(buf)?;
-                buf.clear();
-            }
-        }
-        for writer in &mut self.spill_writers {
-            writer.flush()?;
         }
         self.flush_size_block()?;
         self.omni_file.flush()?;
@@ -1064,7 +1522,13 @@ impl StreamWriterState {
             "Completed compression: total tigs={}, total sizes={}",
             self.prev_tigs_size, self.prev_bucket_pos
         );
-        Ok(self.pos_nb_unitig)
+        let (position_path, position_entries) = self.position_spill.finalize()?;
+        let cid_spill = self.cid_spill.finalize()?;
+        Ok(StreamFinalize {
+            position_path,
+            position_entries,
+            cid_spill,
+        })
     }
 }
 
@@ -1074,12 +1538,6 @@ struct GroupTask {
     dataset_ids_zero_based: Vec<usize>,
     seqs: Vec<Vec<u8>>,
     run_paths: Vec<PathBuf>,
-}
-
-#[derive(Debug)]
-struct GroupWorkItem {
-    tasks: Vec<GroupTask>,
-    spill_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -1101,13 +1559,6 @@ struct GroupWriteResult {
     cid: usize,
     dataset_ids_zero_based: Vec<usize>,
     data: GroupWriteData,
-    worker_wall_sec: f64,
-    worker_cpu_sec: Option<f64>,
-}
-
-#[derive(Debug)]
-struct GroupWorkResultBatch {
-    results: Vec<GroupWriteResult>,
 }
 
 fn map_color_ids_to_zero_based(color_ids: &[u32], max_datasets: usize) -> io::Result<Vec<usize>> {
@@ -1140,7 +1591,6 @@ fn process_single_group_task(
     mut task: GroupTask,
     spill_dir: &Path,
 ) -> io::Result<GroupWriteResult> {
-    let group_timer = PhaseTimer::start();
     let seq_bytes = task.seqs.iter().map(Vec::len).sum::<usize>();
     let use_in_memory = task.run_paths.is_empty() && seq_bytes <= GROUP_IN_MEMORY_MAX_SEQ_BYTES;
 
@@ -1216,100 +1666,112 @@ fn process_single_group_task(
         }
     };
 
-    let group_timing = group_timer.finish();
-
     Ok(GroupWriteResult {
         cid: task.cid,
         dataset_ids_zero_based: task.dataset_ids_zero_based,
         data,
-        worker_wall_sec: group_timing.wall_sec,
-        worker_cpu_sec: group_timing.cpu_sec,
     })
 }
 
-fn process_group_work_item(work: GroupWorkItem) -> io::Result<GroupWorkResultBatch> {
-    let mut results = Vec::with_capacity(work.tasks.len());
-    for task in work.tasks {
-        results.push(process_single_group_task(task, &work.spill_dir)?);
-    }
-    Ok(GroupWorkResultBatch { results })
-}
-
-fn absorb_group_result(
-    received: io::Result<GroupWorkResultBatch>,
-    pending: &mut HashMap<usize, GroupWriteResult>,
+fn commit_group_result(
+    next: GroupWriteResult,
     writer: &mut StreamWriterState,
-    worker_stats: &mut WorkerStats,
     commit_stats: &mut CommitStats,
-) -> io::Result<()> {
-    let batch = received?;
-    for result in batch.results {
-        worker_stats.record_group(result.worker_wall_sec, result.worker_cpu_sec);
-        if pending.insert(result.cid, result).is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate group result for cid",
-            ));
-        }
+) -> Result<()> {
+    if next.cid != writer.cid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "out-of-order group result: expected CID {}, received {}",
+                writer.cid, next.cid
+            ),
+        ));
     }
-
-    while let Some(next) = pending.remove(&writer.cid) {
-        let commit_timer = PhaseTimer::start();
-        match &next.data {
-            GroupWriteData::InMemory {
+    match &next.data {
+        GroupWriteData::InMemory {
+            encoded_tigs,
+            group_sizes,
+        } => {
+            writer.write_precomputed_group_buffers(
+                &next.dataset_ids_zero_based,
                 encoded_tigs,
                 group_sizes,
-            } => {
-                writer.write_precomputed_group_buffers(
-                    &next.dataset_ids_zero_based,
-                    encoded_tigs,
-                    group_sizes,
-                )?;
-                commit_stats.tigs_bytes += encoded_tigs.len() as u64;
-                commit_stats.sizes_bytes += group_sizes.len() as u64;
-            }
-            GroupWriteData::Spilled {
-                encoded_tigs_path,
-                encoded_tigs_len,
-                group_sizes_path,
-                group_sizes_len,
-            } => {
-                writer.write_precomputed_group_files(
-                    &next.dataset_ids_zero_based,
-                    encoded_tigs_path,
-                    *encoded_tigs_len,
-                    group_sizes_path,
-                    *group_sizes_len,
-                )?;
-                commit_stats.tigs_bytes += *encoded_tigs_len;
-                commit_stats.sizes_bytes += *group_sizes_len;
-                let _ = fs::remove_file(encoded_tigs_path);
-                let _ = fs::remove_file(group_sizes_path);
-            }
+            )?;
+            commit_stats.tigs_bytes += encoded_tigs.len() as u64;
+            commit_stats.sizes_bytes += group_sizes.len() as u64;
         }
-        commit_stats.groups += 1;
-        commit_stats.timing.add(commit_timer.finish());
+        GroupWriteData::Spilled {
+            encoded_tigs_path,
+            encoded_tigs_len,
+            group_sizes_path,
+            group_sizes_len,
+        } => {
+            writer.write_precomputed_group_files(
+                &next.dataset_ids_zero_based,
+                encoded_tigs_path,
+                *encoded_tigs_len,
+                group_sizes_path,
+                *group_sizes_len,
+            )?;
+            commit_stats.tigs_bytes += *encoded_tigs_len;
+            commit_stats.sizes_bytes += *group_sizes_len;
+            let _ = fs::remove_file(encoded_tigs_path);
+            let _ = fs::remove_file(group_sizes_path);
+        }
     }
+    commit_stats.groups += 1;
     Ok(())
 }
 
-fn drain_available_group_results(
-    result_rx: &mpsc::Receiver<io::Result<GroupWorkResultBatch>>,
-    pending: &mut HashMap<usize, GroupWriteResult>,
+fn process_and_commit_group_batch(
+    tasks: &mut Vec<GroupTask>,
+    resident_bytes: &mut usize,
+    spill_dir: &Path,
+    pool: &rayon::ThreadPool,
     writer: &mut StreamWriterState,
     worker_stats: &mut WorkerStats,
     commit_stats: &mut CommitStats,
-) -> io::Result<()> {
-    loop {
-        match result_rx.try_recv() {
-            Ok(received) => {
-                absorb_group_result(received, pending, writer, worker_stats, commit_stats)?
-            }
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => break,
-        }
+) -> Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
     }
+    let tasks = std::mem::take(tasks);
+    *resident_bytes = 0;
+    let groups_count = tasks.len();
+    let worker_timer = PhaseTimer::start();
+    let results = pool.install(|| {
+        tasks
+            .into_par_iter()
+            .map(|task| process_single_group_task(task, spill_dir))
+            .collect::<io::Result<Vec<_>>>()
+    })?;
+    worker_stats.record_batch(groups_count, worker_timer.finish());
+    let commit_timer = PhaseTimer::start();
+    for result in results {
+        commit_group_result(result, writer, commit_stats)?;
+    }
+    commit_stats.timing.add(commit_timer.finish());
     Ok(())
+}
+
+fn group_task_resident_bytes(task: &GroupTask) -> usize {
+    task.dataset_ids_zero_based
+        .capacity()
+        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_add(
+            task.seqs
+                .iter()
+                .map(|seq| {
+                    seq.capacity()
+                        .saturating_add(std::mem::size_of::<Vec<u8>>())
+                })
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            task.run_paths
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PathBuf>()),
+        )
 }
 
 fn write_compressed_from_stream(
@@ -1317,11 +1779,11 @@ fn write_compressed_from_stream(
     output_dir: &String,
     nb_files: u32,
     worker_threads: usize,
+    memory_budget: CompressionMemoryBudget,
     record_rx: mpsc::Receiver<SimplitigBatch>,
-) -> Result<(Vec<(u64, u64)>, Vec<PathBuf>, PathBuf)> {
+) -> Result<StreamFinalize> {
     let total_timer = PhaseTimer::start();
-    let (mut writer, spill_paths, spill_dir) =
-        StreamWriterState::new(unitigs_file_path, output_dir, nb_files as usize)?;
+    let mut writer = StreamWriterState::new(unitigs_file_path, output_dir, nb_files as usize)?;
 
     let group_spill_dir = Path::new(output_dir).join(format!(
         ".kloe-group-sort-spill-{}-{}",
@@ -1333,35 +1795,11 @@ fn write_compressed_from_stream(
     ));
     fs::create_dir_all(&group_spill_dir)?;
 
-    let setup_workers_timer = PhaseTimer::start();
     let worker_count = worker_threads.max(1);
-    let (result_tx, result_rx) = mpsc::channel::<io::Result<GroupWorkResultBatch>>();
-    let mut worker_inputs = Vec::with_capacity(worker_count);
-    let mut worker_handles = Vec::with_capacity(worker_count);
-
-    for _ in 0..worker_count {
-        let (work_tx, work_rx) =
-            mpsc::sync_channel::<Option<GroupWorkItem>>(GROUP_WORKER_QUEUE_DEPTH);
-        worker_inputs.push(work_tx);
-        let worker_result_tx = result_tx.clone();
-        worker_handles.push(thread::spawn(move || {
-            while let Ok(msg) = work_rx.recv() {
-                match msg {
-                    Some(work) => {
-                        let send_res = worker_result_tx.send(process_group_work_item(work));
-                        if send_res.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }));
-    }
-    drop(result_tx);
-    let setup_workers_timing = setup_workers_timer.finish();
-
-    let mut pending_results: HashMap<usize, GroupWriteResult> = HashMap::new();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+        .map_err(|err| io::Error::other(format!("create bounded group worker pool: {err}")))?;
     let mut worker_stats = WorkerStats::default();
     let mut commit_stats = CommitStats::default();
     let mut current_color_ids: Option<Arc<Vec<u32>>> = None;
@@ -1369,11 +1807,11 @@ fn write_compressed_from_stream(
     let mut group_seqs: Vec<Vec<u8>> = Vec::new();
     let mut group_run_paths: Vec<PathBuf> = Vec::new();
     let mut pending_group_tasks: Vec<GroupTask> = Vec::with_capacity(GROUP_WORK_BATCH_GROUPS);
-    let mut pending_group_task_seq_bytes: usize = 0;
+    let mut pending_group_resident_bytes: usize = 0;
     let mut group_bytes: usize = 0;
-    let mut group_total_seq_bytes: usize = 0;
     let mut submitted_groups: usize = 0;
-    let mut rr_index = 0usize;
+    let group_batch_budget = memory_budget.group_batch_bytes();
+    let group_spill_threshold = GROUP_SORT_SPILL_BYTES.min((group_batch_budget / 2).max(1));
     let dispatch_timer = PhaseTimer::start();
 
     for batch in record_rx {
@@ -1389,32 +1827,24 @@ fn write_compressed_from_stream(
             if key_changed {
                 if let Some(ids) = current_ids_zero_based.take() {
                     if !group_seqs.is_empty() || !group_run_paths.is_empty() {
-                        pending_group_tasks.push(GroupTask {
+                        let task = GroupTask {
                             cid: submitted_groups,
                             dataset_ids_zero_based: ids,
                             seqs: std::mem::take(&mut group_seqs),
                             run_paths: std::mem::take(&mut group_run_paths),
-                        });
-                        pending_group_task_seq_bytes =
-                            pending_group_task_seq_bytes.saturating_add(group_total_seq_bytes);
+                        };
+                        pending_group_resident_bytes = pending_group_resident_bytes
+                            .saturating_add(group_task_resident_bytes(&task));
+                        pending_group_tasks.push(task);
                         submitted_groups += 1;
                         if pending_group_tasks.len() >= GROUP_WORK_BATCH_GROUPS
-                            || pending_group_task_seq_bytes >= GROUP_WORK_BATCH_SEQ_BYTES
+                            || pending_group_resident_bytes >= group_batch_budget
                         {
-                            let work = GroupWorkItem {
-                                tasks: std::mem::take(&mut pending_group_tasks),
-                                spill_dir: group_spill_dir.clone(),
-                            };
-                            pending_group_task_seq_bytes = 0;
-                            worker_inputs[rr_index % worker_inputs.len()]
-                                .send(Some(work))
-                                .map_err(|err| {
-                                    io::Error::other(format!("group worker channel closed: {err}"))
-                                })?;
-                            rr_index += 1;
-                            drain_available_group_results(
-                                &result_rx,
-                                &mut pending_results,
+                            process_and_commit_group_batch(
+                                &mut pending_group_tasks,
+                                &mut pending_group_resident_bytes,
+                                &group_spill_dir,
+                                &pool,
                                 &mut writer,
                                 &mut worker_stats,
                                 &mut commit_stats,
@@ -1425,17 +1855,15 @@ fn write_compressed_from_stream(
 
                 current_ids_zero_based = Some(map_color_ids_to_zero_based(
                     &record.color_ids,
-                    writer.spill_writers.len(),
+                    nb_files as usize,
                 )?);
                 current_color_ids = Some(Arc::clone(&record.color_ids));
                 group_bytes = 0;
-                group_total_seq_bytes = 0;
             }
 
             group_bytes += record.seq.len();
-            group_total_seq_bytes += record.seq.len();
             group_seqs.push(record.seq);
-            if group_bytes >= GROUP_SORT_SPILL_BYTES {
+            if group_bytes >= group_spill_threshold {
                 sort_and_spill_sequence_run(
                     &mut group_seqs,
                     &mut group_run_paths,
@@ -1448,61 +1876,32 @@ fn write_compressed_from_stream(
 
     if let Some(ids) = current_ids_zero_based.take() {
         if !group_seqs.is_empty() || !group_run_paths.is_empty() {
-            pending_group_tasks.push(GroupTask {
+            let task = GroupTask {
                 cid: submitted_groups,
                 dataset_ids_zero_based: ids,
                 seqs: std::mem::take(&mut group_seqs),
                 run_paths: std::mem::take(&mut group_run_paths),
-            });
+            };
+            pending_group_resident_bytes =
+                pending_group_resident_bytes.saturating_add(group_task_resident_bytes(&task));
+            pending_group_tasks.push(task);
             submitted_groups += 1;
         }
     }
 
-    if !pending_group_tasks.is_empty() {
-        let work = GroupWorkItem {
-            tasks: std::mem::take(&mut pending_group_tasks),
-            spill_dir: group_spill_dir.clone(),
-        };
-        worker_inputs[rr_index % worker_inputs.len()]
-            .send(Some(work))
-            .map_err(|err| io::Error::other(format!("group worker channel closed: {err}")))?;
-    }
+    process_and_commit_group_batch(
+        &mut pending_group_tasks,
+        &mut pending_group_resident_bytes,
+        &group_spill_dir,
+        &pool,
+        &mut writer,
+        &mut worker_stats,
+        &mut commit_stats,
+    )?;
     let dispatch_timing = dispatch_timer.finish();
-
-    for input in worker_inputs {
-        let _ = input.send(None);
-    }
-
-    let wait_results_timer = PhaseTimer::start();
-    while writer.cid < submitted_groups {
-        let received = result_rx.recv().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("group worker results closed early: {err}"),
-            )
-        })?;
-        absorb_group_result(
-            received,
-            &mut pending_results,
-            &mut writer,
-            &mut worker_stats,
-            &mut commit_stats,
-        )?;
-    }
-    let wait_results_timing = wait_results_timer.finish();
-
-    let join_workers_timer = PhaseTimer::start();
-    for handle in worker_handles {
-        if handle.join().is_err() {
-            return Err(io::Error::other("group worker panicked"));
-        }
-    }
-    let join_workers_timing = join_workers_timer.finish();
-
-    let pos_nb_unitig = writer.finalize()?;
+    let finalized = writer.finalize()?;
     let _ = fs::remove_dir_all(&group_spill_dir);
 
-    log_phase_timing("post_ggcat_stream.setup_workers", setup_workers_timing);
     log_phase_timing("post_ggcat_stream.dispatch_records", dispatch_timing);
     log_phase_timing(
         "post_ggcat_stream.worker_groups_total",
@@ -1518,11 +1917,9 @@ fn write_compressed_from_stream(
             cpu_sec: commit_stats.timing.cpu_sec,
         },
     );
-    log_phase_timing("post_ggcat_stream.wait_results", wait_results_timing);
-    log_phase_timing("post_ggcat_stream.join_workers", join_workers_timing);
     log_phase_timing("post_ggcat_stream.total", total_timer.finish());
     println!(
-        "[phase-stats] phase=post_ggcat_stream workers={} groups_submitted={} groups_processed={} groups_committed={} commit_tigs_bytes={} commit_sizes_bytes={} worker_max_group_wall_s={:.3} worker_max_group_cpu_s={}",
+        "[phase-stats] phase=post_ggcat_stream workers={} groups_submitted={} groups_processed={} groups_committed={} commit_tigs_bytes={} commit_sizes_bytes={} worker_max_batch_wall_s={:.3} worker_max_batch_cpu_s={}",
         worker_count,
         submitted_groups,
         worker_stats.groups,
@@ -1536,29 +1933,22 @@ fn write_compressed_from_stream(
             .unwrap_or_else(|| "NA".to_string())
     );
 
-    Ok((pos_nb_unitig, spill_paths, spill_dir))
+    Ok(finalized)
 }
 
-fn write_positions(pos_nb_unitigs: Vec<(u64, u64)>, filepath: String) -> Result<()> {
+fn write_positions_from_spill(
+    position_spill_path: &Path,
+    entries: u64,
+    filepath: String,
+) -> Result<()> {
     let mut pos_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(filepath)?);
     pos_file.write_all(POSITIONS_MAGIC)?;
-    write_varint_u64_to_writer(pos_nb_unitigs.len() as u64, &mut pos_file)?;
-
-    let mut prev_tigs = 0u64;
-    let mut prev_sizes = 0u64;
-    for (tigs_pos, sizes_pos) in &pos_nb_unitigs {
-        if *tigs_pos < prev_tigs || *sizes_pos < prev_sizes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "positions are not monotonic",
-            ));
-        }
-        write_varint_u64_to_writer(*tigs_pos - prev_tigs, &mut pos_file)?;
-        write_varint_u64_to_writer(*sizes_pos - prev_sizes, &mut pos_file)?;
-        prev_tigs = *tigs_pos;
-        prev_sizes = *sizes_pos;
-    }
+    write_varint_u64_to_writer(entries, &mut pos_file)?;
+    let mut spill_reader =
+        BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(position_spill_path)?);
+    io::copy(&mut spill_reader, &mut pos_file)?;
     pos_file.flush()?;
+    fs::remove_file(position_spill_path)?;
     Ok(())
 }
 
@@ -1573,139 +1963,361 @@ fn create_id_cid_spill_dir(output_dir: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn build_id_cid_payload_from_spill(path: &Path, cid_file_path: &str) -> std::io::Result<Vec<u8>> {
-    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(path)?);
-    let mut raw_payload = Vec::new();
-    let mut prev_cid = 0usize;
+fn read_optional_varint_u64(reader: &mut impl Read) -> Result<Option<u64>> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    let mut saw_byte = false;
     loop {
-        let mut raw = [0u8; 8];
-        match std::io::Read::read_exact(&mut reader, &mut raw) {
-            Ok(()) => {
-                let raw_cid = u64::from_le_bytes(raw);
-                let cid = usize::try_from(raw_cid).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "color id {} cannot be represented as usize while writing {}",
-                            raw_cid, cid_file_path
-                        ),
-                    )
-                })?;
-                if cid < prev_cid {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "color ids are not sorted ({} before {}) while writing {}",
-                            prev_cid, cid, cid_file_path
-                        ),
-                    ));
-                }
-                let delta = cid - prev_cid;
-                write_varint_u64(delta as u64, &mut raw_payload);
-                prev_cid = cid;
+        let mut byte = [0u8; 1];
+        match reader.read_exact(&mut byte) {
+            Ok(()) => saw_byte = true,
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !saw_byte => {
+                return Ok(None)
             }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated varint in dataset-to-CID spill record",
+                ))
+            }
+            Err(err) => return Err(err),
+        }
+        value |= ((byte[0] & 0x7f) as u64) << shift;
+        if byte[0] & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID delta varint overflow in dataset-to-CID spill record",
+            ));
         }
     }
-
-    let mut payload = Vec::new();
-    {
-        let mut cid_encoder = Encoder::new(&mut payload, 1)?;
-        cid_encoder.write_all(&raw_payload)?;
-        cid_encoder.finish()?;
-    }
-    Ok(payload)
 }
 
-fn write_id_to_color_id_from_spills(
-    cid_file_path: String,
-    spill_paths: &[PathBuf],
+fn read_required_varint_u64(reader: &mut impl Read) -> Result<u64> {
+    read_optional_varint_u64(reader)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing varint in dataset-to-CID spill record",
+        )
+    })
+}
+
+#[derive(Debug, Default)]
+struct DatasetCidBlocks {
+    last_cid: u64,
+    seen: bool,
+    encoded_deltas: Vec<u8>,
+    blocks: Vec<(u64, u32)>,
+}
+
+fn flush_cid_transpose_block(
+    dataset: &mut DatasetCidBlocks,
+    writer: &mut BufWriter<File>,
+    spool_offset: &mut u64,
+) -> Result<()> {
+    if dataset.encoded_deltas.is_empty() {
+        return Ok(());
+    }
+    let block_len = u32::try_from(dataset.encoded_deltas.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dataset-to-CID transpose block is larger than u32",
+        )
+    })?;
+    dataset.blocks.push((*spool_offset, block_len));
+    writer.write_all(&dataset.encoded_deltas)?;
+    *spool_offset = spool_offset
+        .checked_add(block_len as u64)
+        .ok_or_else(|| io::Error::other("dataset-to-CID transpose offset overflow"))?;
+    dataset.encoded_deltas.clear();
+    Ok(())
+}
+
+fn transpose_cid_partition(
+    path: &Path,
+    partition_index: usize,
     spill_dir: &Path,
-    worker_threads: usize,
+    datasets_per_partition: usize,
+    dataset_count: usize,
+    payload_writer: &mut DatasetPayloadWriter,
+) -> Result<(u64, u64)> {
+    let dataset_start = partition_index.saturating_mul(datasets_per_partition);
+    let dataset_end = dataset_start
+        .saturating_add(datasets_per_partition)
+        .min(dataset_count);
+    let mut datasets = (dataset_start..dataset_end)
+        .map(|_| DatasetCidBlocks::default())
+        .collect::<Vec<_>>();
+    let spool_path = spill_dir.join(format!("partition_{partition_index:04}.transpose.bin"));
+    let mut spool_writer =
+        BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&spool_path)?);
+    let mut spool_offset = 0u64;
+    let mut records = 0u64;
+
+    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(path)?);
+    let mut cid = 0u64;
+    while let Some(cid_delta) = read_optional_varint_u64(&mut reader)? {
+        cid = cid.checked_add(cid_delta).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "CID overflow in transpose spill")
+        })?;
+        let count = usize::try_from(read_required_varint_u64(&mut reader)?).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "dataset count cannot fit usize")
+        })?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty CID group in dataset transpose spill",
+            ));
+        }
+        let mut dataset = dataset_start;
+        for _ in 0..count {
+            let dataset_delta = usize::try_from(read_required_varint_u64(&mut reader)?).map_err(
+                |_| io::Error::new(io::ErrorKind::InvalidData, "dataset delta cannot fit usize"),
+            )?;
+            dataset = dataset.checked_add(dataset_delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "dataset index overflow")
+            })?;
+            if dataset < dataset_start || dataset >= dataset_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "dataset {} is outside partition {} range [{}, {})",
+                        dataset, partition_index, dataset_start, dataset_end
+                    ),
+                ));
+            }
+            let state = &mut datasets[dataset - dataset_start];
+            if state.seen && cid < state.last_cid {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CIDs for dataset {} are not monotonic: {} before {}",
+                        dataset, state.last_cid, cid
+                    ),
+                ));
+            }
+            let delta = if state.seen { cid - state.last_cid } else { cid };
+            write_varint_u64(delta, &mut state.encoded_deltas);
+            state.last_cid = cid;
+            state.seen = true;
+            records += 1;
+            if state.encoded_deltas.len() >= CID_TRANSPOSE_BLOCK_BYTES {
+                flush_cid_transpose_block(state, &mut spool_writer, &mut spool_offset)?;
+            }
+        }
+    }
+
+    for state in &mut datasets {
+        flush_cid_transpose_block(state, &mut spool_writer, &mut spool_offset)?;
+    }
+    spool_writer.flush()?;
+    drop(spool_writer);
+    fs::remove_file(path)?;
+
+    let mut spool_reader = File::open(&spool_path)?;
+    let mut block_buffer = Vec::new();
+    for (local_dataset, state) in datasets.into_iter().enumerate() {
+        if !state.seen {
+            continue;
+        }
+        let dataset = dataset_start + local_dataset;
+        for (offset, len) in state.blocks {
+            spool_reader.seek(SeekFrom::Start(offset))?;
+            block_buffer.resize(len as usize, 0);
+            spool_reader.read_exact(&mut block_buffer)?;
+            payload_writer.append_encoded_deltas(dataset, &block_buffer)?;
+        }
+    }
+    drop(spool_reader);
+    fs::remove_file(&spool_path)?;
+    Ok((records, spool_offset))
+}
+
+struct DatasetPayloadWriter {
+    output: BufWriter<File>,
+    offsets: Vec<usize>,
+    dataset_count: usize,
+    total_size: usize,
+    current_dataset: Option<usize>,
+    payload_path: PathBuf,
+    payload_encoder: Option<Encoder<'static, File>>,
+    payload_bytes: u64,
+}
+
+impl DatasetPayloadWriter {
+    fn new(path: &str, spill_dir: &Path, dataset_count: usize) -> Result<Self> {
+        let mut output = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(path)?);
+        output.write_all(ID_TO_CID_MAGIC)?;
+        Ok(Self {
+            output,
+            offsets: Vec::with_capacity(dataset_count),
+            dataset_count,
+            total_size: ID_TO_CID_MAGIC.len(),
+            current_dataset: None,
+            payload_path: spill_dir.join("dataset_payload.zst.tmp"),
+            payload_encoder: None,
+            payload_bytes: 0,
+        })
+    }
+
+    fn start_dataset(&mut self, dataset: usize) -> Result<()> {
+        if self.current_dataset.is_some() {
+            return Err(io::Error::other(
+                "cannot start dataset payload before finishing the previous payload",
+            ));
+        }
+        let payload_file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.payload_path)?;
+        let encoder = Encoder::new(payload_file, 1)?;
+        self.current_dataset = Some(dataset);
+        self.payload_encoder = Some(encoder);
+        Ok(())
+    }
+
+    fn finish_dataset(&mut self) -> Result<()> {
+        let dataset = self
+            .current_dataset
+            .take()
+            .ok_or_else(|| io::Error::other("no active dataset payload"))?;
+        let encoder = self
+            .payload_encoder
+            .take()
+            .ok_or_else(|| io::Error::other("missing dataset payload encoder"))?;
+        let mut payload_file = encoder.finish()?;
+        let payload_len = payload_file.seek(SeekFrom::End(0))?;
+        payload_file.seek(SeekFrom::Start(0))?;
+        self.offsets.push(self.total_size);
+        self.output.write_all(&payload_len.to_le_bytes())?;
+        io::copy(&mut payload_file, &mut self.output)?;
+        self.total_size = self
+            .total_size
+            .checked_add(8)
+            .and_then(|size| size.checked_add(payload_len as usize))
+            .ok_or_else(|| io::Error::other("id-to-CID output size overflow"))?;
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_len);
+        drop(payload_file);
+        debug_assert_eq!(self.offsets.len(), dataset + 1);
+        Ok(())
+    }
+
+    fn advance_to(&mut self, dataset: usize) -> Result<()> {
+        if let Some(current) = self.current_dataset {
+            if dataset < current {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "dataset spill order regressed from {} to {}",
+                        current, dataset
+                    ),
+                ));
+            }
+            if dataset == current {
+                return Ok(());
+            }
+            self.finish_dataset()?;
+        }
+        while self.offsets.len() < dataset {
+            let missing = self.offsets.len();
+            self.start_dataset(missing)?;
+            self.finish_dataset()?;
+        }
+        self.start_dataset(dataset)
+    }
+
+    fn append_encoded_deltas(&mut self, dataset: usize, encoded_deltas: &[u8]) -> Result<()> {
+        if dataset >= self.dataset_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "dataset {} outside [0, {}) in transposed dataset-to-CID spill",
+                    dataset, self.dataset_count
+                ),
+            ));
+        }
+        self.advance_to(dataset)?;
+        self.payload_encoder
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing dataset payload encoder"))?
+            .write_all(encoded_deltas)
+    }
+
+    fn finish(mut self, dataset_count: usize) -> Result<(Vec<usize>, u64)> {
+        if self.current_dataset.is_some() {
+            self.finish_dataset()?;
+        }
+        while self.offsets.len() < dataset_count {
+            let dataset = self.offsets.len();
+            self.start_dataset(dataset)?;
+            self.finish_dataset()?;
+        }
+        if self.offsets.len() != dataset_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dataset-to-CID spill contains an out-of-range dataset",
+            ));
+        }
+        self.output.write_all(&0u64.to_le_bytes())?;
+        self.output.flush()?;
+        if self.payload_path.exists() {
+            fs::remove_file(&self.payload_path)?;
+        }
+        Ok((self.offsets, self.payload_bytes))
+    }
+}
+
+fn write_id_to_color_id_from_partitions(
+    cid_file_path: String,
+    spill: DatasetCidSpillFiles,
+    _memory_budget: CompressionMemoryBudget,
 ) -> std::io::Result<Vec<usize>> {
     let total_timer = PhaseTimer::start();
-    let mut cid_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&cid_file_path)?);
-    cid_file.write_all(ID_TO_CID_MAGIC)?;
-    let mut id_cid_line_sizes = Vec::with_capacity(spill_paths.len());
-    let mut tot_size = ID_TO_CID_MAGIC.len();
-    let mut per_dataset_timing = TimingAccumulator::default();
-    let mut total_payload_bytes = 0usize;
-    let mut payloads: Vec<Option<Vec<u8>>> = vec![None; spill_paths.len()];
-
-    if spill_paths.len() <= 1 || worker_threads <= 1 {
-        for (idx, path) in spill_paths.iter().enumerate() {
-            let dataset_timer = PhaseTimer::start();
-            let payload = build_id_cid_payload_from_spill(path, &cid_file_path)?;
-            let _ = fs::remove_file(path);
-            per_dataset_timing.add(dataset_timer.finish());
-            payloads[idx] = Some(payload);
-        }
-    } else {
-        let max_threads = worker_threads.max(1).min(spill_paths.len());
-        let build_payloads = || -> io::Result<Vec<(usize, Vec<u8>, PhaseTiming)>> {
-            spill_paths
-                .par_iter()
-                .enumerate()
-                .map(|(idx, path)| -> io::Result<(usize, Vec<u8>, PhaseTiming)> {
-                    let dataset_timer = PhaseTimer::start();
-                    let payload = build_id_cid_payload_from_spill(path, &cid_file_path)?;
-                    let _ = fs::remove_file(path);
-                    Ok((idx, payload, dataset_timer.finish()))
-                })
-                .collect()
-        };
-
-        let results = match rayon::ThreadPoolBuilder::new()
-            .num_threads(max_threads)
-            .build()
-        {
-            Ok(pool) => pool.install(build_payloads),
-            Err(_) => build_payloads(),
-        }?;
-
-        for (idx, payload, timing) in results {
-            per_dataset_timing.add(timing);
-            payloads[idx] = Some(payload);
-        }
+    let mut payload_writer =
+        DatasetPayloadWriter::new(&cid_file_path, &spill.directory, spill.dataset_count)?;
+    let mut transposed_records = 0u64;
+    let mut transpose_bytes = 0u64;
+    for (partition_index, path) in spill.paths.iter().enumerate() {
+        let (records, bytes) = transpose_cid_partition(
+            path,
+            partition_index,
+            &spill.directory,
+            spill.datasets_per_partition,
+            spill.dataset_count,
+            &mut payload_writer,
+        )?;
+        transposed_records = transposed_records.saturating_add(records);
+        transpose_bytes = transpose_bytes.saturating_add(bytes);
     }
-
-    for payload in payloads {
-        let payload = payload
-            .ok_or_else(|| io::Error::other("missing id->cid payload after spill processing"))?;
-        id_cid_line_sizes.push(tot_size);
-        tot_size += 8 + payload.len();
-        total_payload_bytes += payload.len();
-        cid_file.write_all(&(payload.len() as u64).to_le_bytes())?;
-        cid_file.write_all(&payload)?;
-    }
-
-    cid_file.write_all(&(0_u64).to_le_bytes())?;
-    cid_file.flush()?;
-    let _ = fs::remove_dir(spill_dir);
-    log_phase_timing(
-        "post_ggcat.id_to_cid.per_dataset_total",
-        PhaseTiming {
-            wall_sec: per_dataset_timing.wall_sec,
-            cpu_sec: per_dataset_timing.cpu_sec,
-        },
-    );
+    let (offsets, total_payload_bytes) = payload_writer.finish(spill.dataset_count)?;
+    let _ = fs::remove_dir(&spill.directory);
     log_phase_timing("post_ggcat.id_to_cid.total", total_timer.finish());
     println!(
-        "[phase-stats] phase=post_ggcat.id_to_cid datasets={} payload_bytes={}",
-        spill_paths.len(),
+        "[phase-stats] phase=post_ggcat.id_to_cid datasets={} partitions={} datasets_per_partition={} transposed_records={} transpose_bytes={} payload_bytes={}",
+        spill.dataset_count,
+        spill.paths.len(),
+        spill.datasets_per_partition,
+        transposed_records,
+        transpose_bytes,
         total_payload_bytes
     );
-    Ok(id_cid_line_sizes)
+    Ok(offsets)
 }
 
 pub(crate) fn sort_by_bucket_streaming(
     output_dir: &String,
     nb_files: u32,
     worker_threads: usize,
+    memory_gb: usize,
     record_rx: mpsc::Receiver<SimplitigBatch>,
 ) -> Vec<usize> {
     let total_timer = PhaseTimer::start();
+    let memory_budget = CompressionMemoryBudget::from_gb(memory_gb);
     println!("Starting writing compressed sequences (streaming).");
     let write_stream_timer = PhaseTimer::start();
     let triple = match write_compressed_from_stream(
@@ -1713,6 +2325,7 @@ pub(crate) fn sort_by_bucket_streaming(
         output_dir,
         nb_files,
         worker_threads,
+        memory_budget,
         record_rx,
     ) {
         Ok(res_pair) => res_pair,
@@ -1724,14 +2337,11 @@ pub(crate) fn sort_by_bucket_streaming(
         write_stream_timing.wall_sec
     );
     log_phase_timing("post_ggcat.write_stream", write_stream_timing);
-    let pos_nb_unitig = triple.0;
-    let spill_paths = triple.1;
-    let spill_dir = triple.2;
-
     let position_timer = PhaseTimer::start();
     println!("Starting to write positions");
-    if let Err(e) = write_positions(
-        pos_nb_unitig,
+    if let Err(e) = write_positions_from_spill(
+        &triple.position_path,
+        triple.position_entries,
         String::from(output_dir.clone() + "positions_kloe.bin"),
     ) {
         panic!("Error writting positions: {e:?}");
@@ -1743,11 +2353,10 @@ pub(crate) fn sort_by_bucket_streaming(
     );
     log_phase_timing("post_ggcat.write_positions", position_timing);
     let id_timer = PhaseTimer::start();
-    let write_id_cid = match write_id_to_color_id_from_spills(
+    let write_id_cid = match write_id_to_color_id_from_partitions(
         output_dir.clone() + "id_to_color_id.txt.zst",
-        &spill_paths,
-        &spill_dir,
-        worker_threads,
+        triple.cid_spill,
+        memory_budget,
     ) {
         Ok(id_cid_line_sizes) => id_cid_line_sizes,
         Err(e) => panic!("error writting id to color id list: {e:?}"),
@@ -1768,7 +2377,7 @@ fn stream_sorted_records_from_chunks(
     let mut readers = Vec::with_capacity(chunk_paths.len());
     for path in chunk_paths {
         readers.push(BufReader::with_capacity(
-            IO_BUFFER_CAPACITY,
+            COLOR_RUN_BUFFER_BYTES,
             File::open(path)?,
         ));
     }
@@ -1796,8 +2405,94 @@ fn stream_sorted_records_from_chunks(
     Ok(())
 }
 
+fn reduce_sorted_color_chunks(mut chunks: Vec<PathBuf>, chunk_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut merge_pass = 0usize;
+    while chunks.len() > COLOR_MERGE_FAN_IN {
+        let mut next_chunks = Vec::with_capacity(chunks.len().div_ceil(COLOR_MERGE_FAN_IN));
+        for (group_index, group) in chunks.chunks(COLOR_MERGE_FAN_IN).enumerate() {
+            if group.len() == 1 {
+                next_chunks.push(group[0].clone());
+                continue;
+            }
+            let path = chunk_dir.join(format!("color_merge_{merge_pass:03}_{group_index:06}.bin"));
+            let mut writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&path)?);
+            stream_sorted_records_from_chunks(group, |record| {
+                write_sorted_color_record(&mut writer, &record)
+            })?;
+            writer.flush()?;
+            for old_path in group {
+                fs::remove_file(old_path)?;
+            }
+            next_chunks.push(path);
+        }
+        chunks = next_chunks;
+        merge_pass += 1;
+    }
+    Ok(chunks)
+}
+
+struct StructuredGgcatCapture {
+    chunk_files: Vec<PathBuf>,
+    chunk_flush_metrics: ChunkFlushMetrics,
+    input_sequences_count: usize,
+    emitted_segments_count: usize,
+    initial_chunk_count: usize,
+}
+
+fn capture_structured_ggcat_output(
+    receiver: mpsc::Receiver<Vec<u8>>,
+    chunk_dir: PathBuf,
+    memory_budget: CompressionMemoryBudget,
+    k: usize,
+) -> Result<StructuredGgcatCapture> {
+    let mut records = Vec::new();
+    let mut chunk_files = Vec::new();
+    let mut chunk_bytes = 0usize;
+    let mut chunk_flush_metrics = ChunkFlushMetrics::default();
+    let mut input_sequences_count = 0usize;
+    let mut emitted_segments_count = 0usize;
+
+    for block in receiver {
+        let (sequences, segments) = visit_structured_ggcat_block(&block, k, |record| {
+            chunk_bytes = chunk_bytes
+                .saturating_add(std::mem::size_of::<ColorIndexType>() + record.seq.len());
+            records.push(record);
+            if chunk_bytes >= memory_budget.color_chunk_bytes() {
+                flush_sorted_chunk_timed(
+                    &mut records,
+                    &mut chunk_files,
+                    &chunk_dir,
+                    &mut chunk_flush_metrics,
+                )?;
+                chunk_bytes = 0;
+            }
+            Ok(())
+        })?;
+        input_sequences_count = input_sequences_count.saturating_add(sequences);
+        emitted_segments_count = emitted_segments_count.saturating_add(segments);
+    }
+
+    flush_sorted_chunk_timed(
+        &mut records,
+        &mut chunk_files,
+        &chunk_dir,
+        &mut chunk_flush_metrics,
+    )?;
+    let initial_chunk_count = chunk_files.len();
+    let chunk_files = reduce_sorted_color_chunks(chunk_files, &chunk_dir)?;
+    Ok(StructuredGgcatCapture {
+        chunk_files,
+        chunk_flush_metrics,
+        input_sequences_count,
+        emitted_segments_count,
+        initial_chunk_count,
+    })
+}
+
 fn produce_ggcat_records(
-    filenames: Vec<String>,
+    input_streams: Vec<GeneralSequenceBlockData>,
+    source_dataset_ids: SourceDatasetMap,
+    dataset_count: usize,
     threads: usize,
     k: usize,
     m: usize,
@@ -1807,14 +2502,14 @@ fn produce_ggcat_records(
     ggcat_cfg: GgcatCompressionConfig,
     sender: mpsc::SyncSender<SimplitigBatch>,
 ) -> Result<()> {
-    let dataset_count = filenames.len();
-    if dataset_count == 0 {
+    let source_count = source_dataset_ids.len();
+    let memory_budget = CompressionMemoryBudget::from_gb(ggcat_cfg.memory_gb);
+    if source_count == 0 || input_streams.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "input file list is empty",
+            "ggcat source list is empty",
         ));
     }
-
     let ggcat_temp_root = if ggcat_cfg.temp_dir.is_empty() {
         std::env::temp_dir().join(format!("kloe-ggcat-shared-{}", std::process::id()))
     } else {
@@ -1828,14 +2523,15 @@ fn produce_ggcat_records(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    let raw_records_file = ggcat_temp_root.join(format!("kloe-color-records-{pid}-{nanos}.tmp"));
+    let structured_output_key =
+        ggcat_temp_root.join(format!("kloe-color-stream-{pid}-{nanos}.tmp"));
     let chunk_dir = ggcat_temp_root.join(format!("kloe-color-chunks-{pid}-{nanos}"));
     fs::create_dir_all(&chunk_dir)?;
 
     let instance = GGCATInstance::create(GGCATConfig {
         temp_dir: Some(ggcat_temp_root.clone()),
-        memory: ggcat_cfg.memory_gb.max(1) as f64,
-        prefer_memory: true,
+        memory: memory_budget.ggcat_memory_gb(),
+        prefer_memory: false,
         total_threads_count: threads.max(1),
         intermediate_compression_level: None,
         stats_file: None,
@@ -1843,32 +2539,41 @@ fn produce_ggcat_records(
     })
     .map_err(|e| to_io_err("create ggcat instance", e))?;
 
-    let input_streams = filenames
-        .iter()
-        .map(|file| {
-            let path = PathBuf::from(file);
-            let resolved = fs::canonicalize(&path).unwrap_or(path);
-            GeneralSequenceBlockData::FASTA((resolved, None))
-        })
-        .collect::<Vec<_>>();
-
-    let color_names = (1..=dataset_count)
+    let color_names = (0..source_count)
         .map(|idx| idx.to_string())
         .collect::<Vec<_>>();
 
     println!(
-        "Running embedded ggcat build-colored-fasta path (k={}, m={}, threads={}, memory={}GB)",
+        "Running embedded ggcat structured-output path (k={}, m={}, threads={}, sources={}, datasets={}, total_memory={}GB, ggcat_memory={:.2}GB, disk_backed=true)",
         k,
         m,
         threads.max(1),
-        ggcat_cfg.memory_gb.max(1)
+        source_count,
+        dataset_count,
+        ggcat_cfg.memory_gb.max(1),
+        memory_budget.ggcat_memory_gb()
     );
 
+    let (structured_tx, structured_rx) = mpsc::sync_channel::<Vec<u8>>(2);
+    if !register_channel_output(structured_output_key.clone(), structured_tx) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "a GGCAT structured output is already registered for {}",
+                structured_output_key.display()
+            ),
+        ));
+    }
+    let capture_chunk_dir = chunk_dir.clone();
+    let capture_thread = thread::spawn(move || {
+        capture_structured_ggcat_output(structured_rx, capture_chunk_dir, memory_budget, k)
+    });
+
     let ggcat_build_timer = PhaseTimer::start();
-    let records_output = instance
+    let build_result = instance
         .build_graph(
             input_streams,
-            raw_records_file,
+            structured_output_key.clone(),
             Some(&color_names),
             k,
             threads.max(1),
@@ -1878,8 +2583,13 @@ fn produce_ggcat_records(
             1,
             ggcat_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
             None,
-        )
-        .map_err(|e| to_io_err("ggcat build_graph", e))?;
+        );
+    unregister_channel_output(&structured_output_key);
+    let capture_result = capture_thread
+        .join()
+        .map_err(|_| io::Error::other("GGCAT structured-output capture thread panicked"))?;
+    let records_output = build_result.map_err(|e| to_io_err("ggcat build_graph", e))?;
+    let captured = capture_result?;
     log_phase_timing("ggcat.build_graph_api_call", ggcat_build_timer.finish());
 
     let colormap_file = GGCATInstance::get_colormap_file(&records_output);
@@ -1888,11 +2598,11 @@ fn produce_ggcat_records(
             .map_err(|e| to_io_err("open ggcat colormap", e))?;
 
     let colors_count = colors_deserializer.colors_count();
-    if colors_count != dataset_count {
+    if colors_count != source_count {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "ggcat returned {colors_count} colors but KLOE loaded {dataset_count} datasets"
+                "ggcat returned {colors_count} colors but KLOE registered {source_count} sources"
             ),
         ));
     }
@@ -1910,188 +2620,107 @@ fn produce_ggcat_records(
             ),
         ));
     }
-    let mut color_index_to_dataset_index = Vec::with_capacity(colors_count);
+    let mut color_index_to_source_index = Vec::with_capacity(colors_count);
     for color_name in dumped_colors {
         let parsed = color_name.parse::<usize>().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "ggcat color name '{}' is not a dataset index; expected numeric names",
+                    "ggcat color name '{}' is not a source index; expected numeric names",
                     color_name
                 ),
             )
         })?;
-        if parsed == 0 || parsed > dataset_count {
+        if parsed >= source_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "ggcat color name '{}' maps outside dataset range [1, {}]",
-                    color_name, dataset_count
+                    "ggcat color name '{}' maps outside source range [0, {})",
+                    color_name, source_count
                 ),
             ));
         }
-        color_index_to_dataset_index.push(parsed - 1);
+        color_index_to_source_index.push(parsed);
     }
 
     let keep_ggcat = std::env::var_os("KLOE_KEEP_GGCAT").is_some();
     let process_result = (|| -> Result<()> {
         let producer_total_timer = PhaseTimer::start();
-        let mut records = Vec::new();
-        let mut chunk_files = Vec::new();
-        let mut chunk_bytes = 0usize;
-        let mut chunk_flush_metrics = ChunkFlushMetrics::default();
-        let mut input_sequences_count = 0usize;
-        let mut emitted_segments_count = 0usize;
-        let mut unique_subsets = HashSet::<ColorIndexType>::new();
+        let StructuredGgcatCapture {
+            chunk_files,
+            chunk_flush_metrics,
+            input_sequences_count,
+            emitted_segments_count,
+            initial_chunk_count,
+        } = captured;
 
-        let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(&records_output)?);
-        let mut line = Vec::new();
-        let mut current_header: Option<Vec<u8>> = None;
-        let mut current_seq: Vec<u8> = Vec::new();
-        let mut entry_batch: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(PRODUCER_PARSE_BATCH_ENTRIES);
-        let mut entry_batch_bytes = 0usize;
-        let parse_timer = PhaseTimer::start();
-
-        let mut flush_entry_batch =
-            |entries: &mut Vec<(Vec<u8>, Vec<u8>)>, batch_bytes: &mut usize| -> Result<()> {
-                if entries.is_empty() {
-                    return Ok(());
-                }
-                let entries_local = std::mem::take(entries);
-                *batch_bytes = 0;
-
-                let parsed_batches = entries_local
-                    .into_par_iter()
-                    .map(|(header, seq)| parse_entry_color_segments(&header, &seq, k))
-                    .collect::<Result<Vec<_>>>()?;
-
-                input_sequences_count += parsed_batches.len();
-                for mut segments in parsed_batches {
-                    emitted_segments_count += segments.len();
-                    for record in segments.drain(..) {
-                        unique_subsets.insert(record.subset);
-                        chunk_bytes += std::mem::size_of::<ColorIndexType>() + record.seq.len();
-                        records.push(record);
-                        if chunk_bytes >= COLOR_CHUNK_TARGET_BYTES {
-                            flush_sorted_chunk_timed(
-                                &mut records,
-                                &mut chunk_files,
-                                &chunk_dir,
-                                &mut chunk_flush_metrics,
-                            )?;
-                            chunk_bytes = 0;
-                        }
-                    }
-                }
-                Ok(())
-            };
-
-        loop {
-            line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
-                if let Some(header) = current_header.take() {
-                    entry_batch_bytes += header.len() + current_seq.len();
-                    entry_batch.push((header, std::mem::take(&mut current_seq)));
-                }
-                flush_entry_batch(&mut entry_batch, &mut entry_batch_bytes)?;
-                break;
-            }
-
-            while matches!(line.last(), Some(b'\n' | b'\r')) {
-                line.pop();
-            }
-            if line.is_empty() {
-                continue;
-            }
-            if line[0] == b'>' {
-                if let Some(header) = current_header.take() {
-                    entry_batch_bytes += header.len() + current_seq.len();
-                    entry_batch.push((header, std::mem::take(&mut current_seq)));
-                    if entry_batch.len() >= PRODUCER_PARSE_BATCH_ENTRIES
-                        || entry_batch_bytes >= PRODUCER_PARSE_BATCH_BYTES
-                    {
-                        flush_entry_batch(&mut entry_batch, &mut entry_batch_bytes)?;
-                    }
-                }
-                current_header = Some(line[1..].to_vec());
-            } else {
-                current_seq.extend_from_slice(&line);
-            }
-        }
-
-        flush_sorted_chunk_timed(
-            &mut records,
-            &mut chunk_files,
-            &chunk_dir,
-            &mut chunk_flush_metrics,
-        )?;
-        let parse_timing = parse_timer.finish();
-
-        let resolve_subsets_timer = PhaseTimer::start();
-        let subset_to_dataset_ids = resolve_subsets_to_dataset_ids(
-            &instance,
-            &colormap_file,
-            &unique_subsets,
-            &color_index_to_dataset_index,
-            dataset_count,
-        )?;
-        let resolve_subsets_timing = resolve_subsets_timer.finish();
-
-        let mut current_subset: Option<ColorIndexType> = None;
-        let mut current_color_ids: Option<Arc<Vec<u32>>> = None;
+        let resolve_and_emit_timer = PhaseTimer::start();
         let mut batch: SimplitigBatch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
+        let mut batch_bytes = 0usize;
+        let mut record_window = Vec::<SortedColorRecord>::new();
+        let mut record_window_bytes = 0usize;
+        let mut record_window_subsets = 0usize;
+        let mut window_last_subset = None;
+        let mut global_last_subset = None;
+        let mut unique_subsets_count = 0usize;
         let mut merged_records_count = 0usize;
         let mut emitted_batches_count = 0usize;
         let mut emitted_records_count = 0usize;
-        let merge_emit_timer = PhaseTimer::start();
+        let window_sequence_limit = memory_budget.subset_window_sequence_bytes();
+        let window_subset_limit = memory_budget.subset_window_count(dataset_count);
 
         stream_sorted_records_from_chunks(&chunk_files, |record| {
             merged_records_count += 1;
-            let color_ids = match current_subset {
-                Some(active_subset) if active_subset == record.subset => {
-                    Arc::clone(current_color_ids.as_ref().expect("color ids must be set"))
-                }
-                _ => {
-                    let ids = subset_to_dataset_ids
-                        .get(&record.subset)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "missing resolved dataset ids for subset {}",
-                                    record.subset
-                                ),
-                            )
-                        })?
-                        .clone();
-                    current_subset = Some(record.subset);
-                    current_color_ids = Some(Arc::clone(&ids));
-                    ids
-                }
-            };
-
-            batch.push(SimplitigRecord {
-                color_ids,
-                seq: record.seq,
-            });
-
-            if batch.len() >= COLOR_RECORD_BATCH_SIZE {
-                let out = std::mem::take(&mut batch);
-                emitted_batches_count += 1;
-                emitted_records_count += out.len();
-                sender.send(out).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("record receiver dropped: {e}"),
-                    )
-                })?;
-                batch = Vec::with_capacity(COLOR_RECORD_BATCH_SIZE);
+            if global_last_subset != Some(record.subset) {
+                unique_subsets_count += 1;
+                global_last_subset = Some(record.subset);
             }
-
+            let is_new_window_subset = window_last_subset != Some(record.subset);
+            if !record_window.is_empty()
+                && (record_window_bytes >= window_sequence_limit
+                    || (is_new_window_subset && record_window_subsets >= window_subset_limit))
+            {
+                emit_resolved_record_window(
+                    &mut record_window,
+                    &instance,
+                    &colormap_file,
+                    &color_index_to_source_index,
+                    &source_dataset_ids,
+                    dataset_count,
+                    &sender,
+                    &mut batch,
+                    &mut batch_bytes,
+                    window_sequence_limit,
+                    &mut emitted_batches_count,
+                    &mut emitted_records_count,
+                )?;
+                record_window_bytes = 0;
+                record_window_subsets = 0;
+                window_last_subset = None;
+            }
+            if window_last_subset != Some(record.subset) {
+                record_window_subsets += 1;
+                window_last_subset = Some(record.subset);
+            }
+            record_window_bytes = record_window_bytes.saturating_add(record.seq.len());
+            record_window.push(record);
             Ok(())
         })?;
+
+        emit_resolved_record_window(
+            &mut record_window,
+            &instance,
+            &colormap_file,
+            &color_index_to_source_index,
+            &source_dataset_ids,
+            dataset_count,
+            &sender,
+            &mut batch,
+            &mut batch_bytes,
+            window_sequence_limit,
+            &mut emitted_batches_count,
+            &mut emitted_records_count,
+        )?;
 
         if !batch.is_empty() {
             emitted_batches_count += 1;
@@ -2104,27 +2733,25 @@ fn produce_ggcat_records(
             })?;
         }
 
-        let merge_emit_timing = merge_emit_timer.finish();
-        log_phase_timing("producer.parse_headers_chunk_sort", parse_timing);
+        let resolve_and_emit_timing = resolve_and_emit_timer.finish();
         log_phase_timing(
-            "producer.chunk_flush_total",
+            "ggcat.structured_capture_chunk_flush_total",
             PhaseTiming {
                 wall_sec: chunk_flush_metrics.timing.wall_sec,
                 cpu_sec: chunk_flush_metrics.timing.cpu_sec,
             },
         );
         log_phase_timing(
-            "producer.resolve_subsets_dataset_ids",
-            resolve_subsets_timing,
+            "producer.resolve_subsets_and_emit_records",
+            resolve_and_emit_timing,
         );
-        log_phase_timing("producer.merge_chunks_emit_records", merge_emit_timing);
         log_phase_timing("producer.total_post_ggcat", producer_total_timer.finish());
         println!(
             "[phase-stats] phase=producer input_sequences={} emitted_segments={} subsets_unique={} chunks={} chunk_flush_calls={} chunk_flush_records={} merged_records={} emitted_batches={} emitted_records={}",
             input_sequences_count,
             emitted_segments_count,
-            unique_subsets.len(),
-            chunk_files.len(),
+            unique_subsets_count,
+            initial_chunk_count,
             chunk_flush_metrics.calls,
             chunk_flush_metrics.records,
             merged_records_count,
@@ -2138,8 +2765,7 @@ fn produce_ggcat_records(
 
     if keep_ggcat {
         eprintln!(
-            "DEBUG_KEEP_GGCAT graph={} colormap={} chunks_dir={}",
-            records_output.display(),
+            "DEBUG_KEEP_GGCAT structured_output=no_file colormap={} chunks_dir={}",
             colormap_file.display(),
             chunk_dir.display()
         );
@@ -2150,6 +2776,76 @@ fn produce_ggcat_records(
     }
 
     process_result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_ggcat_sources(
+    output_dir: &str,
+    filenames: Vec<String>,
+    input_streams: Vec<GeneralSequenceBlockData>,
+    source_dataset_ids: SourceDatasetMap,
+    threads: usize,
+    k: usize,
+    m: usize,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+    ggcat_cfg: GgcatCompressionConfig,
+) -> Result<()> {
+    let dataset_count = filenames.len();
+    if dataset_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input file list is empty",
+        ));
+    }
+
+    println!("Compression backend: embedded ggcat structured output");
+
+    let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigBatch>(2);
+    let producer_cfg = ggcat_cfg.clone();
+
+    let producer = thread::spawn(move || {
+        produce_ggcat_records(
+            input_streams,
+            source_dataset_ids,
+            dataset_count,
+            threads,
+            k,
+            m,
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+            producer_cfg,
+            record_tx,
+        )
+    });
+
+    let sort_start = Instant::now();
+    let id_cid_line_sizes = sort_by_bucket_streaming(
+        &output_dir.to_string(),
+        dataset_count as u32,
+        threads,
+        ggcat_cfg.memory_gb,
+        record_rx,
+    );
+    println!(
+        "Streamed ggcat colored records into KLOE archive in {:.3}s",
+        sort_start.elapsed().as_secs_f64()
+    );
+
+    match producer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return Err(io::Error::other(format!("ggcat producer failed: {err}")));
+        }
+        Err(_) => {
+            return Err(io::Error::other("ggcat producer panicked"));
+        }
+    }
+
+    write_filenames_id_offsets(output_dir, &filenames, &id_cid_line_sizes)?;
+    Ok(())
 }
 
 pub fn compress_with_ggcat(
@@ -2172,57 +2868,124 @@ pub fn compress_with_ggcat(
     }
     if skip_sort {
         eprintln!(
-            "Warning: --skip-sort is ignored; ggcat build-colored-fasta always sorts by colors."
+            "Warning: --skip-sort is ignored; KLOE groups GGCAT structured records by colors."
         );
     }
 
     let filenames = read_input_fof_filenames(input_fof)?;
-    let dataset_count = filenames.len();
-    if dataset_count == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "input file list is empty",
-        ));
+    let input_streams = filenames
+        .iter()
+        .map(|file| {
+            let path = PathBuf::from(file);
+            let resolved = fs::canonicalize(&path).unwrap_or(path);
+            GeneralSequenceBlockData::FASTA((resolved, None))
+        })
+        .collect::<Vec<_>>();
+    let source_dataset_ids = SourceDatasetMap::from_singletons(filenames.len())?;
+
+    compress_ggcat_sources(
+        output_dir,
+        filenames,
+        input_streams,
+        source_dataset_ids,
+        threads,
+        k,
+        m,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
+        ggcat_cfg,
+    )
+}
+
+#[cfg(test)]
+mod structured_output_tests {
+    use super::*;
+    use ggcat_colors::storage::run_length::RunLengthColorsSerializer;
+    use ggcat_colors::storage::serializer::ColorsSerializer;
+
+    #[test]
+    fn source_color_union_is_linear_sorted_and_deduplicated() {
+        let mut ids = vec![1, 3, 7, 9];
+        merge_sorted_dataset_ids(&mut ids, &[2, 3, 8, 9, 10]);
+        assert_eq!(ids, vec![1, 2, 3, 7, 8, 9, 10]);
+
+        merge_sorted_dataset_ids_with_offset(&mut ids, &[1, 2, 5], 10).unwrap();
+        assert_eq!(ids, vec![1, 2, 3, 7, 8, 9, 10, 11, 12, 15]);
     }
 
-    println!("Compression backend: embedded ggcat build-colored-fasta");
+    #[test]
+    fn structured_color_runs_are_split_without_fasta_headers() {
+        let sequence = b"AACCGG";
+        let mut colors = Vec::new();
+        write_varint_u64(2, &mut colors);
+        write_varint_u64(5, &mut colors);
+        write_varint_u64(2, &mut colors);
+        write_varint_u64(7, &mut colors);
+        write_varint_u64(2, &mut colors);
 
-    let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigBatch>(16);
-    let producer_filenames = filenames.clone();
-    let producer_cfg = ggcat_cfg.clone();
+        let mut block = Vec::new();
+        block.extend_from_slice(&11u64.to_le_bytes());
+        block.extend_from_slice(&(sequence.len() as u64).to_le_bytes());
+        block.extend_from_slice(&(colors.len() as u64).to_le_bytes());
+        block.extend_from_slice(&0u64.to_le_bytes());
+        block.extend_from_slice(sequence);
+        block.extend_from_slice(&colors);
 
-    let producer = thread::spawn(move || {
-        produce_ggcat_records(
-            producer_filenames,
-            threads,
-            k,
-            m,
-            use_unitigs,
-            use_matchtigs,
-            use_eulertigs,
-            producer_cfg,
-            record_tx,
-        )
-    });
+        let mut records = Vec::new();
+        let counts = visit_structured_ggcat_block(&block, 3, |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
 
-    let sort_start = Instant::now();
-    let id_cid_line_sizes =
-        sort_by_bucket_streaming(output_dir, dataset_count as u32, threads, record_rx);
-    println!(
-        "Streamed ggcat colored records into KLOE archive in {:.3}s",
-        sort_start.elapsed().as_secs_f64()
-    );
-
-    match producer.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            return Err(io::Error::other(format!("ggcat producer failed: {err}")));
-        }
-        Err(_) => {
-            return Err(io::Error::other("ggcat producer panicked"));
-        }
+        assert_eq!(counts, (1, 2));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].subset, 5);
+        assert_eq!(records[0].seq, b"AACC");
+        assert_eq!(records[1].subset, 7);
+        assert_eq!(records[1].seq, b"CCGG");
     }
 
-    write_filenames_id_offsets(output_dir, &filenames, &id_cid_line_sizes)?;
-    Ok(())
+    #[test]
+    fn parallel_checkpoint_pipeline_preserves_assigned_color_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("colors.dat");
+        let color_names = (0..128).map(|id| id.to_string()).collect::<Vec<_>>();
+        let serializer = Arc::new(
+            ColorsSerializer::<RunLengthColorsSerializer>::new(&path, &color_names, 4, false)
+                .unwrap(),
+        );
+
+        let handles = (0..8)
+            .map(|thread_id| {
+                let serializer = Arc::clone(&serializer);
+                thread::spawn(move || {
+                    let mut assigned = Vec::new();
+                    for index in 0..4_000u32 {
+                        let color = (thread_id * 17 + index) % 128;
+                        let subset_id = serializer.serialize_colors(&[color]);
+                        assigned.push((subset_id, color));
+                    }
+                    assigned
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut assigned = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assigned.sort_unstable_by_key(|(subset_id, _)| *subset_id);
+        Arc::try_unwrap(serializer).ok().unwrap().finalize();
+
+        let mut deserializer =
+            ColorsDeserializer::<RunLengthColorsSerializer>::new(&path, true).unwrap();
+        let mut decoded = Vec::new();
+        for (subset_id, expected_color) in assigned {
+            decoded.clear();
+            deserializer.get_color_mappings(subset_id, &mut decoded);
+            assert_eq!(decoded, [expected_color]);
+        }
+    }
 }

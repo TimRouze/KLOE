@@ -13,7 +13,7 @@ This projects uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers
 
 ```sh
 cargo build -r
-./target/release/kloe compress -i path/to/file/of/file -o output/path -d temporary/folder -t 12
+./target/release/kloe compress -i path/to/file/of/file -o output/path -d temporary/folder -t 12 -r 32
 ```
 Builds are configured to always use optimized profiles and native CPU flags from `.cargo/config.toml`.
 
@@ -71,17 +71,26 @@ If this flag is set, the archive will contain monochromatic eulertigs.
 By default, if none of the above flags are set, compression uses ggcat monochromatic unitigs mode.
 There can only be one flag set at once or 0. If several flags are set the tool will not run and raise an error.
 
-#### ggcat `build-colored-fasta` backend (hard switch)
+#### Embedded ggcat structured-output backend (hard switch)
 KLOE embeds `ggcat` in-process (no external `ggcat` executable required at runtime).
 
-Compression is now fully driven by the forked ggcat direct colored export path (sorted by color bitsets), streamed into the native KLOE archive writer.
+Compression is driven by a forked ggcat structured-sequence backend. Sequence and
+color-run data are streamed directly into bounded KLOE binary chunks; no intermediate
+graph FASTA is formatted, stored, or parsed.
 
 The on-disk KLOE archive format is unchanged (`tigs_kloe.fa`, `bucket_sizes.txt`, `positions_kloe.bin`, `id_to_color_id.txt.zst`, `filenames_id.txt`).
 
 The vendored ggcat fork is pinned to commit:
 `fe6a633e64f60cd7266951d73c1def5cc023fa96`
 
-`-r/--memory` sets the embedded ggcat memory budget in GB.
+`-r/--memory` is the total compression memory budget in GB. KLOE derives bounded
+post-processing windows, graph-record chunks, group batches, and transpose blocks
+from this value. Embedded ggcat receives 75% of the budget and uses
+disk-backed intermediate storage; the remainder is reserved for KLOE and I/O.
+
+Dataset-to-color indexes use a linear, CID-monotonic external transpose rather than
+comparison sorting. Graph positions are also generated as external-memory streams,
+so their bulk payloads do not accumulate in RAM as dataset count grows.
 
 
 ## Archive decompression
@@ -118,7 +127,14 @@ Input directory for archive B.
 Output directory where the merged archive is written.
 
 #### memory -r
-Global memory budget in GB. Merge uses this budget to batch archive-A color sets while scanning archive B.
+Global memory budget in GB. Merge streams the packed SPSS records from both archives
+directly into embedded ggcat, without a k-mer hash join, repeated archive-B scans,
+an intermediate KLOE archive, or per-dataset FASTA dumps. Existing archive color
+sets are used as transient ggcat sources and translated back to dataset colors in
+the final archive. Compact size metadata is indexed without retaining every decoded
+sequence length in memory. Merge color memberships use flat contiguous storage,
+compact archives retain only the tig-position index needed for streaming, and input
+blocks are balanced by packed sequence bytes rather than by color-set count.
 
 #### output tig mode flags
 Merge honors the same output mode flags as compression:

@@ -16,6 +16,7 @@ use io::{
             IdentSequenceWriter, StructuredSequenceBackend, StructuredSequenceBackendInit,
             StructuredSequenceBackendWrapper, StructuredSequenceWriter,
             binary::StructSeqBinaryWriter,
+            channel::ChannelWriterWrapper,
             fasta::FastaWriterWrapper,
             gfa::{GFAWriterWrapperV1, GFAWriterWrapperV2},
         },
@@ -99,6 +100,7 @@ pub fn get_final_output_writer<
     colors::non_colored::NonColoredManager,
 ], OutputMode = [
     FastaWriterWrapper,
+    ChannelWriterWrapper,
     #[cfg(feature = "enable-gfa")] GFAWriterWrapperV1,
     #[cfg(feature = "enable-gfa")] GFAWriterWrapperV2
 ])]
