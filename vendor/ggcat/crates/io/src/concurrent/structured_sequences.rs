@@ -137,6 +137,7 @@ pub trait StructuredSequenceBackend<ColorInfo: IdentSequenceWriter, LinksInfo: I
     Sync + Send
 {
     type SequenceTempBuffer;
+    const REQUIRES_ORDERED_WRITES: bool = true;
 
     fn alloc_temp_buffer(k: usize) -> Self::SequenceTempBuffer;
 
@@ -226,6 +227,11 @@ impl<
                 _abundance,
             );
             current_index += 1;
+        }
+
+        if !Backend::REQUIRES_ORDERED_WRITES {
+            self.backend.lock().flush_temp_buffer(buffer);
+            return start_sequence_index;
         }
 
         loop {

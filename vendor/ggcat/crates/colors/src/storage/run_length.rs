@@ -126,6 +126,12 @@ pub struct RunLengthCheckpointWriter {
     checkpoint_buffer: ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>,
 }
 
+pub struct RunLengthCompressedCheckpointWriter {
+    checkpoint_subset_start: u64,
+    uncompressed_size: usize,
+    compressed_buffer: ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>,
+}
+
 impl ColorsSerializerTrait for RunLengthColorsSerializer {
     const MAGIC: [u8; 16] = *b"GGCAT_CMAP_RNLEN";
 
@@ -134,6 +140,7 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
     type CheckpointBuffer = ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>;
     type CompressedCheckpointBuffer = ResizableVec<u8, DEFAULT_OUTPUT_BUFFER_SIZE>;
     type CheckpointWriter = RunLengthCheckpointWriter;
+    type CompressedCheckpointWriter = RunLengthCompressedCheckpointWriter;
 
     fn decode_color(mut reader: impl Read, out_vec: Option<&mut Vec<u32>>) {
         match out_vec {
@@ -191,27 +198,35 @@ impl ColorsSerializerTrait for RunLengthColorsSerializer {
         }
     }
 
-    fn flush_checkpoint(
+    fn compress_checkpoint(
         &self,
-        mut checkpoint: Self::CheckpointWriter,
-        compressed_buffer: &mut Self::CheckpointBuffer,
-        wait_for_previous: crossbeam::channel::Receiver<()>,
-        release_next: crossbeam::channel::Sender<()>,
-    ) {
-        ColorsFlushProcessing::compress_chunk(&checkpoint.checkpoint_buffer, compressed_buffer);
+        checkpoint: Self::CheckpointWriter,
+        mut compressed_buffer: Self::CompressedCheckpointBuffer,
+    ) -> Self::CompressedCheckpointWriter {
+        ColorsFlushProcessing::compress_chunk(
+            &checkpoint.checkpoint_buffer,
+            &mut compressed_buffer,
+        );
+        RunLengthCompressedCheckpointWriter {
+            checkpoint_subset_start: checkpoint.checkpoint_subset_start,
+            uncompressed_size: checkpoint.checkpoint_buffer.len(),
+            compressed_buffer,
+        }
+    }
 
-        wait_for_previous.recv().unwrap();
+    fn commit_checkpoint(
+        &self,
+        mut checkpoint: Self::CompressedCheckpointWriter,
+    ) -> Self::CompressedCheckpointBuffer {
         let mut writer = self.writer.lock();
         writer.write_compressed_chunk(
             checkpoint.checkpoint_subset_start as ColorIndexType,
-            checkpoint.checkpoint_buffer.len(),
-            &compressed_buffer,
+            checkpoint.uncompressed_size,
+            &checkpoint.compressed_buffer,
         );
-        checkpoint.checkpoint_buffer.clear();
-        compressed_buffer.clear();
-
         drop(writer);
-        let _ = release_next.send(());
+        checkpoint.compressed_buffer.clear();
+        checkpoint.compressed_buffer
     }
 
     fn take_final_checkpoint(

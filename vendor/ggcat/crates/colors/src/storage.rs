@@ -15,9 +15,10 @@ pub trait ColorsSerializerTrait: Sized + Sync + Send + 'static {
 
     type CheckpointTracker: Sized + Send;
     type CheckpointBuffer: Default;
-    type CompressedCheckpointBuffer: Default;
+    type CompressedCheckpointBuffer: Default + Send + 'static;
 
     type CheckpointWriter: Send + 'static;
+    type CompressedCheckpointWriter: Send + 'static;
 
     fn decode_color(reader: impl Read, out_vec: Option<&mut Vec<ColorIndexType>>);
     // fn decode_colors(reader: impl Read) -> ;
@@ -38,13 +39,15 @@ pub trait ColorsSerializerTrait: Sized + Sync + Send + 'static {
         pre_serializer: &Self::PreSerializer,
     ) -> Option<Self::CheckpointWriter>;
 
-    fn flush_checkpoint(
+    fn compress_checkpoint(
         &self,
         checkpoint: Self::CheckpointWriter,
-        compressed_buffer: &mut Self::CompressedCheckpointBuffer,
-        wait_for_previous: crossbeam::channel::Receiver<()>,
-        release_next: crossbeam::channel::Sender<()>,
-    );
+        compressed_buffer: Self::CompressedCheckpointBuffer,
+    ) -> Self::CompressedCheckpointWriter;
+    fn commit_checkpoint(
+        &self,
+        checkpoint: Self::CompressedCheckpointWriter,
+    ) -> Self::CompressedCheckpointBuffer;
     fn take_final_checkpoint(
         tracker: &mut Self::CheckpointTracker,
         buffer: Self::CheckpointBuffer,

@@ -483,13 +483,19 @@ fn flush_sorted_chunk(
     records: &mut Vec<SortedColorRecord>,
     chunk_files: &mut Vec<PathBuf>,
     chunk_dir: &Path,
+    sort_pool: &rayon::ThreadPool,
 ) -> Result<()> {
     if records.is_empty() {
         return Ok(());
     }
 
     if records.len() >= PAR_SORT_THRESHOLD {
-        records.par_sort_unstable_by(|left, right| left.subset.cmp(&right.subset));
+        // GGCAT can have every worker in the global Rayon pool blocked while its
+        // bounded structured-output channel is full.  Sorting on that same pool
+        // would then deadlock the consumer which is needed to drain the channel.
+        sort_pool.install(|| {
+            records.par_sort_unstable_by(|left, right| left.subset.cmp(&right.subset));
+        });
     } else {
         records.sort_unstable_by(|left, right| left.subset.cmp(&right.subset));
     }
@@ -509,6 +515,7 @@ fn flush_sorted_chunk_timed(
     records: &mut Vec<SortedColorRecord>,
     chunk_files: &mut Vec<PathBuf>,
     chunk_dir: &Path,
+    sort_pool: &rayon::ThreadPool,
     metrics: &mut ChunkFlushMetrics,
 ) -> Result<()> {
     if records.is_empty() {
@@ -516,7 +523,7 @@ fn flush_sorted_chunk_timed(
     }
     let records_count = records.len();
     let timer = PhaseTimer::start();
-    flush_sorted_chunk(records, chunk_files, chunk_dir)?;
+    flush_sorted_chunk(records, chunk_files, chunk_dir, sort_pool)?;
     metrics.calls += 1;
     metrics.records += records_count;
     metrics.timing.add(timer.finish());
@@ -2444,7 +2451,15 @@ fn capture_structured_ggcat_output(
     chunk_dir: PathBuf,
     memory_budget: CompressionMemoryBudget,
     k: usize,
+    worker_threads: usize,
 ) -> Result<StructuredGgcatCapture> {
+    // This pool must remain independent from GGCAT's pool: the producer may be
+    // blocked waiting for this consumer while a chunk is being sorted.
+    let sort_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads.max(1))
+        .thread_name(|index| format!("kloe-color-sort-{index}"))
+        .build()
+        .map_err(|err| io::Error::other(format!("create color-sort worker pool: {err}")))?;
     let mut records = Vec::new();
     let mut chunk_files = Vec::new();
     let mut chunk_bytes = 0usize;
@@ -2462,6 +2477,7 @@ fn capture_structured_ggcat_output(
                     &mut records,
                     &mut chunk_files,
                     &chunk_dir,
+                    &sort_pool,
                     &mut chunk_flush_metrics,
                 )?;
                 chunk_bytes = 0;
@@ -2476,6 +2492,7 @@ fn capture_structured_ggcat_output(
         &mut records,
         &mut chunk_files,
         &chunk_dir,
+        &sort_pool,
         &mut chunk_flush_metrics,
     )?;
     let initial_chunk_count = chunk_files.len();
@@ -2566,7 +2583,13 @@ fn produce_ggcat_records(
     }
     let capture_chunk_dir = chunk_dir.clone();
     let capture_thread = thread::spawn(move || {
-        capture_structured_ggcat_output(structured_rx, capture_chunk_dir, memory_budget, k)
+        capture_structured_ggcat_output(
+            structured_rx,
+            capture_chunk_dir,
+            memory_budget,
+            k,
+            threads,
+        )
     });
 
     let ggcat_build_timer = PhaseTimer::start();

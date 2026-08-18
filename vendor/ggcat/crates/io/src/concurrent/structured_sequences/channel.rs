@@ -82,6 +82,7 @@ impl<ColorInfo: IdentSequenceWriter, LinksInfo: IdentSequenceWriter>
     StructuredSequenceBackend<ColorInfo, LinksInfo> for ChannelWriter<ColorInfo, LinksInfo>
 {
     type SequenceTempBuffer = ChannelBuffer;
+    const REQUIRES_ORDERED_WRITES: bool = false;
 
     fn alloc_temp_buffer(_: usize) -> Self::SequenceTempBuffer {
         ChannelBuffer {
