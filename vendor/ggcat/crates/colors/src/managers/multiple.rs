@@ -68,10 +68,17 @@ impl ColorsMergeManager for MultipleColorsManager {
     fn create_colors_table(
         path: impl AsRef<Path>,
         color_names: &[String],
+        implicit_colors_count: Option<u64>,
         threads_count: usize,
         print_stats: bool,
     ) -> anyhow::Result<Self::GlobalColorsTableWriter> {
-        ColorsMemMapWriter::new(path, color_names, threads_count, print_stats)
+        ColorsMemMapWriter::new(
+            path,
+            color_names,
+            implicit_colors_count,
+            threads_count,
+            print_stats,
+        )
     }
 
     fn open_colors_table(_path: impl AsRef<Path>) -> anyhow::Result<Self::GlobalColorsTableReader> {

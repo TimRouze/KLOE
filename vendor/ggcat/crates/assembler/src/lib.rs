@@ -92,6 +92,7 @@ pub fn run_assembler<
     last_step: AssemblerPhase,
     input_blocks: Vec<GeneralSequenceBlockData>,
     color_names: &[String],
+    implicit_colors_count: Option<u64>,
     output_file: PathBuf,
     temp_dir: Option<PathBuf>,
     threads_count: usize,
@@ -135,6 +136,7 @@ pub fn run_assembler<
         AssemblerColorsManager::ColorsMergeManagerType::create_colors_table(
             output_file.with_extension("colors.dat"),
             color_names,
+            implicit_colors_count,
             colormap_threads_count,
             true,
         )?,

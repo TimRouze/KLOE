@@ -452,6 +452,7 @@ fn run_assembler_from_args(instance: &GGCATInstance, args: AssemblerArgs) {
             inputs,
             args.output_file.clone(),
             Some(&color_names),
+            None,
             args.common_args.kmer_length,
             args.common_args.threads_count,
             args.common_args.forward_only,

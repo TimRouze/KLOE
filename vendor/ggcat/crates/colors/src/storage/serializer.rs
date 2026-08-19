@@ -62,6 +62,7 @@ impl<SI: ColorsSerializerTrait> ColorsSerializer<SI> {
     pub fn new(
         file: impl AsRef<Path>,
         color_names: &[String],
+        implicit_colors_count: Option<u64>,
         threads_count: usize,
         print_stats: bool,
     ) -> anyhow::Result<Self> {
@@ -113,7 +114,11 @@ impl<SI: ColorsSerializerTrait> ColorsSerializer<SI> {
             uncompressed_size: 0,
         };
 
-        let colors_count = color_names.len() as u64;
+        let colors_count = implicit_colors_count.unwrap_or(color_names.len() as u64);
+        anyhow::ensure!(
+            implicit_colors_count.is_none() || color_names.is_empty(),
+            "implicit color count requires an empty color-name list"
+        );
 
         let (colors_sender, receiver) =
             crossbeam::channel::bounded::<PreserializedColors<SI::PreSerializer>>(128);

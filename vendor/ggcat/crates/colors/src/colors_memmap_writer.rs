@@ -20,6 +20,7 @@ impl<C: ColorsSerializerTrait> ColorsMemMapWriter<C> {
     pub fn new(
         file: impl AsRef<Path>,
         color_names: &[String],
+        implicit_colors_count: Option<u64>,
         threads_count: usize,
         print_stats: bool,
     ) -> anyhow::Result<Self> {
@@ -33,6 +34,7 @@ impl<C: ColorsSerializerTrait> ColorsMemMapWriter<C> {
             colors_storage: ManuallyDrop::new(ColorsSerializer::new(
                 file,
                 color_names,
+                implicit_colors_count,
                 threads_count,
                 print_stats,
             )?),

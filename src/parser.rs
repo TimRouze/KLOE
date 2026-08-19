@@ -2340,6 +2340,7 @@ fn write_partition_simplitigs_ggcat(
         streams,
         graph_path,
         Some(&color_names),
+        None,
         k,
         threads.max(1),
         false,
@@ -2347,6 +2348,7 @@ fn write_partition_simplitigs_ggcat(
         true,
         1,
         partition_mode_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
+        None,
     );
     let dumped_color_names =
         GGCATInstance::dump_colors(GGCATInstance::get_colormap_file(&graph_path))

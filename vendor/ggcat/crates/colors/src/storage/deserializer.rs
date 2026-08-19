@@ -15,6 +15,7 @@ pub struct ColorsDeserializer<DS: ColorsSerializerTrait> {
     colormap_file: lz4::Decoder<BufReader<File>>,
     color_names: Vec<String>,
     json_escaped_color_names: Vec<String>,
+    colors_count: usize,
     colors_index: ColorsIndexMap,
     current_chunk: ColorsIndexEntry,
     current_chunk_size: ColorIndexType,
@@ -99,6 +100,7 @@ impl<DS: ColorsSerializerTrait> ColorsDeserializer<DS> {
             colormap_file: lz4::Decoder::new(BufReader::new(file)).unwrap(),
             color_names,
             json_escaped_color_names,
+            colors_count: header.colors_count as usize,
             colors_index,
             current_chunk: first_chunk,
             current_chunk_size,
@@ -172,7 +174,7 @@ impl<DS: ColorsSerializerTrait> ColorMapReader for ColorsDeserializer<DS> {
     }
 
     fn colors_count(&self) -> usize {
-        self.color_names.len()
+        self.colors_count
     }
 
     fn colors_subsets_count(&self) -> u64 {

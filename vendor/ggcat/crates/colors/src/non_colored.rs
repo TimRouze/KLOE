@@ -210,6 +210,7 @@ impl ColorsMergeManager for NonColoredManager {
     fn create_colors_table(
         _path: impl AsRef<Path>,
         _color_names: &[String],
+        _implicit_colors_count: Option<u64>,
         _threads_count: usize,
         _print_stats: bool,
     ) -> anyhow::Result<Self::GlobalColorsTableWriter> {

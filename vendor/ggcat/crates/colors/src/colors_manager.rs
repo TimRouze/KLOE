@@ -131,6 +131,7 @@ pub trait ColorsMergeManager: Sized {
     fn create_colors_table(
         path: impl AsRef<Path>,
         color_names: &[String],
+        implicit_colors_count: Option<u64>,
         threads_count: usize,
         print_stats: bool,
     ) -> anyhow::Result<Self::GlobalColorsTableWriter>;

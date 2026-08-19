@@ -203,6 +203,7 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
             streams,
             rebuilt_output,
             None,
+            None,
             cfg.k,
             cfg.threads.max(1),
             false,

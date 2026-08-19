@@ -81,7 +81,7 @@ impl Default for MergeConfig {
 struct ArchiveInfo {
     filenames: Vec<String>,
     positions: Arc<ArchivePositions>,
-    cid_to_ids: CidDatasetIds,
+    cid_to_ids: ArchiveDatasetIds,
     tigs_path: PathBuf,
     sizes_path: PathBuf,
     compact_sizes: Option<Arc<CompactSizesIndex>>,
@@ -589,20 +589,64 @@ impl ArchivePositions {
 
 #[derive(Debug)]
 struct CidDatasetIds {
-    offsets: Vec<usize>,
+    offsets: Arc<Vec<usize>>,
     values: Arc<Vec<u32>>,
 }
 
-impl CidDatasetIds {
-    fn span(&self, cid: usize) -> Option<(usize, usize)> {
-        Some((*self.offsets.get(cid)?, *self.offsets.get(cid + 1)?))
+#[derive(Debug)]
+enum ArchiveDatasetIds {
+    Memory(CidDatasetIds),
+    Disk(Arc<compress::CidDatasetSidecar>),
+}
+
+impl ArchiveDatasetIds {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(ids) => ids.len(),
+            Self::Disk(sidecar) => sidecar.len(),
+        }
     }
 
-    fn active_cids(&self) -> impl Iterator<Item = usize> + '_ {
-        self.offsets
-            .windows(2)
-            .enumerate()
-            .filter_map(|(cid, range)| (range[0] != range[1]).then_some(cid))
+    fn add_to_source_map(
+        &self,
+        map: &mut compress::SourceDatasetMap,
+        dataset_offset: u32,
+    ) -> io::Result<()> {
+        match self {
+            Self::Memory(ids) => map.add_dense_storage(
+                Arc::clone(&ids.values),
+                Arc::clone(&ids.offsets),
+                dataset_offset,
+            ),
+            Self::Disk(sidecar) => map.add_disk_storage(Arc::clone(sidecar), dataset_offset),
+        }
+    }
+
+    fn ensure_disk_backed(&mut self, temp_path: &Path) -> io::Result<()> {
+        let Self::Memory(ids) = self else {
+            return Ok(());
+        };
+        let mut writer = compress::CidDatasetSidecarWriter::create(temp_path)?;
+        for range in ids.offsets.windows(2) {
+            writer.append_one_based(&ids.values[range[0]..range[1]])?;
+        }
+        writer.finish()?;
+        let sidecar = Arc::new(compress::CidDatasetSidecar::open(temp_path)?);
+        if sidecar.len() != ids.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "temporary CID sidecar group count mismatch",
+            ));
+        }
+        *self = Self::Disk(sidecar);
+        fs::remove_file(temp_path)?;
+        Ok(())
+    }
+}
+
+impl CidDatasetIds {
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
     }
 }
 
@@ -610,7 +654,7 @@ impl CidDatasetIds {
 struct CompactSizesBlock {
     first_group: usize,
     group_count: usize,
-    offsets: Vec<u32>,
+    offsets_file_offset: u64,
     data_offset: u64,
     data_len: usize,
 }
@@ -632,7 +676,9 @@ struct ArchiveSequencesStream {
 
 #[derive(Clone)]
 struct ArchiveSequenceBlock {
-    cids: Vec<(usize, ColorIndexType)>,
+    cid_start: usize,
+    cid_end: usize,
+    first_color: ColorIndexType,
     estimated_bases: u64,
 }
 
@@ -663,13 +709,17 @@ impl ArchiveSequencesStream {
             None
         };
         let mut cached_block_index = usize::MAX;
+        let mut cached_block_offsets = Vec::new();
         let mut cached_block_data = Vec::new();
         let mut encoded = Vec::new();
         let mut sequence = Vec::new();
         let mut sizes = Vec::new();
         let mut current_tigs_pos = None;
 
-        for &(cid, color) in &block_data.cids {
+        for cid in block_data.cid_start..block_data.cid_end {
+            let color_offset = cid - block_data.cid_start;
+            let color = ColorIndexType::try_from(block_data.first_color as usize + color_offset)
+                .expect("validated archive color range must fit ColorIndexType");
             if cid >= self.positions.len().saturating_sub(1) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -688,7 +738,7 @@ impl ArchiveSequencesStream {
                 })?;
                 let block_index = compact.block_index_for_group(group)?;
                 if cached_block_index != block_index {
-                    cached_block_data = compact.load_block_from(
+                    (cached_block_offsets, cached_block_data) = compact.load_block_from(
                         block_index,
                         compact_sizes_reader
                             .as_mut()
@@ -696,7 +746,13 @@ impl ArchiveSequencesStream {
                     )?;
                     cached_block_index = block_index;
                 }
-                compact.decode_group_into(block_index, group, &cached_block_data, &mut sizes)?;
+                compact.decode_group_into(
+                    block_index,
+                    group,
+                    &cached_block_offsets,
+                    &cached_block_data,
+                    &mut sizes,
+                )?;
             } else {
                 read_bucket_sizes_at_into(
                     legacy_sizes_reader
@@ -767,6 +823,7 @@ impl ArchiveInfo {
         let positions_path = root.join("positions_kloe.bin");
         let sizes_path = root.join("bucket_sizes.txt");
         let cid_path = root.join("id_to_color_id.txt.zst");
+        let cid_sidecar_path = root.join(compress::CID_TO_DATASET_FILE);
         let tigs_path = root.join("tigs_kloe.fa");
         let filenames_path = root.join("filenames_id.txt");
 
@@ -787,11 +844,36 @@ impl ArchiveInfo {
         }
 
         let filenames = load_filenames(&filenames_path)?;
-        let cid_to_ids = load_cid_to_ids(
-            &cid_path,
-            filenames.len(),
-            positions.len().saturating_sub(1),
-        )?;
+        let expected_groups = positions.len().saturating_sub(1);
+        let cid_to_ids = if cid_sidecar_path.is_file() {
+            let sidecar = Arc::new(compress::CidDatasetSidecar::open(&cid_sidecar_path)?);
+            if sidecar.len() != expected_groups {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CID sidecar '{}' contains {} groups, expected {}",
+                        cid_sidecar_path.display(),
+                        sidecar.len(),
+                        expected_groups
+                    ),
+                ));
+            }
+            println!(
+                "Using disk-backed CID memberships from {}",
+                cid_sidecar_path.display()
+            );
+            ArchiveDatasetIds::Disk(sidecar)
+        } else {
+            eprintln!(
+                "Archive '{}' predates disk-backed CID memberships; using the compatibility in-memory transpose",
+                root.display()
+            );
+            ArchiveDatasetIds::Memory(load_cid_to_ids(
+                &cid_path,
+                filenames.len(),
+                expected_groups,
+            )?)
+        };
 
         Ok(Self {
             filenames,
@@ -805,50 +887,68 @@ impl ArchiveInfo {
 
     fn sequence_stream(
         &self,
-        colored_cids: Vec<(usize, ColorIndexType)>,
+        first_color: usize,
         target_blocks: usize,
-    ) -> ArchiveSequencesStream {
-        let total_bytes = colored_cids.iter().fold(0u64, |total, &(cid, _)| {
-            let start = self.positions.tigs(cid).unwrap_or(0);
-            let end = self.positions.tigs(cid + 1).unwrap_or(start);
-            total.saturating_add(end.saturating_sub(start))
-        });
-        let target_bytes = total_bytes
-            .div_ceil(target_blocks.max(1) as u64)
-            .max(1);
-        let mut blocks = Vec::with_capacity(target_blocks.min(colored_cids.len()).max(1));
-        let mut current_cids = Vec::new();
-        let mut current_bytes = 0u64;
-        for colored_cid in colored_cids {
-            let start = self.positions.tigs(colored_cid.0).unwrap_or(0);
-            let end = self.positions.tigs(colored_cid.0 + 1).unwrap_or(start);
-            let cid_bytes = end.saturating_sub(start);
-            if !current_cids.is_empty()
-                && current_bytes >= target_bytes
-                && blocks.len() + 1 < target_blocks.max(1)
-            {
+    ) -> io::Result<ArchiveSequencesStream> {
+        let cid_count = self.cid_to_ids.len();
+        let last_color = first_color.checked_add(cid_count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "merge source color count overflow")
+        })?;
+        ColorIndexType::try_from(last_color.saturating_sub(1)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "too many merge source colors")
+        })?;
+        let mut blocks = Vec::with_capacity(target_blocks.min(cid_count).max(1));
+        if cid_count > 0 {
+            let first_byte = self.positions.tigs(0).unwrap_or(0);
+            let end_byte = self.positions.tigs(cid_count).unwrap_or(first_byte);
+            let total_bytes = end_byte.saturating_sub(first_byte);
+            let block_count = target_blocks.max(1).min(cid_count);
+            let mut current_start = 0usize;
+            for block_number in 1..block_count {
+                let target_byte = first_byte.saturating_add(
+                    ((total_bytes as u128 * block_number as u128) / block_count as u128) as u64,
+                );
+                let mut current_end = self
+                    .positions
+                    .tigs
+                    .partition_point(|&position| position < target_byte)
+                    .clamp(current_start + 1, cid_count);
+                if cid_count - current_end < block_count - block_number {
+                    current_end = cid_count - (block_count - block_number);
+                }
+                let start_byte = self.positions.tigs(current_start).unwrap_or(first_byte);
+                let block_end_byte = self.positions.tigs(current_end).unwrap_or(start_byte);
                 blocks.push(ArchiveSequenceBlock {
-                    cids: std::mem::take(&mut current_cids),
-                    estimated_bases: current_bytes.saturating_mul(4).max(1),
+                    cid_start: current_start,
+                    cid_end: current_end,
+                    first_color: ColorIndexType::try_from(first_color + current_start)
+                        .expect("validated archive color range must fit ColorIndexType"),
+                    estimated_bases: block_end_byte
+                        .saturating_sub(start_byte)
+                        .saturating_mul(4)
+                        .max(1),
                 });
-                current_bytes = 0;
+                current_start = current_end;
             }
-            current_cids.push(colored_cid);
-            current_bytes = current_bytes.saturating_add(cid_bytes);
-        }
-        if !current_cids.is_empty() {
+            let start_byte = self.positions.tigs(current_start).unwrap_or(first_byte);
             blocks.push(ArchiveSequenceBlock {
-                cids: current_cids,
-                estimated_bases: current_bytes.saturating_mul(4).max(1),
+                cid_start: current_start,
+                cid_end: cid_count,
+                first_color: ColorIndexType::try_from(first_color + current_start)
+                    .expect("validated archive color range must fit ColorIndexType"),
+                estimated_bases: end_byte
+                    .saturating_sub(start_byte)
+                    .saturating_mul(4)
+                    .max(1),
             });
         }
-        ArchiveSequencesStream {
+        Ok(ArchiveSequencesStream {
             positions: Arc::clone(&self.positions),
             tigs_path: self.tigs_path.clone(),
             sizes_path: self.sizes_path.clone(),
             compact_sizes: self.compact_sizes.clone(),
             blocks,
-        }
+        })
     }
 
 }
@@ -934,12 +1034,26 @@ pub fn merge_archives_with_config(
         "Loading archive A from {}",
         archive_a_root.to_string_lossy()
     );
-    let archive_a = ArchiveInfo::load(archive_a_root, k)?;
+    let mut archive_a = ArchiveInfo::load(archive_a_root, k)?;
+    let legacy_a_sidecar = output_root.join(format!(
+        ".kloe-merge-source-a-{}.bin",
+        std::process::id()
+    ));
+    archive_a
+        .cid_to_ids
+        .ensure_disk_backed(&legacy_a_sidecar)?;
     println!(
         "Loading archive B from {}",
         archive_b_root.to_string_lossy()
     );
-    let archive_b = ArchiveInfo::load(archive_b_root, k)?;
+    let mut archive_b = ArchiveInfo::load(archive_b_root, k)?;
+    let legacy_b_sidecar = output_root.join(format!(
+        ".kloe-merge-source-b-{}.bin",
+        std::process::id()
+    ));
+    archive_b
+        .cid_to_ids
+        .ensure_disk_backed(&legacy_b_sidecar)?;
 
     let mut merged_filenames =
         Vec::with_capacity(archive_a.filenames.len() + archive_b.filenames.len());
@@ -959,41 +1073,21 @@ pub fn merge_archives_with_config(
         )
     })?;
 
-    let source_count = archive_a.cid_to_ids.active_cids().count()
-        + archive_b.cid_to_ids.active_cids().count();
+    let a_source_count = archive_a.cid_to_ids.len();
+    let b_source_count = archive_b.cid_to_ids.len();
+    let source_count = a_source_count.checked_add(b_source_count).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "merge source color count overflow")
+    })?;
     let mut source_dataset_ids = compress::SourceDatasetMap::new();
-    let a_storage = source_dataset_ids.add_storage(Arc::clone(&archive_a.cid_to_ids.values));
-    let b_storage = source_dataset_ids.add_storage(Arc::clone(&archive_b.cid_to_ids.values));
-    let mut a_colored_cids = Vec::with_capacity(archive_a.cid_to_ids.active_cids().count());
-    let mut b_colored_cids = Vec::with_capacity(archive_b.cid_to_ids.active_cids().count());
-
-    for cid in archive_a.cid_to_ids.active_cids() {
-        let color = ColorIndexType::try_from(source_dataset_ids.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "too many merge source colors")
-        })?;
-        a_colored_cids.push((cid, color));
-        let (start, end) = archive_a
-            .cid_to_ids
-            .span(cid)
-            .expect("active archive CID must have a dataset span");
-        source_dataset_ids.push_span(a_storage, start, end, 0)?;
-    }
-    for cid in archive_b.cid_to_ids.active_cids() {
-        let color = ColorIndexType::try_from(source_dataset_ids.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "too many merge source colors")
-        })?;
-        b_colored_cids.push((cid, color));
-        let (start, end) = archive_b
-            .cid_to_ids
-            .span(cid)
-            .expect("active archive CID must have a dataset span");
-        source_dataset_ids.push_span(b_storage, start, end, offset)?;
-    }
+    archive_a.cid_to_ids.add_to_source_map(&mut source_dataset_ids, 0)?;
+    archive_b
+        .cid_to_ids
+        .add_to_source_map(&mut source_dataset_ids, offset)?;
     debug_assert_eq!(source_dataset_ids.len(), source_count);
 
     let blocks_per_archive = cfg.threads.max(1).div_ceil(2);
-    let a_stream = Arc::new(archive_a.sequence_stream(a_colored_cids, blocks_per_archive));
-    let b_stream = Arc::new(archive_b.sequence_stream(b_colored_cids, blocks_per_archive));
+    let a_stream = Arc::new(archive_a.sequence_stream(0, blocks_per_archive)?);
+    let b_stream = Arc::new(archive_b.sequence_stream(a_source_count, blocks_per_archive)?);
     let a_block_count = a_stream.blocks.len();
     let b_block_count = b_stream.blocks.len();
     let a_stream: Arc<dyn DynamicSequencesStream> = a_stream;
@@ -1170,29 +1264,41 @@ impl CompactSizesIndex {
         }
     }
 
-    fn load_block_from(&self, block_index: usize, file: &mut File) -> io::Result<Vec<u8>> {
+    fn load_block_from(
+        &self,
+        block_index: usize,
+        file: &mut File,
+    ) -> io::Result<(Vec<u32>, Vec<u8>)> {
         let block = self.blocks.get(block_index).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "compact size block is not indexed")
         })?;
+        file.seek(std::io::SeekFrom::Start(block.offsets_file_offset))?;
+        let mut offsets = vec![0u32; block.group_count + 1];
+        let mut bytes = [0u8; 4];
+        for offset in &mut offsets {
+            file.read_exact(&mut bytes)?;
+            *offset = u32::from_le_bytes(bytes);
+        }
         file.seek(std::io::SeekFrom::Start(block.data_offset))?;
         let mut compressed = vec![0u8; block.data_len];
         file.read_exact(&mut compressed)?;
         let mut decompressed = Vec::new();
         Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
-        let expected_min = block.offsets.last().copied().unwrap_or(0) as usize;
+        let expected_min = offsets.last().copied().unwrap_or(0) as usize;
         if decompressed.len() < expected_min {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("truncated compact size block in '{}'", self.path.display()),
             ));
         }
-        Ok(decompressed)
+        Ok((offsets, decompressed))
     }
 
     fn decode_group_into(
         &self,
         block_index: usize,
         group: usize,
+        offsets: &[u32],
         decompressed: &[u8],
         sizes: &mut Vec<usize>,
     ) -> io::Result<()> {
@@ -1208,8 +1314,12 @@ impl CompactSizesIndex {
                 "compact size group exceeds block",
             ));
         }
-        let start = block.offsets[local] as usize;
-        let end = block.offsets[local + 1] as usize;
+        let start = *offsets.get(local).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing compact size start offset")
+        })? as usize;
+        let end = *offsets.get(local + 1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing compact size end offset")
+        })? as usize;
         if end < start || end > decompressed.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1255,12 +1365,13 @@ fn load_compact_bucket_sizes_index(path: &Path) -> io::Result<CompactSizesIndex>
         let data_len = usize::try_from(u64::from_le_bytes(compressed_len_buf)).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "compact size block is too large")
         })?;
-        let mut offsets = vec![0u32; group_count + 1];
-        for offset in &mut offsets {
-            let mut bytes = [0u8; 4];
-            reader.read_exact(&mut bytes)?;
-            *offset = u32::from_le_bytes(bytes);
-        }
+        let offsets_file_offset = reader.stream_position()?;
+        let offsets_bytes = (group_count + 1)
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "compact size offsets overflow")
+            })?;
+        reader.seek(std::io::SeekFrom::Current(offsets_bytes as i64))?;
         let data_offset = reader.stream_position()?;
         let next_offset = data_offset.checked_add(data_len as u64).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "compact size file offset overflow")
@@ -1269,7 +1380,7 @@ fn load_compact_bucket_sizes_index(path: &Path) -> io::Result<CompactSizesIndex>
         blocks.push(CompactSizesBlock {
             first_group,
             group_count,
-            offsets,
+            offsets_file_offset,
             data_offset,
             data_len,
         });
@@ -1559,7 +1670,7 @@ fn load_cid_to_ids(
     }
 
     Ok(CidDatasetIds {
-        offsets,
+        offsets: Arc::new(offsets),
         values: Arc::new(values),
     })
 }

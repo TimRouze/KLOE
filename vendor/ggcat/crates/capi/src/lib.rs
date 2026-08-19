@@ -102,6 +102,7 @@ fn ggcat_build(
             } else {
                 None
             },
+            None,
             kmer_length,
             threads_count,
             forward_only,

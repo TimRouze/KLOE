@@ -54,6 +54,7 @@ fn main() {
             ],
             graph_file.clone(),
             Some(&["sal1".to_string(), "sal2".to_string(), "sal3".to_string()]),
+            None,
             k,
             threads_count,
             false,
@@ -62,7 +63,6 @@ fn main() {
             1,
             ExtraElaboration::UnitigLinks,
             None,
-            5,
         )
         .unwrap();
 

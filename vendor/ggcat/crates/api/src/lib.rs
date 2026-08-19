@@ -231,6 +231,9 @@ impl GGCATInstance {
         // The names of the colors, ordered by color index
         color_names: Option<&[String]>,
 
+        // Number of numeric colors when names are intentionally omitted
+        implicit_colors_count: Option<usize>,
+
         // Specifies the k-mers length
         kmer_length: usize,
         // The threads to be used
@@ -300,6 +303,7 @@ impl GGCATInstance {
             last_step,
             input_streams,
             color_names.unwrap_or(&[]),
+            implicit_colors_count.map(|count| count as u64),
             output_file,
             temp_dir.clone(),
             threads_count,

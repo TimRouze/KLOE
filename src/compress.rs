@@ -29,7 +29,6 @@ const COLOR_CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const GROUP_SORT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 const GROUP_WORK_BATCH_GROUPS: usize = 2048;
 const GROUP_IN_MEMORY_MAX_SEQ_BYTES: usize = 2 * 1024 * 1024;
-const SUBSET_QUERY_CHUNK_SIZE: usize = 500_000;
 const MIN_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const MIN_GROUP_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GROUP_BATCH_BYTES: usize = 512 * 1024 * 1024;
@@ -43,8 +42,293 @@ const COLOR_MERGE_FAN_IN: usize = 64;
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
+pub(crate) const CID_TO_DATASET_MAGIC: &[u8; 4] = b"KCD2";
+pub(crate) const CID_TO_DATASET_FILE: &str = "cid_to_dataset_id.bin";
 const BUCKET_SIZE_BLOCK_MAX_GROUPS: usize = 8_192;
 const BUCKET_SIZE_BLOCK_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CidDatasetSidecarBlock {
+    first_group: usize,
+    group_count: usize,
+    offsets_file_offset: u64,
+    data_offset: u64,
+    data_len: usize,
+}
+
+#[derive(Debug)]
+struct CidDatasetSidecarCache {
+    file: File,
+    block_index: usize,
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+    decoded_ids: Vec<u32>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CidDatasetSidecar {
+    blocks: Vec<CidDatasetSidecarBlock>,
+    group_count: usize,
+    cache: Mutex<CidDatasetSidecarCache>,
+}
+
+impl CidDatasetSidecar {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        if &magic != CID_TO_DATASET_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid CID-to-dataset sidecar '{}': bad magic", path.display()),
+            ));
+        }
+        let mut blocks = Vec::new();
+        let mut group_count = 0usize;
+        loop {
+            let mut count_bytes = [0u8; 4];
+            match file.read_exact(&mut count_bytes) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err),
+            }
+            let block_groups = u32::from_le_bytes(count_bytes) as usize;
+            if block_groups == 0 {
+                break;
+            }
+            let mut len_bytes = [0u8; 8];
+            file.read_exact(&mut len_bytes)?;
+            let data_len = usize::try_from(u64::from_le_bytes(len_bytes)).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar block is too large")
+            })?;
+            let offsets_file_offset = file.stream_position()?;
+            let offsets_bytes = (block_groups + 1)
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "CID sidecar offsets overflow")
+                })?;
+            let data_offset = offsets_file_offset
+                .checked_add(offsets_bytes as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "CID sidecar offset overflow")
+                })?;
+            let next_block = data_offset.checked_add(data_len as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar offset overflow")
+            })?;
+            blocks.push(CidDatasetSidecarBlock {
+                first_group: group_count,
+                group_count: block_groups,
+                offsets_file_offset,
+                data_offset,
+                data_len,
+            });
+            group_count = group_count.checked_add(block_groups).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar group count overflow")
+            })?;
+            file.seek(SeekFrom::Start(next_block))?;
+        }
+        Ok(Self {
+            blocks,
+            group_count,
+            cache: Mutex::new(CidDatasetSidecarCache {
+                file: File::open(path)?,
+                block_index: usize::MAX,
+                offsets: Vec::new(),
+                data: Vec::new(),
+                decoded_ids: Vec::new(),
+            }),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.group_count
+    }
+
+    fn merge_group_into(
+        &self,
+        group: usize,
+        target: &mut Vec<u32>,
+        dataset_offset: u32,
+    ) -> io::Result<()> {
+        let block_index = self
+            .blocks
+            .partition_point(|block| block.first_group <= group)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar group is out of range")
+            })?;
+        let block = self.blocks.get(block_index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "CID sidecar group is out of range")
+        })?;
+        let local = group - block.first_group;
+        if local >= block.group_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID sidecar group is outside its block",
+            ));
+        }
+        let mut cache = self.cache.lock().expect("CID sidecar cache lock poisoned");
+        if cache.block_index != block_index {
+            cache.file.seek(SeekFrom::Start(block.offsets_file_offset))?;
+            let mut offsets = vec![0u32; block.group_count + 1];
+            let mut bytes = [0u8; 4];
+            for offset in &mut offsets {
+                cache.file.read_exact(&mut bytes)?;
+                *offset = u32::from_le_bytes(bytes);
+            }
+            let mut compressed = vec![0u8; block.data_len];
+            cache.file.seek(SeekFrom::Start(block.data_offset))?;
+            cache.file.read_exact(&mut compressed)?;
+            let data = zstd::decode_all(compressed.as_slice())?;
+            if offsets.windows(2).any(|range| range[0] > range[1])
+                || offsets.last().copied().map(|v| v as usize) != Some(data.len())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CID sidecar block offsets are invalid for its payload",
+                ));
+            }
+            cache.offsets = offsets;
+            cache.data = data;
+            cache.block_index = block_index;
+        }
+        let start = cache.offsets[local] as usize;
+        let end = cache.offsets[local + 1] as usize;
+        let mut ids = std::mem::take(&mut cache.decoded_ids);
+        ids.clear();
+        let encoded = &cache.data[start..end];
+        let mut cursor = 0usize;
+        let mut previous = 0u64;
+        while cursor < encoded.len() {
+            let delta = read_varint_field(encoded, &mut cursor, "CID dataset delta")?;
+            previous = previous.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar dataset ID overflow")
+            })?;
+            let one_based = previous.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar dataset ID overflow")
+            })?;
+            let id = u32::try_from(one_based).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar dataset ID overflow")
+            })?;
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID sidecar group has no dataset membership",
+            ));
+        }
+        let result = merge_sorted_dataset_ids_with_offset(target, &ids, dataset_offset);
+        cache.decoded_ids = ids;
+        result
+    }
+}
+
+pub(crate) struct CidDatasetSidecarWriter {
+    file: BufWriter<File>,
+    block_groups: usize,
+    block_offsets: Vec<u32>,
+    block_data: Vec<u8>,
+}
+
+impl CidDatasetSidecarWriter {
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        let mut file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(path)?);
+        file.write_all(CID_TO_DATASET_MAGIC)?;
+        Ok(Self {
+            file,
+            block_groups: 0,
+            block_offsets: vec![0],
+            block_data: Vec::new(),
+        })
+    }
+
+    pub(crate) fn append_zero_based(&mut self, dataset_ids: &[usize]) -> io::Result<()> {
+        if dataset_ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot store an empty CID dataset set",
+            ));
+        }
+        let mut previous = 0usize;
+        for (index, &dataset) in dataset_ids.iter().enumerate() {
+            if index > 0 && dataset <= previous {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CID dataset IDs are not strictly increasing",
+                ));
+            }
+            write_varint_u64((dataset - previous) as u64, &mut self.block_data);
+            previous = dataset;
+        }
+        self.finish_group()
+    }
+
+    pub(crate) fn append_one_based(&mut self, dataset_ids: &[u32]) -> io::Result<()> {
+        if dataset_ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot store an empty CID dataset set",
+            ));
+        }
+        let mut previous = 0u32;
+        let mut first = true;
+        for &dataset in dataset_ids {
+            let zero_based = dataset.checked_sub(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "dataset ID zero is invalid")
+            })?;
+            if !first && zero_based <= previous {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CID dataset IDs are not strictly increasing",
+                ));
+            }
+            write_varint_u64((zero_based - previous) as u64, &mut self.block_data);
+            previous = zero_based;
+            first = false;
+        }
+        self.finish_group()
+    }
+
+    fn finish_group(&mut self) -> io::Result<()> {
+        self.block_offsets
+            .push(u32::try_from(self.block_data.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar block exceeds 4GiB")
+            })?);
+        self.block_groups += 1;
+        if self.block_groups >= BUCKET_SIZE_BLOCK_MAX_GROUPS
+            || self.block_data.len() >= BUCKET_SIZE_BLOCK_MAX_UNCOMPRESSED_BYTES
+        {
+            self.flush_block()?;
+        }
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> io::Result<()> {
+        if self.block_groups == 0 {
+            return Ok(());
+        }
+        let compressed = zstd::encode_all(self.block_data.as_slice(), 1)?;
+        self.file
+            .write_all(&(self.block_groups as u32).to_le_bytes())?;
+        self.file.write_all(&(compressed.len() as u64).to_le_bytes())?;
+        for &offset in &self.block_offsets {
+            self.file.write_all(&offset.to_le_bytes())?;
+        }
+        self.file.write_all(&compressed)?;
+        self.block_groups = 0;
+        self.block_offsets.clear();
+        self.block_offsets.push(0);
+        self.block_data.clear();
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        self.flush_block()?;
+        self.file.write_all(&0u32.to_le_bytes())?;
+        self.file.flush()
+    }
+}
 
 pub fn compress(
     output_dir: &String,
@@ -105,7 +389,7 @@ impl CompressionMemoryBudget {
     }
 
     fn subset_window_sequence_bytes(self) -> usize {
-        (self.total_bytes / 16).clamp(8 * 1024 * 1024, 256 * 1024 * 1024)
+        (self.total_bytes / 16).clamp(8 * 1024 * 1024, 1024 * 1024 * 1024)
     }
 
     fn subset_window_count(self, dataset_count: usize) -> usize {
@@ -113,7 +397,7 @@ impl CompressionMemoryBudget {
             .saturating_mul(std::mem::size_of::<u32>())
             .saturating_add(96)
             .max(1);
-        (self.total_bytes / 32 / worst_case_subset_bytes).clamp(1, SUBSET_QUERY_CHUNK_SIZE)
+        (self.total_bytes / 8 / worst_case_subset_bytes).max(1)
     }
 
     fn ggcat_memory_gb(self) -> f64 {
@@ -807,6 +1091,26 @@ pub(crate) struct SourceDatasetSpan {
 pub(crate) struct SourceDatasetMap {
     storages: Vec<Arc<Vec<u32>>>,
     spans: Vec<SourceDatasetSpan>,
+    dense_ranges: Vec<DenseSourceDatasetRange>,
+    disk_ranges: Vec<DiskSourceDatasetRange>,
+    source_count: usize,
+}
+
+#[derive(Debug)]
+struct DenseSourceDatasetRange {
+    source_start: usize,
+    source_end: usize,
+    storage: usize,
+    offsets: Arc<Vec<usize>>,
+    offset: u32,
+}
+
+#[derive(Debug)]
+struct DiskSourceDatasetRange {
+    source_start: usize,
+    source_end: usize,
+    sidecar: Arc<CidDatasetSidecar>,
+    offset: u32,
 }
 
 impl SourceDatasetMap {
@@ -814,6 +1118,9 @@ impl SourceDatasetMap {
         Self {
             storages: Vec::new(),
             spans: Vec::new(),
+            dense_ranges: Vec::new(),
+            disk_ranges: Vec::new(),
+            source_count: 0,
         }
     }
 
@@ -845,6 +1152,63 @@ impl SourceDatasetMap {
             end,
             offset,
         });
+        self.source_count = self.source_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many GGCAT sources")
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn add_dense_storage(
+        &mut self,
+        values: Arc<Vec<u32>>,
+        offsets: Arc<Vec<usize>>,
+        offset: u32,
+    ) -> io::Result<()> {
+        if offsets.is_empty() || offsets[0] != 0 || offsets.last().copied() != Some(values.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dense source offsets do not cover their dataset storage",
+            ));
+        }
+        if offsets.windows(2).any(|range| range[0] >= range[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive contains a source group without any dataset membership",
+            ));
+        }
+        let count = offsets.len() - 1;
+        let source_start = self.source_count;
+        let source_end = source_start.checked_add(count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many GGCAT sources")
+        })?;
+        let storage = self.add_storage(values);
+        self.dense_ranges.push(DenseSourceDatasetRange {
+            source_start,
+            source_end,
+            storage,
+            offsets,
+            offset,
+        });
+        self.source_count = source_end;
+        Ok(())
+    }
+
+    pub(crate) fn add_disk_storage(
+        &mut self,
+        sidecar: Arc<CidDatasetSidecar>,
+        offset: u32,
+    ) -> io::Result<()> {
+        let source_start = self.source_count;
+        let source_end = source_start.checked_add(sidecar.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many GGCAT sources")
+        })?;
+        self.disk_ranges.push(DiskSourceDatasetRange {
+            source_start,
+            source_end,
+            sidecar,
+            offset,
+        });
+        self.source_count = source_end;
         Ok(())
     }
 
@@ -864,23 +1228,50 @@ impl SourceDatasetMap {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.spans.len()
+        self.source_count
     }
 
     fn merge_source_into(&self, source: usize, target: &mut Vec<u32>) -> io::Result<()> {
-        let span = self.spans.get(source).ok_or_else(|| {
+        if let Some(span) = self.spans.get(source) {
+            let values = self.storages.get(span.storage).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "source dataset storage is missing")
+            })?;
+            let values = values.get(span.start..span.end).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "source dataset span is invalid")
+            })?;
+            return merge_sorted_dataset_ids_with_offset(target, values, span.offset);
+        }
+        if let Some(range) = self
+            .disk_ranges
+            .iter()
+            .find(|range| source >= range.source_start && source < range.source_end)
+        {
+            return range.sidecar.merge_group_into(
+                source - range.source_start,
+                target,
+                range.offset,
+            );
+        }
+        let range = self
+            .dense_ranges
+            .iter()
+            .find(|range| source >= range.source_start && source < range.source_end)
+            .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("ggcat source index {} is out of range", source),
             )
         })?;
-        let values = self.storages.get(span.storage).ok_or_else(|| {
+        let local = source - range.source_start;
+        let start = range.offsets[local];
+        let end = range.offsets[local + 1];
+        let values = self.storages.get(range.storage).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "source dataset storage is missing")
         })?;
-        let values = values.get(span.start..span.end).ok_or_else(|| {
+        let values = values.get(start..end).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "source dataset span is invalid")
         })?;
-        merge_sorted_dataset_ids_with_offset(target, values, span.offset)
+        merge_sorted_dataset_ids_with_offset(target, values, range.offset)
     }
 }
 
@@ -888,7 +1279,7 @@ fn resolve_subsets_to_dataset_ids(
     instance: &GGCATInstance,
     colormap_file: &Path,
     subsets: &[ColorIndexType],
-    color_index_to_source_index: &[usize],
+    color_index_to_source_index: Option<&[usize]>,
     source_dataset_ids: &SourceDatasetMap,
     dataset_count: usize,
 ) -> Result<HashMap<ColorIndexType, Arc<Vec<u32>>>> {
@@ -903,12 +1294,13 @@ fn resolve_subsets_to_dataset_ids(
     subset_list.sort_unstable();
     subset_list.dedup();
 
-    let resolved = Mutex::new(HashMap::<ColorIndexType, Arc<Vec<u32>>>::with_capacity(
-        subset_list.len(),
-    ));
+    let mut resolved = HashMap::<ColorIndexType, Arc<Vec<u32>>>::with_capacity(subset_list.len());
     let callback_err = Mutex::new(None::<io::Error>);
 
-    for chunk in subset_list.chunks(SUBSET_QUERY_CHUNK_SIZE.max(1)) {
+    for chunk in subset_list.chunks(subset_list.len().max(1)) {
+        let subset_sources = Mutex::new(Vec::<(ColorIndexType, Vec<usize>)>::with_capacity(
+            chunk.len(),
+        ));
         instance
             .query_colormap(
                 colormap_file.to_path_buf(),
@@ -923,26 +1315,37 @@ fn resolve_subsets_to_dataset_ids(
                         return;
                     }
 
-                    let mut dataset_ids = Vec::new();
+                    let mut source_indices = Vec::with_capacity(colors.len());
                     for &color in colors {
                         let color_idx = color as usize;
-                        let Some(&source_idx) = color_index_to_source_index.get(color_idx) else {
+                        let source_idx = match color_index_to_source_index {
+                            Some(mapping) => match mapping.get(color_idx) {
+                                Some(&source_idx) => source_idx,
+                                None => {
+                                    *callback_err.lock().expect("callback error lock poisoned") =
+                                        Some(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "ggcat color index {} is missing from its source mapping",
+                                                color_idx
+                                            ),
+                                        ));
+                                    return;
+                                }
+                            },
+                            None => color_idx,
+                        };
+                        if source_idx >= source_dataset_ids.len() {
                             *callback_err.lock().expect("callback error lock poisoned") =
                                 Some(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!("ggcat color index {} out of range", color_idx),
                                 ));
                             return;
-                        };
-                        if let Err(err) =
-                            source_dataset_ids.merge_source_into(source_idx, &mut dataset_ids)
-                        {
-                            *callback_err.lock().expect("callback error lock poisoned") = Some(err);
-                            return;
                         }
+                        source_indices.push(source_idx);
                     }
-
-                    if dataset_ids.is_empty() {
+                    if source_indices.is_empty() {
                         *callback_err.lock().expect("callback error lock poisoned") =
                             Some(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -950,25 +1353,10 @@ fn resolve_subsets_to_dataset_ids(
                             ));
                         return;
                     }
-                    if let Some(&invalid) = dataset_ids
-                        .iter()
-                        .find(|&&dataset_id| dataset_id == 0 || dataset_id as usize > dataset_count)
-                    {
-                        *callback_err.lock().expect("callback error lock poisoned") =
-                            Some(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "source color maps to dataset id {} outside [1, {}]",
-                                    invalid, dataset_count
-                                ),
-                            ));
-                        return;
-                    }
-
-                    resolved
+                    subset_sources
                         .lock()
-                        .expect("resolved-subset lock poisoned")
-                        .insert(subset, Arc::new(dataset_ids));
+                        .expect("subset-source lock poisoned")
+                        .push((subset, source_indices));
                 },
             )
             .map_err(|e| to_io_err("query ggcat colormap", e))?;
@@ -980,22 +1368,90 @@ fn resolve_subsets_to_dataset_ids(
         {
             return Err(err);
         }
+
+        let subset_sources = subset_sources
+            .into_inner()
+            .expect("subset-source lock poisoned");
+        if subset_sources.len() != chunk.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "queried {} color subsets but GGCAT returned {}",
+                    chunk.len(),
+                    subset_sources.len()
+                ),
+            ));
+        }
+        let request_count: usize = subset_sources
+            .iter()
+            .map(|(_, sources)| sources.len())
+            .sum();
+        let mut requests = Vec::<(usize, ColorIndexType)>::with_capacity(request_count);
+        let mut partial = HashMap::<ColorIndexType, Vec<u32>>::with_capacity(chunk.len());
+        for (subset, sources) in subset_sources {
+            partial.entry(subset).or_default();
+            requests.extend(sources.into_iter().map(|source| (source, subset)));
+        }
+        requests.sort_unstable();
+        requests.dedup();
+
+        let mut current_source = None;
+        let mut current_dataset_ids = Vec::new();
+        for (source, subset) in requests {
+            if current_source != Some(source) {
+                current_dataset_ids.clear();
+                source_dataset_ids.merge_source_into(source, &mut current_dataset_ids)?;
+                current_source = Some(source);
+            }
+            let dataset_ids = partial.get_mut(&subset).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("GGCAT returned unexpected color subset {}", subset),
+                )
+            })?;
+            merge_sorted_dataset_ids(dataset_ids, &current_dataset_ids);
+        }
+
+        for &subset in chunk {
+            let dataset_ids = partial.remove(&subset).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing resolved dataset IDs for subset {}", subset),
+                )
+            })?;
+            if dataset_ids.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGCAT color subset resolved to empty dataset set",
+                ));
+            }
+            if let Some(&invalid) = dataset_ids
+                .iter()
+                .find(|&&dataset_id| dataset_id == 0 || dataset_id as usize > dataset_count)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source color maps to dataset id {} outside [1, {}]",
+                        invalid, dataset_count
+                    ),
+                ));
+            }
+            resolved.insert(subset, Arc::new(dataset_ids));
+        }
     }
 
-    let map = resolved
-        .into_inner()
-        .expect("resolved-subset lock poisoned");
-    if map.len() != subset_list.len() {
+    if resolved.len() != subset_list.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "resolved {} color subsets but expected {}",
-                map.len(),
+                resolved.len(),
                 subset_list.len()
             ),
         ));
     }
-    Ok(map)
+    Ok(resolved)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1003,7 +1459,7 @@ fn emit_resolved_record_window(
     records: &mut Vec<SortedColorRecord>,
     instance: &GGCATInstance,
     colormap_file: &Path,
-    color_index_to_source_index: &[usize],
+    color_index_to_source_index: Option<&[usize]>,
     source_dataset_ids: &SourceDatasetMap,
     dataset_count: usize,
     sender: &mpsc::SyncSender<SimplitigBatch>,
@@ -1334,6 +1790,7 @@ struct StreamFinalize {
 struct StreamWriterState {
     omni_file: BufWriter<File>,
     size_file: BufWriter<File>,
+    cid_dataset_writer: Option<CidDatasetSidecarWriter>,
     cid_spill: DatasetCidSpill,
     position_spill: PositionSpill,
     size_block_groups: usize,
@@ -1349,6 +1806,9 @@ impl StreamWriterState {
     fn new(unitigs_file_path: String, output_dir: &str, nb_files: usize) -> Result<Self> {
         let cid_spill = DatasetCidSpill::new(output_dir, nb_files)?;
         let position_spill = PositionSpill::new(&cid_spill.directory)?;
+        let cid_dataset_writer = CidDatasetSidecarWriter::create(
+            &Path::new(output_dir).join(CID_TO_DATASET_FILE),
+        )?;
         Ok(Self {
             omni_file: BufWriter::with_capacity(
                 IO_BUFFER_CAPACITY,
@@ -1362,6 +1822,7 @@ impl StreamWriterState {
                 out.write_all(BUCKET_SIZES_MAGIC)?;
                 out
             },
+            cid_dataset_writer: Some(cid_dataset_writer),
             cid_spill,
             position_spill,
             size_block_groups: 0,
@@ -1422,6 +1883,10 @@ impl StreamWriterState {
     }
 
     fn append_group_cids(&mut self, dataset_ids_zero_based: &[usize]) -> Result<()> {
+        self.cid_dataset_writer
+            .as_mut()
+            .expect("CID dataset sidecar writer must be initialized")
+            .append_zero_based(dataset_ids_zero_based)?;
         self.cid_spill
             .append_group(dataset_ids_zero_based, self.cid)?;
         self.cid += 1;
@@ -1524,6 +1989,10 @@ impl StreamWriterState {
         self.flush_size_block()?;
         self.omni_file.flush()?;
         self.size_file.flush()?;
+        self.cid_dataset_writer
+            .take()
+            .expect("CID dataset sidecar writer must be initialized")
+            .finish()?;
 
         println!(
             "Completed compression: total tigs={}, total sizes={}",
@@ -2556,10 +3025,6 @@ fn produce_ggcat_records(
     })
     .map_err(|e| to_io_err("create ggcat instance", e))?;
 
-    let color_names = (0..source_count)
-        .map(|idx| idx.to_string())
-        .collect::<Vec<_>>();
-
     println!(
         "Running embedded ggcat structured-output path (k={}, m={}, threads={}, sources={}, datasets={}, total_memory={}GB, ggcat_memory={:.2}GB, disk_backed=true)",
         k,
@@ -2597,7 +3062,8 @@ fn produce_ggcat_records(
         .build_graph(
             input_streams,
             structured_output_key.clone(),
-            Some(&color_names),
+            None,
+            Some(source_count),
             k,
             threads.max(1),
             false,
@@ -2617,7 +3083,7 @@ fn produce_ggcat_records(
 
     let colormap_file = GGCATInstance::get_colormap_file(&records_output);
     let colors_deserializer =
-        ColorsDeserializer::<DefaultColorsSerializer>::new(&colormap_file, true)
+        ColorsDeserializer::<DefaultColorsSerializer>::new(&colormap_file, false)
             .map_err(|e| to_io_err("open ggcat colormap", e))?;
 
     let colors_count = colors_deserializer.colors_count();
@@ -2628,42 +3094,6 @@ fn produce_ggcat_records(
                 "ggcat returned {colors_count} colors but KLOE registered {source_count} sources"
             ),
         ));
-    }
-
-    let dumped_colors = GGCATInstance::dump_colors(&colormap_file)
-        .map_err(|e| to_io_err("dump ggcat colors", e))?
-        .collect::<Vec<_>>();
-    if dumped_colors.len() != colors_count {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "ggcat dumped {} color names but reports {} colors",
-                dumped_colors.len(),
-                colors_count
-            ),
-        ));
-    }
-    let mut color_index_to_source_index = Vec::with_capacity(colors_count);
-    for color_name in dumped_colors {
-        let parsed = color_name.parse::<usize>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ggcat color name '{}' is not a source index; expected numeric names",
-                    color_name
-                ),
-            )
-        })?;
-        if parsed >= source_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ggcat color name '{}' maps outside source range [0, {})",
-                    color_name, source_count
-                ),
-            ));
-        }
-        color_index_to_source_index.push(parsed);
     }
 
     let keep_ggcat = std::env::var_os("KLOE_KEEP_GGCAT").is_some();
@@ -2707,7 +3137,7 @@ fn produce_ggcat_records(
                     &mut record_window,
                     &instance,
                     &colormap_file,
-                    &color_index_to_source_index,
+                    None,
                     &source_dataset_ids,
                     dataset_count,
                     &sender,
@@ -2734,7 +3164,7 @@ fn produce_ggcat_records(
             &mut record_window,
             &instance,
             &colormap_file,
-            &color_index_to_source_index,
+            None,
             &source_dataset_ids,
             dataset_count,
             &sender,
@@ -2938,6 +3368,28 @@ mod structured_output_tests {
     }
 
     #[test]
+    fn cid_dataset_sidecar_roundtrips_and_applies_archive_offset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(CID_TO_DATASET_FILE);
+        let mut writer = CidDatasetSidecarWriter::create(&path).unwrap();
+        writer.append_one_based(&[1, 3, 9]).unwrap();
+        writer.append_zero_based(&[1, 4]).unwrap();
+        writer.finish().unwrap();
+
+        let sidecar = Arc::new(CidDatasetSidecar::open(&path).unwrap());
+        assert_eq!(sidecar.len(), 2);
+        let mut map = SourceDatasetMap::new();
+        map.add_disk_storage(sidecar, 10).unwrap();
+
+        let mut ids = vec![2, 11, 20];
+        map.merge_source_into(0, &mut ids).unwrap();
+        assert_eq!(ids, vec![2, 11, 13, 19, 20]);
+        let mut ids = Vec::new();
+        map.merge_source_into(1, &mut ids).unwrap();
+        assert_eq!(ids, vec![12, 15]);
+    }
+
+    #[test]
     fn structured_color_runs_are_split_without_fasta_headers() {
         let sequence = b"AACCGG";
         let mut colors = Vec::new();
@@ -2974,10 +3426,15 @@ mod structured_output_tests {
     fn parallel_checkpoint_pipeline_preserves_assigned_color_ids() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("colors.dat");
-        let color_names = (0..128).map(|id| id.to_string()).collect::<Vec<_>>();
         let serializer = Arc::new(
-            ColorsSerializer::<RunLengthColorsSerializer>::new(&path, &color_names, 4, false)
-                .unwrap(),
+            ColorsSerializer::<RunLengthColorsSerializer>::new(
+                &path,
+                &[],
+                Some(128),
+                4,
+                false,
+            )
+            .unwrap(),
         );
 
         let handles = (0..8)
@@ -3003,7 +3460,8 @@ mod structured_output_tests {
         Arc::try_unwrap(serializer).ok().unwrap().finalize();
 
         let mut deserializer =
-            ColorsDeserializer::<RunLengthColorsSerializer>::new(&path, true).unwrap();
+            ColorsDeserializer::<RunLengthColorsSerializer>::new(&path, false).unwrap();
+        assert_eq!(deserializer.colors_count(), 128);
         let mut decoded = Vec::new();
         for (subset_id, expected_color) in assigned {
             decoded.clear();
