@@ -127,24 +127,20 @@ Input directory for archive B.
 Output directory where the merged archive is written.
 
 #### memory -r
-The default merge is structural: packed SPSS bytes and compact metadata are streamed
-from archive A followed by archive B. It does not construct a graph, decode tigs, or
-materialize CID memberships. Its memory use is bounded by I/O and one compressed
-dataset-metadata record rather than by the number of k-mers or color sets. `-r` is
-retained for CLI consistency but is only used by merge recompaction.
+The default merge rebuilds the combined colored graph with embedded GGCAT. It removes
+sequence redundancy shared between the two input archives. `-r/--memory` is the
+global memory budget for this operation.
 
-#### recompact-merge
-Pass `--recompact-merge` to rebuild the combined colored graph with embedded GGCAT.
-This can remove sequence redundancy shared by the two input archives, but costs
-substantially more time and memory. The `-r/--memory` value is the global budget for
-this path. The input archives are still streamed without per-dataset FASTA dumps.
+#### structural-merge
+Pass `--structural-merge` only when a container-level concatenation is desired.
+This bounded-memory path preserves the input SPSS records but does not remove
+redundancy shared between the archives. It cannot be combined with a tig output mode.
 
 #### output tig mode flags
 Merge honors the same output mode flags as compression:
-- default structural merge: preserve each input archive's SPSS
+- default: simplitigs produced by GGCAT recompaction
 - `--unitig`
 - `--matchtig`
 - `--eulertig`
 
-Selecting an output tig mode enables GGCAT recompaction because a structural merge
-cannot change the input SPSS representation.
+Output tig modes apply to the default GGCAT merge.

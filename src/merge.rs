@@ -57,7 +57,7 @@ pub struct MergeConfig {
     pub use_unitigs: bool,
     pub use_matchtigs: bool,
     pub use_eulertigs: bool,
-    pub recompact: bool,
+    pub structural: bool,
 }
 
 impl Default for MergeConfig {
@@ -72,7 +72,7 @@ impl Default for MergeConfig {
             use_unitigs: false,
             use_matchtigs: false,
             use_eulertigs: false,
-            recompact: false,
+            structural: false,
         }
     }
 }
@@ -104,7 +104,7 @@ fn require_magic(path: &Path, expected: &[u8; 4]) -> io::Result<BufReader<File>>
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "'{}' uses a legacy archive encoding; use --recompact-merge to convert it",
+                "'{}' uses a legacy archive encoding and cannot be structurally joined",
                 path.display()
             ),
         ));
@@ -896,9 +896,15 @@ pub fn merge_archives_with_config(
     let output_root = Path::new(output_dir);
 
     let requested_tig_rebuild = cfg.use_unitigs || cfg.use_matchtigs || cfg.use_eulertigs;
-    if !cfg.recompact && !requested_tig_rebuild {
+    if cfg.structural {
+        if requested_tig_rebuild {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--structural-merge cannot change the SPSS mode; remove the tig output flag",
+            ));
+        }
         println!(
-            "Merging packed KLOE archives structurally (bounded memory, no graph rebuild)"
+            "Structurally joining packed KLOE archives (no graph rebuild or cross-archive deduplication)"
         );
         if cfg.verify_kmers {
             eprintln!(
@@ -919,10 +925,6 @@ pub fn merge_archives_with_config(
             output_root.to_string_lossy()
         );
         return Ok(());
-    }
-
-    if requested_tig_rebuild && !cfg.recompact {
-        println!("A tig output mode was requested; enabling GGCAT merge recompaction.");
     }
 
     fs::create_dir_all(output_root)?;
