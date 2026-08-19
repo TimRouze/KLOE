@@ -1,7 +1,8 @@
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ggcat_api::{
     ColorIndexType, DnaSequence, DnaSequencesFileType, DynamicSequencesStream,
@@ -56,6 +57,7 @@ pub struct MergeConfig {
     pub use_unitigs: bool,
     pub use_matchtigs: bool,
     pub use_eulertigs: bool,
+    pub recompact: bool,
 }
 
 impl Default for MergeConfig {
@@ -70,6 +72,7 @@ impl Default for MergeConfig {
             use_unitigs: false,
             use_matchtigs: false,
             use_eulertigs: false,
+            recompact: false,
         }
     }
 }
@@ -82,6 +85,479 @@ struct ArchiveInfo {
     tigs_path: PathBuf,
     sizes_path: PathBuf,
     compact_sizes: Option<Arc<CompactSizesIndex>>,
+}
+
+#[derive(Debug)]
+struct CompactArchiveLayout {
+    root: PathBuf,
+    filenames: Vec<String>,
+    position_entries: u64,
+    group_count: u64,
+    packed_tigs_bytes: u64,
+}
+
+fn require_magic(path: &Path, expected: &[u8; 4]) -> io::Result<BufReader<File>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "'{}' uses a legacy archive encoding; use --recompact-merge to convert it",
+                path.display()
+            ),
+        ));
+    }
+    Ok(reader)
+}
+
+fn inspect_compact_positions(path: &Path) -> io::Result<(u64, u64, u64)> {
+    let mut reader = require_magic(path, POSITIONS_MAGIC)?;
+    let entries = read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "missing compact positions count")
+    })?;
+    if entries == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("compact positions file '{}' has no entries", path.display()),
+        ));
+    }
+    let mut tigs_position = 0u64;
+    let mut sizes_position = 0u64;
+    for _ in 0..entries {
+        let tigs_delta = read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated compact tig positions")
+        })?;
+        let sizes_delta = read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated compact size positions")
+        })?;
+        tigs_position = tigs_position.checked_add(tigs_delta).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact tig position overflow")
+        })?;
+        sizes_position = sizes_position.checked_add(sizes_delta).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "compact size position overflow")
+        })?;
+    }
+    if read_varint_u64_from_reader(&mut reader)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("compact positions file '{}' has trailing entries", path.display()),
+        ));
+    }
+    let groups = entries - 1;
+    if sizes_position != groups {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact positions in '{}' describe {} size groups, expected {}",
+                path.display(),
+                sizes_position,
+                groups
+            ),
+        ));
+    }
+    Ok((entries, groups, tigs_position))
+}
+
+fn inspect_compact_bucket_sizes(path: &Path) -> io::Result<u64> {
+    let mut reader = require_magic(path, BUCKET_SIZES_MAGIC)?;
+    let mut groups = 0u64;
+    loop {
+        let mut count_buf = [0u8; 4];
+        match reader.read_exact(&mut count_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err),
+        }
+        let count = u32::from_le_bytes(count_buf) as u64;
+        if count == 0 {
+            break;
+        }
+        let mut len_buf = [0u8; 8];
+        reader.read_exact(&mut len_buf)?;
+        let compressed_len = u64::from_le_bytes(len_buf);
+        let offsets_bytes = (count + 1).checked_mul(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "bucket-size offset overflow")
+        })?;
+        let skip = offsets_bytes.checked_add(compressed_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "bucket-size block overflow")
+        })?;
+        reader.seek(SeekFrom::Current(i64::try_from(skip).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "bucket-size block is too large")
+        })?))?;
+        groups = groups.checked_add(count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "bucket-size group count overflow")
+        })?;
+    }
+    Ok(groups)
+}
+
+impl CompactArchiveLayout {
+    fn inspect(root: &Path) -> io::Result<Self> {
+        ensure_archive_complete(root)?;
+        let positions_path = root.join("positions_kloe.bin");
+        let sizes_path = root.join("bucket_sizes.txt");
+        let tigs_path = root.join("tigs_kloe.fa");
+        let _ = require_magic(&root.join("id_to_color_id.txt.zst"), ID_TO_CID_MAGIC)?;
+        let (position_entries, group_count, packed_tigs_bytes) =
+            inspect_compact_positions(&positions_path)?;
+        let sizes_groups = inspect_compact_bucket_sizes(&sizes_path)?;
+        if sizes_groups != group_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "archive '{}' has {} position groups but {} bucket-size groups",
+                    root.display(),
+                    group_count,
+                    sizes_groups
+                ),
+            ));
+        }
+        let actual_tigs_bytes = fs::metadata(&tigs_path)?.len();
+        if actual_tigs_bytes != packed_tigs_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "archive '{}' positions end at byte {}, but packed tigs contain {} bytes",
+                    root.display(),
+                    packed_tigs_bytes,
+                    actual_tigs_bytes
+                ),
+            ));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            filenames: load_filenames(&root.join("filenames_id.txt"))?,
+            position_entries,
+            group_count,
+            packed_tigs_bytes,
+        })
+    }
+}
+
+fn write_varint_u64_to_writer(mut value: u64, writer: &mut impl Write) -> io::Result<()> {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        writer.write_all(&[byte])?;
+        if value == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn copy_file_into(path: &Path, output: &mut BufWriter<File>) -> io::Result<u64> {
+    let mut input = BufReader::with_capacity(16 * 1024 * 1024, File::open(path)?);
+    io::copy(&mut input, output)
+}
+
+fn append_compact_file_body(
+    path: &Path,
+    magic: &[u8; 4],
+    output: &mut BufWriter<File>,
+) -> io::Result<u64> {
+    let mut input = require_magic(path, magic)?;
+    io::copy(&mut input, output)
+}
+
+fn append_position_deltas(
+    path: &Path,
+    skip_initial_entry: bool,
+    output: &mut BufWriter<File>,
+) -> io::Result<()> {
+    let mut input = require_magic(path, POSITIONS_MAGIC)?;
+    let entries = read_varint_u64_from_reader(&mut input)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "missing compact positions count")
+    })?;
+    if entries == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compact positions contain no initial entry",
+        ));
+    }
+    if skip_initial_entry {
+        let initial_tigs = read_varint_u64_from_reader(&mut input)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "missing initial tig position")
+        })?;
+        let initial_sizes = read_varint_u64_from_reader(&mut input)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "missing initial size position")
+        })?;
+        if initial_tigs != 0 || initial_sizes != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compact positions do not begin at zero",
+            ));
+        }
+    }
+    io::copy(&mut input, output)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_shifted_dataset_cids(
+    path: &Path,
+    expected_datasets: usize,
+    source_group_count: u64,
+    cid_offset: u64,
+    output: &mut BufWriter<File>,
+    output_position: &mut u64,
+    output_offsets: &mut Vec<usize>,
+    scratch: &mut File,
+) -> io::Result<()> {
+    let mut input = require_magic(path, ID_TO_CID_MAGIC)?;
+    for dataset in 0..expected_datasets {
+        let mut len_buf = [0u8; 8];
+        input.read_exact(&mut len_buf).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("missing dataset {} CID payload in '{}': {err}", dataset, path.display()),
+            )
+        })?;
+        let payload_len = u64::from_le_bytes(len_buf);
+        if payload_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("premature CID terminator at dataset {} in '{}'", dataset, path.display()),
+            ));
+        }
+
+        scratch.set_len(0)?;
+        scratch.seek(SeekFrom::Start(0))?;
+        {
+            let limited = (&mut input).take(payload_len);
+            let mut decoder = Decoder::new(limited)?;
+            let mut encoder = zstd::Encoder::new(&mut *scratch, 1)?;
+            let mut current_cid = 0u64;
+            let mut first = true;
+            while let Some(delta) = read_varint_u64_from_reader(&mut decoder)? {
+                current_cid = current_cid.checked_add(delta).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "dataset CID overflow")
+                })?;
+                if current_cid >= source_group_count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "dataset {} CID {} is outside [0, {}) in '{}'",
+                            dataset,
+                            current_cid,
+                            source_group_count,
+                            path.display()
+                        ),
+                    ));
+                }
+                let output_delta = if first {
+                    current_cid.checked_add(cid_offset).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "shifted CID overflow")
+                    })?
+                } else {
+                    delta
+                };
+                write_varint_u64_to_writer(output_delta, &mut encoder)?;
+                first = false;
+            }
+            encoder.finish()?;
+        }
+
+        let output_payload_len = scratch.seek(SeekFrom::End(0))?;
+        scratch.seek(SeekFrom::Start(0))?;
+        output_offsets.push(usize::try_from(*output_position).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "id-to-CID offset cannot fit usize")
+        })?);
+        output.write_all(&output_payload_len.to_le_bytes())?;
+        io::copy(scratch, output)?;
+        *output_position = output_position
+            .checked_add(8)
+            .and_then(|position| position.checked_add(output_payload_len))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id-to-CID size overflow"))?;
+    }
+
+    let mut terminator = [0u8; 8];
+    input.read_exact(&mut terminator)?;
+    if u64::from_le_bytes(terminator) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("'{}' contains more datasets than filenames", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn append_unshifted_dataset_cids(
+    path: &Path,
+    expected_datasets: usize,
+    output: &mut BufWriter<File>,
+    output_position: &mut u64,
+    output_offsets: &mut Vec<usize>,
+) -> io::Result<()> {
+    let mut input = require_magic(path, ID_TO_CID_MAGIC)?;
+    for dataset in 0..expected_datasets {
+        let mut len_buf = [0u8; 8];
+        input.read_exact(&mut len_buf).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("missing dataset {} CID payload in '{}': {err}", dataset, path.display()),
+            )
+        })?;
+        let payload_len = u64::from_le_bytes(len_buf);
+        if payload_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("premature CID terminator at dataset {} in '{}'", dataset, path.display()),
+            ));
+        }
+        output_offsets.push(usize::try_from(*output_position).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "id-to-CID offset cannot fit usize")
+        })?);
+        output.write_all(&len_buf)?;
+        let copied = io::copy(&mut (&mut input).take(payload_len), output)?;
+        if copied != payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated dataset {} CID payload in '{}'", dataset, path.display()),
+            ));
+        }
+        *output_position = (*output_position)
+            .checked_add(8)
+            .and_then(|position| position.checked_add(payload_len))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id-to-CID size overflow"))?;
+    }
+    let mut terminator = [0u8; 8];
+    input.read_exact(&mut terminator)?;
+    if u64::from_le_bytes(terminator) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("'{}' contains more datasets than filenames", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn merge_compact_archives_structurally(
+    archive_a_root: &Path,
+    archive_b_root: &Path,
+    output_root: &Path,
+    temp_dir: &str,
+) -> io::Result<()> {
+    let timer = Instant::now();
+    let archive_a = CompactArchiveLayout::inspect(archive_a_root)?;
+    let archive_b = CompactArchiveLayout::inspect(archive_b_root)?;
+    let output_groups = archive_a
+        .group_count
+        .checked_add(archive_b.group_count)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "merged group count overflow"))?;
+    let output_entries = archive_a
+        .position_entries
+        .checked_add(archive_b.position_entries)
+        .and_then(|entries| entries.checked_sub(1))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "merged position count overflow"))?;
+
+    fs::create_dir_all(output_root)?;
+    let output_dir = normalize_output_dir(output_root);
+
+    let mut tigs_output = BufWriter::with_capacity(
+        16 * 1024 * 1024,
+        File::create(output_root.join("tigs_kloe.fa"))?,
+    );
+    let copied_a = copy_file_into(&archive_a.root.join("tigs_kloe.fa"), &mut tigs_output)?;
+    let copied_b = copy_file_into(&archive_b.root.join("tigs_kloe.fa"), &mut tigs_output)?;
+    tigs_output.flush()?;
+    if copied_a != archive_a.packed_tigs_bytes || copied_b != archive_b.packed_tigs_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packed tig file changed while it was being merged",
+        ));
+    }
+
+    let mut sizes_output = BufWriter::with_capacity(
+        16 * 1024 * 1024,
+        File::create(output_root.join("bucket_sizes.txt"))?,
+    );
+    sizes_output.write_all(BUCKET_SIZES_MAGIC)?;
+    append_compact_file_body(
+        &archive_a.root.join("bucket_sizes.txt"),
+        BUCKET_SIZES_MAGIC,
+        &mut sizes_output,
+    )?;
+    append_compact_file_body(
+        &archive_b.root.join("bucket_sizes.txt"),
+        BUCKET_SIZES_MAGIC,
+        &mut sizes_output,
+    )?;
+    sizes_output.flush()?;
+
+    let mut positions_output = BufWriter::with_capacity(
+        16 * 1024 * 1024,
+        File::create(output_root.join("positions_kloe.bin"))?,
+    );
+    positions_output.write_all(POSITIONS_MAGIC)?;
+    write_varint_u64_to_writer(output_entries, &mut positions_output)?;
+    append_position_deltas(
+        &archive_a.root.join("positions_kloe.bin"),
+        false,
+        &mut positions_output,
+    )?;
+    append_position_deltas(
+        &archive_b.root.join("positions_kloe.bin"),
+        true,
+        &mut positions_output,
+    )?;
+    positions_output.flush()?;
+
+    let scratch_root = if temp_dir.is_empty() {
+        output_root
+    } else {
+        Path::new(temp_dir)
+    };
+    fs::create_dir_all(scratch_root)?;
+    let mut scratch = tempfile::tempfile_in(scratch_root)?;
+    let mut cid_output = BufWriter::with_capacity(
+        16 * 1024 * 1024,
+        File::create(output_root.join("id_to_color_id.txt.zst"))?,
+    );
+    cid_output.write_all(ID_TO_CID_MAGIC)?;
+    let mut cid_output_position = ID_TO_CID_MAGIC.len() as u64;
+    let mut dataset_offsets = Vec::with_capacity(
+        archive_a
+            .filenames
+            .len()
+            .saturating_add(archive_b.filenames.len()),
+    );
+    append_unshifted_dataset_cids(
+        &archive_a.root.join("id_to_color_id.txt.zst"),
+        archive_a.filenames.len(),
+        &mut cid_output,
+        &mut cid_output_position,
+        &mut dataset_offsets,
+    )?;
+    append_shifted_dataset_cids(
+        &archive_b.root.join("id_to_color_id.txt.zst"),
+        archive_b.filenames.len(),
+        archive_b.group_count,
+        archive_a.group_count,
+        &mut cid_output,
+        &mut cid_output_position,
+        &mut dataset_offsets,
+        &mut scratch,
+    )?;
+    cid_output.write_all(&0u64.to_le_bytes())?;
+    cid_output.flush()?;
+
+    let mut filenames = archive_a.filenames;
+    filenames.extend(archive_b.filenames);
+    compress::write_filenames_id_offsets(&output_dir, &filenames, &dataset_offsets)?;
+
+    println!(
+        "Structural archive merge complete: datasets={}, groups={}, packed_tigs_bytes={}, elapsed={:.3}s",
+        filenames.len(),
+        output_groups,
+        copied_a.saturating_add(copied_b),
+        timer.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -418,6 +894,36 @@ pub fn merge_archives_with_config(
     let archive_a_root = Path::new(archive_a_dir);
     let archive_b_root = Path::new(archive_b_dir);
     let output_root = Path::new(output_dir);
+
+    let requested_tig_rebuild = cfg.use_unitigs || cfg.use_matchtigs || cfg.use_eulertigs;
+    if !cfg.recompact && !requested_tig_rebuild {
+        println!(
+            "Merging packed KLOE archives structurally (bounded memory, no graph rebuild)"
+        );
+        if cfg.verify_kmers {
+            eprintln!(
+                "Warning: --verify-kmers is not needed for the byte-preserving structural merge."
+            );
+        }
+        if cfg.skip_sort {
+            eprintln!("Warning: --skip-sort has no effect on structural archive merge.");
+        }
+        merge_compact_archives_structurally(
+            archive_a_root,
+            archive_b_root,
+            output_root,
+            &cfg.temp_dir,
+        )?;
+        println!(
+            "Merge complete: output archive written to {} (structural SPSS)",
+            output_root.to_string_lossy()
+        );
+        return Ok(());
+    }
+
+    if requested_tig_rebuild && !cfg.recompact {
+        println!("A tig output mode was requested; enabling GGCAT merge recompaction.");
+    }
 
     fs::create_dir_all(output_root)?;
     let output_dir_norm = normalize_output_dir(output_root);

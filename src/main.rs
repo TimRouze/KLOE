@@ -65,6 +65,9 @@ struct Args {
     /// During decompression, rebuild tigs from Dump_*.fa using ggcat
     #[arg(long = "ggcat-rebuild", default_value_t = false)]
     ggcat_rebuild: bool,
+    /// Rebuild the colored graph while merging instead of structurally joining archives
+    #[arg(long = "recompact-merge", default_value_t = false)]
+    recompact_merge: bool,
 }
 fn main() {
     let args = Args::parse();
@@ -176,6 +179,7 @@ fn main() {
                 use_unitigs,
                 use_matchtigs,
                 use_eulertigs,
+                recompact: args.recompact_merge,
             };
             if let Err(err) = merge::merge_archives_with_config(
                 &input_dir,
