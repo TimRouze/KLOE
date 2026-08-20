@@ -210,8 +210,14 @@ fn is_compressed_dir_complete(input_dir: String) {
         panic!("Positions file not found");
     } else if !Path::new(&format!("{input_dir}/bucket_sizes.txt")).exists() {
         panic!("Tigs sizes file not found");
-    } else if !Path::new(&format!("{input_dir}/id_to_color_id.txt.zst")).exists() {
-        panic!("id to color id file not found");
+    } else if !Path::new(&format!("{input_dir}/id_to_color_id.txt.zst")).exists()
+        && !Path::new(&format!(
+            "{input_dir}/{}",
+            compress::CID_TO_DATASET_FILE
+        ))
+        .exists()
+    {
+        panic!("archive membership index not found");
     } else if !Path::new(&format!("{input_dir}/tigs_kloe.fa")).exists() {
         panic!("Tigs file not found");
     } else {
@@ -1005,6 +1011,13 @@ mod tests {
             .expect("compress archive A");
         run_compression(&[b_file1.clone(), b_file2.clone()], &archive_b, K)
             .expect("compress archive B");
+        for archive in [&archive_a, &archive_b] {
+            assert!(archive.join(compress::CID_TO_DATASET_FILE).is_file());
+            assert!(
+                !archive.join("id_to_color_id.txt.zst").exists(),
+                "new archives must not duplicate the membership relation"
+            );
+        }
 
         merge::merge_archives(
             &archive_a.display().to_string(),
@@ -1014,6 +1027,8 @@ mod tests {
             1,
         )
         .expect("merge archives");
+        assert!(merged_archive.join(compress::CID_TO_DATASET_FILE).is_file());
+        assert!(!merged_archive.join("id_to_color_id.txt.zst").exists());
 
         run_full_decompression(&merged_archive, &merged_out);
 

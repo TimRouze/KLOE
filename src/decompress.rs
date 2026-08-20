@@ -1,5 +1,5 @@
 use core::panic;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
 use zstd::Decoder;
 
+use crate::compress::{CID_TO_DATASET_FILE, CidDatasetSidecar};
 use crate::utils::vec2str;
 
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
+const BUCKET_SIZES_COMPACT_MAGIC: &[u8; 4] = b"KSB3";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
+const POSITIONS_COMPACT_MAGIC: &[u8; 4] = b"KPS3";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
 
 //   =========================================================================================== DECOMPRESSION ==============================================================================
@@ -237,6 +240,42 @@ pub fn decompress_with_options(
     println!("Writing decompressed data in {out_dir}");
     ensure_output_dir(out_dir)?;
 
+    let filenames_path = input_dir.clone() + filename_id;
+    let filenames = load_archive_filenames(&filenames_path)?;
+    let sidecar_path = Path::new(&input_dir).join(CID_TO_DATASET_FILE);
+    if sidecar_path.is_file() {
+        let wanted_filenames = if wanted_files_path.is_empty() {
+            filenames.clone()
+        } else {
+            select_wanted_filenames(&filenames, wanted_files_path)?
+        };
+        println!(
+            "Using compact CID-to-dataset index for {} decompression",
+            if wanted_files_path.is_empty() {
+                "complete"
+            } else {
+                "targeted"
+            }
+        );
+        decompress_sidecar(
+            &sidecar_path,
+            &(input_dir.clone() + positions_filename),
+            &(input_dir.to_owned() + tigs_filename),
+            &(input_dir.to_owned() + size_filename),
+            out_dir,
+            &filenames,
+            if wanted_files_path.is_empty() {
+                None
+            } else {
+                Some(&wanted_filenames)
+            },
+        )?;
+        if ggcat_cfg.enabled {
+            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
+        }
+        return Ok(());
+    }
+
     if wanted_files_path != "" {
         let input_file = File::open(input_dir.clone() + filename_id).unwrap();
         let input_reader = BufReader::new(input_file);
@@ -302,6 +341,361 @@ pub fn decompress_with_options(
         run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
     }
     Ok(())
+}
+
+fn load_archive_filenames(filename_id_path: &str) -> Result<Vec<(String, u32)>> {
+    let input_reader = BufReader::new(File::open(filename_id_path)?);
+    let mut filenames = Vec::new();
+    for (file_id, line_result) in input_reader.lines().enumerate() {
+        let line = line_result?;
+        let path = line.rsplit_once(':').map(|(path, _)| path).unwrap_or(&line);
+        let file_id = u32::try_from(file_id).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "archive has more than u32::MAX datasets")
+        })?;
+        filenames.push((path.to_owned(), file_id));
+    }
+    Ok(filenames)
+}
+
+fn select_wanted_filenames(
+    filenames: &[(String, u32)],
+    wanted_files_path: &str,
+) -> Result<Vec<(String, u32)>> {
+    let by_name: HashMap<&str, u32> = filenames
+        .iter()
+        .map(|(path, file_id)| (path.as_str(), *file_id))
+        .collect();
+    let wanted_reader = BufReader::new(File::open(wanted_files_path)?);
+    let mut wanted = Vec::new();
+    for line_result in wanted_reader.lines() {
+        let path = line_result?;
+        if let Some(&file_id) = by_name.get(path.as_str()) {
+            wanted.push((path, file_id));
+        } else {
+            println!(
+                "FILE {} NOT FOUND IN ARCHIVE, CHECK SPELLING OR ACTUAL PRESENCE IN ARCHIVE",
+                path
+            );
+        }
+    }
+    Ok(wanted)
+}
+
+fn decompress_sidecar(
+    sidecar_filename: &Path,
+    positions_filename: &str,
+    tigs_filename: &str,
+    size_filename: &str,
+    out_dir: &str,
+    filenames: &[(String, u32)],
+    wanted_filenames: Option<&[(String, u32)]>,
+) -> Result<()> {
+    let sidecar = CidDatasetSidecar::open(sidecar_filename)?;
+    let tig_positions = preload_tig_positions(positions_filename)?;
+    let mut sizes_reader = SequentialCompactSizesReader::open(size_filename)?;
+    if tig_positions.len() != sidecar.len().saturating_add(1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "CID sidecar has {} groups but positions contain {} entries",
+                sidecar.len(),
+                tig_positions.len()
+            ),
+        ));
+    }
+
+    let wanted_ids = wanted_filenames.map(|wanted| {
+        wanted
+            .iter()
+            .map(|(_, file_id)| *file_id)
+            .collect::<HashSet<_>>()
+    });
+    let mut writers: HashMap<u32, BufWriter<File>> = HashMap::new();
+    if let Some(wanted) = wanted_filenames {
+        for (path, file_id) in wanted {
+            let output_path = dump_output_path(out_dir, path);
+            writers.insert(
+                *file_id,
+                BufWriter::new(File::options().append(true).create(true).open(output_path)?),
+            );
+        }
+    }
+
+    let mut tigs_file = BufReader::new(File::open(tigs_filename)?);
+    let mut selected_ids = Vec::<u32>::new();
+    let mut tig_buffer = Vec::<u8>::new();
+    let mut sizes = Vec::<usize>::new();
+    let mut selected_cids = 0usize;
+    let mut total_unitigs = 0u64;
+    sidecar.visit_groups(|cid, dataset_ids| {
+        if !sizes_reader.next_group_into(&mut sizes)? {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("bucket sizes ended before CID {}", cid),
+            ));
+        }
+        selected_ids.clear();
+        for &one_based in dataset_ids {
+            let file_id = one_based.checked_sub(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "sidecar contains dataset ID zero")
+            })?;
+            if file_id as usize >= filenames.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("sidecar dataset ID {} is out of range", one_based),
+                ));
+            }
+            if wanted_ids
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(&file_id))
+            {
+                selected_ids.push(file_id);
+            }
+        }
+        if selected_ids.is_empty() {
+            return Ok(());
+        }
+
+        selected_cids += 1;
+        if selected_cids % 1000 == 1 || cid + 1 == sidecar.len() {
+            println!(
+                "Processing selected CID {} (archive CID {}/{}, {} unitigs written so far)",
+                selected_cids,
+                cid + 1,
+                sidecar.len(),
+                total_unitigs
+            );
+        }
+        let tigs_pos = tig_positions[cid];
+        tigs_file.seek(std::io::SeekFrom::Start(tigs_pos))?;
+        for &size in &sizes {
+            tig_buffer.resize(size.div_ceil(4), 0);
+            tigs_file.read_exact(&mut tig_buffer)?;
+            let tig = vec2str(&tig_buffer, &size);
+            for &file_id in &selected_ids {
+                let writer = match writers.entry(file_id) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let output_path = dump_output_path(out_dir, &filenames[file_id as usize].0);
+                        entry.insert(BufWriter::new(
+                            File::options().append(true).create(true).open(output_path)?,
+                        ))
+                    }
+                };
+                writeln!(writer, ">")?;
+                writeln!(writer, "{}", tig)?;
+            }
+            total_unitigs += 1;
+        }
+        Ok(())
+    })?;
+    if sizes_reader.next_group_into(&mut sizes)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bucket sizes contain more groups than the CID sidecar",
+        ));
+    }
+    for (_, mut writer) in writers {
+        writer.flush()?;
+    }
+    println!(
+        "Decompression complete: {} unitigs written across {} selected CIDs",
+        total_unitigs, selected_cids
+    );
+    Ok(())
+}
+
+struct SequentialCompactSizesReader {
+    file: BufReader<File>,
+    length_prefixed: bool,
+    ranges: Vec<(usize, usize)>,
+    data: Vec<u8>,
+    next_range: usize,
+    finished: bool,
+}
+
+impl SequentialCompactSizesReader {
+    fn open(path: &str) -> Result<Self> {
+        let mut file = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        let length_prefixed = if &magic == BUCKET_SIZES_MAGIC {
+            false
+        } else if &magic == BUCKET_SIZES_COMPACT_MAGIC {
+            true
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported compact bucket-size encoding in '{}'", path),
+            ));
+        };
+        Ok(Self {
+            file,
+            length_prefixed,
+            ranges: Vec::new(),
+            data: Vec::new(),
+            next_range: 0,
+            finished: false,
+        })
+    }
+
+    fn next_group_into(&mut self, sizes: &mut Vec<usize>) -> Result<bool> {
+        if self.next_range == self.ranges.len() && !self.load_next_block()? {
+            return Ok(false);
+        }
+        let (start, end) = self.ranges[self.next_range];
+        self.next_range += 1;
+        decode_varint_deltas_to_sizes_into(
+            &self.data[start..end],
+            "compact bucket group",
+            sizes,
+        )?;
+        Ok(true)
+    }
+
+    fn load_next_block(&mut self) -> Result<bool> {
+        if self.finished {
+            return Ok(false);
+        }
+        let mut groups_buf = [0u8; 4];
+        match self.file.read_exact(&mut groups_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                self.finished = true;
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        }
+        let groups = u32::from_le_bytes(groups_buf) as usize;
+        if groups == 0 {
+            self.finished = true;
+            return Ok(false);
+        }
+        let mut compressed_len_buf = [0u8; 8];
+        self.file.read_exact(&mut compressed_len_buf)?;
+        let compressed_len = usize::try_from(u64::from_le_bytes(compressed_len_buf)).map_err(
+            |_| io::Error::new(io::ErrorKind::InvalidData, "bucket-size block is too large"),
+        )?;
+
+        let mut offsets = Vec::new();
+        if !self.length_prefixed {
+            offsets.resize(groups + 1, 0u32);
+            let mut bytes = [0u8; 4];
+            for offset in &mut offsets {
+                self.file.read_exact(&mut bytes)?;
+                *offset = u32::from_le_bytes(bytes);
+            }
+        }
+        let mut compressed = vec![0u8; compressed_len];
+        self.file.read_exact(&mut compressed)?;
+        self.data.clear();
+        Decoder::new(compressed.as_slice())?.read_to_end(&mut self.data)?;
+        self.ranges.clear();
+        self.ranges.reserve(groups);
+        self.next_range = 0;
+
+        if self.length_prefixed {
+            let mut cursor = std::io::Cursor::new(self.data.as_slice());
+            for _ in 0..groups {
+                let group_len = read_varint_u64_from_reader(&mut cursor)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "missing compact bucket group length",
+                    )
+                })?;
+                let start = cursor.position() as usize;
+                let end = start
+                    .checked_add(usize::try_from(group_len).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compact bucket group is too large",
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compact bucket group offset overflow",
+                        )
+                    })?;
+                if end > self.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compact bucket group extends past its block",
+                    ));
+                }
+                self.ranges.push((start, end));
+                cursor.set_position(end as u64);
+            }
+            if cursor.position() as usize != self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compact bucket block has trailing data",
+                ));
+            }
+        } else {
+            if offsets.windows(2).any(|range| range[0] > range[1])
+                || offsets.last().copied().map(|value| value as usize) != Some(self.data.len())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compact bucket block offsets are invalid",
+                ));
+            }
+            self.ranges.extend(
+                offsets
+                    .windows(2)
+                    .map(|range| (range[0] as usize, range[1] as usize)),
+            );
+        }
+        Ok(true)
+    }
+}
+
+fn preload_tig_positions(positions_filename: &str) -> Result<Vec<u64>> {
+    let mut file = BufReader::new(File::open(positions_filename)?);
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic == POSITIONS_MAGIC || &magic == POSITIONS_COMPACT_MAGIC {
+        let implicit_sizes = &magic == POSITIONS_COMPACT_MAGIC;
+        let entries = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "missing positions entry count")
+        })?;
+        let entries = usize::try_from(entries).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "positions entry count is too large")
+        })?;
+        let mut positions = Vec::with_capacity(entries);
+        let mut position = 0u64;
+        for _ in 0..entries {
+            let delta = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated tig position")
+            })?;
+            position = position.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "tig position overflow")
+            })?;
+            positions.push(position);
+            if !implicit_sizes {
+                read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated size position")
+                })?;
+            }
+        }
+        return Ok(positions);
+    }
+
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let file_size = file.get_ref().metadata()?.len() as usize;
+    if file_size % 16 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy positions size is not divisible by 16",
+        ));
+    }
+    let mut positions = Vec::with_capacity(file_size / 16);
+    let mut entry = [0u8; 16];
+    while file.read_exact(&mut entry).is_ok() {
+        positions.push(u64::from_le_bytes(entry[..8].try_into().unwrap()));
+    }
+    Ok(positions)
 }
 
 /// Preload all positions from the raw binary positions file.
@@ -371,8 +765,18 @@ fn decode_varint_delta_cids(payload: &[u8], context: &str) -> Result<Vec<usize>>
 }
 
 fn decode_varint_deltas_to_sizes(payload: &[u8], context: &str) -> Result<Vec<usize>> {
-    let mut cursor = std::io::Cursor::new(payload);
     let mut sizes = Vec::new();
+    decode_varint_deltas_to_sizes_into(payload, context, &mut sizes)?;
+    Ok(sizes)
+}
+
+fn decode_varint_deltas_to_sizes_into(
+    payload: &[u8],
+    context: &str,
+    sizes: &mut Vec<usize>,
+) -> Result<()> {
+    let mut cursor = std::io::Cursor::new(payload);
+    sizes.clear();
     let mut prev = 0usize;
     loop {
         let Some(delta_u64) = read_varint_u64_from_reader(&mut cursor)? else {
@@ -396,7 +800,7 @@ fn decode_varint_deltas_to_sizes(payload: &[u8], context: &str) -> Result<Vec<us
         sizes.push(size);
         prev = size;
     }
-    Ok(sizes)
+    Ok(())
 }
 
 fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
@@ -408,7 +812,8 @@ fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
         Err(err) => return Err(err),
     }
 
-    if &magic == POSITIONS_MAGIC {
+    if &magic == POSITIONS_MAGIC || &magic == POSITIONS_COMPACT_MAGIC {
+        let implicit_sizes = &magic == POSITIONS_COMPACT_MAGIC;
         let entries = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -424,19 +829,23 @@ fn preload_positions(positions_filename: &str) -> Result<Vec<(u64, u64)>> {
         let mut positions = Vec::with_capacity(entries);
         let mut tigs_pos = 0u64;
         let mut sizes_pos = 0u64;
-        for _ in 0..entries {
+        for entry in 0..entries {
             let dt = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated tigs delta in positions file",
                 )
             })?;
-            let ds = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated sizes delta in positions file",
-                )
-            })?;
+            let ds = if implicit_sizes {
+                u64::from(entry > 0)
+            } else {
+                read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated sizes delta in positions file",
+                    )
+                })?
+            };
             tigs_pos = tigs_pos.checked_add(dt).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -537,7 +946,8 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
         Err(err) => return Err(err),
     }
 
-    if &magic == BUCKET_SIZES_MAGIC {
+    if &magic == BUCKET_SIZES_MAGIC || &magic == BUCKET_SIZES_COMPACT_MAGIC {
+        let length_prefixed = &magic == BUCKET_SIZES_COMPACT_MAGIC;
         let mut global_group_index = 0u64;
         loop {
             let mut groups_buf = [0u8; 4];
@@ -554,12 +964,14 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
             file.read_exact(&mut compressed_len_buf)?;
             let compressed_len = u64::from_le_bytes(compressed_len_buf) as usize;
 
-            let offsets_len = groups + 1;
-            let mut offsets = vec![0u32; offsets_len];
-            for off in &mut offsets {
-                let mut buf = [0u8; 4];
-                file.read_exact(&mut buf)?;
-                *off = u32::from_le_bytes(buf);
+            let mut offsets = Vec::new();
+            if !length_prefixed {
+                offsets.resize(groups + 1, 0u32);
+                for off in &mut offsets {
+                    let mut buf = [0u8; 4];
+                    file.read_exact(&mut buf)?;
+                    *off = u32::from_le_bytes(buf);
+                }
             }
 
             let mut compressed = vec![0u8; compressed_len];
@@ -568,9 +980,36 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
             let mut decompressed = Vec::new();
             Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
 
+            let mut compact_cursor = std::io::Cursor::new(decompressed.as_slice());
             for i in 0..groups {
-                let start = offsets[i] as usize;
-                let end = offsets[i + 1] as usize;
+                let (start, end) = if length_prefixed {
+                    let group_len = read_varint_u64_from_reader(&mut compact_cursor)?.ok_or_else(
+                        || {
+                            io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "missing compact bucket group length",
+                            )
+                        },
+                    )?;
+                    let start = compact_cursor.position() as usize;
+                    let end = start
+                        .checked_add(usize::try_from(group_len).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "compact bucket group is too large",
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "compact bucket group offset overflow",
+                            )
+                        })?;
+                    compact_cursor.set_position(end as u64);
+                    (start, end)
+                } else {
+                    (offsets[i] as usize, offsets[i + 1] as usize)
+                };
                 if end < start || end > decompressed.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -581,6 +1020,12 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
                 let context = format!("{}#group{}", size_filename, key);
                 let sizes = decode_varint_deltas_to_sizes(&decompressed[start..end], &context)?;
                 sizes_map.insert(key, sizes);
+            }
+            if length_prefixed && compact_cursor.position() as usize != decompressed.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compact bucket block has trailing group data",
+                ));
             }
             global_group_index += groups as u64;
         }

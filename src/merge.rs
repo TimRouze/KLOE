@@ -13,14 +13,15 @@ use zstd::Decoder;
 use crate::compress;
 
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
+const BUCKET_SIZES_COMPACT_MAGIC: &[u8; 4] = b"KSB3";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
+const POSITIONS_COMPACT_MAGIC: &[u8; 4] = b"KPS3";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
 
-const REQUIRED_ARCHIVE_FILES: [&str; 5] = [
+const REQUIRED_ARCHIVE_FILES: [&str; 4] = [
     "filenames_id.txt",
     "positions_kloe.bin",
     "bucket_sizes.txt",
-    "id_to_color_id.txt.zst",
     "tigs_kloe.fa",
 ];
 
@@ -113,7 +114,16 @@ fn require_magic(path: &Path, expected: &[u8; 4]) -> io::Result<BufReader<File>>
 }
 
 fn inspect_compact_positions(path: &Path) -> io::Result<(u64, u64, u64)> {
-    let mut reader = require_magic(path, POSITIONS_MAGIC)?;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != POSITIONS_MAGIC && &magic != POSITIONS_COMPACT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("'{}' uses an unsupported positions encoding", path.display()),
+        ));
+    }
+    let implicit_sizes = &magic == POSITIONS_COMPACT_MAGIC;
     let entries = read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::UnexpectedEof, "missing compact positions count")
     })?;
@@ -125,13 +135,17 @@ fn inspect_compact_positions(path: &Path) -> io::Result<(u64, u64, u64)> {
     }
     let mut tigs_position = 0u64;
     let mut sizes_position = 0u64;
-    for _ in 0..entries {
+    for entry in 0..entries {
         let tigs_delta = read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "truncated compact tig positions")
         })?;
-        let sizes_delta = read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated compact size positions")
-        })?;
+        let sizes_delta = if implicit_sizes {
+            u64::from(entry > 0)
+        } else {
+            read_varint_u64_from_reader(&mut reader)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated compact size positions")
+            })?
+        };
         tigs_position = tigs_position.checked_add(tigs_delta).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "compact tig position overflow")
         })?;
@@ -161,7 +175,16 @@ fn inspect_compact_positions(path: &Path) -> io::Result<(u64, u64, u64)> {
 }
 
 fn inspect_compact_bucket_sizes(path: &Path) -> io::Result<u64> {
-    let mut reader = require_magic(path, BUCKET_SIZES_MAGIC)?;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != BUCKET_SIZES_MAGIC && &magic != BUCKET_SIZES_COMPACT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("'{}' uses an unsupported bucket-size encoding", path.display()),
+        ));
+    }
+    let length_prefixed = &magic == BUCKET_SIZES_COMPACT_MAGIC;
     let mut groups = 0u64;
     loop {
         let mut count_buf = [0u8; 4];
@@ -177,9 +200,13 @@ fn inspect_compact_bucket_sizes(path: &Path) -> io::Result<u64> {
         let mut len_buf = [0u8; 8];
         reader.read_exact(&mut len_buf)?;
         let compressed_len = u64::from_le_bytes(len_buf);
-        let offsets_bytes = (count + 1).checked_mul(4).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "bucket-size offset overflow")
-        })?;
+        let offsets_bytes = if length_prefixed {
+            0
+        } else {
+            (count + 1).checked_mul(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "bucket-size offset overflow")
+            })?
+        };
         let skip = offsets_bytes.checked_add(compressed_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "bucket-size block overflow")
         })?;
@@ -199,7 +226,17 @@ impl CompactArchiveLayout {
         let positions_path = root.join("positions_kloe.bin");
         let sizes_path = root.join("bucket_sizes.txt");
         let tigs_path = root.join("tigs_kloe.fa");
-        let _ = require_magic(&root.join("id_to_color_id.txt.zst"), ID_TO_CID_MAGIC)?;
+        let legacy_index = root.join("id_to_color_id.txt.zst");
+        if !legacy_index.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "compact archive '{}' omits the redundant dataset-to-CID index; use the default deduplicating merge",
+                    root.display()
+                ),
+            ));
+        }
+        let _ = require_magic(&legacy_index, ID_TO_CID_MAGIC)?;
         let (position_entries, group_count, packed_tigs_bytes) =
             inspect_compact_positions(&positions_path)?;
         let sizes_groups = inspect_compact_bucket_sizes(&sizes_path)?;
@@ -663,6 +700,7 @@ struct CompactSizesBlock {
 struct CompactSizesIndex {
     path: PathBuf,
     blocks: Vec<CompactSizesBlock>,
+    length_prefixed: bool,
 }
 
 #[derive(Clone)]
@@ -709,7 +747,7 @@ impl ArchiveSequencesStream {
             None
         };
         let mut cached_block_index = usize::MAX;
-        let mut cached_block_offsets = Vec::new();
+        let mut cached_block_ranges = Vec::new();
         let mut cached_block_data = Vec::new();
         let mut encoded = Vec::new();
         let mut sequence = Vec::new();
@@ -738,7 +776,7 @@ impl ArchiveSequencesStream {
                 })?;
                 let block_index = compact.block_index_for_group(group)?;
                 if cached_block_index != block_index {
-                    (cached_block_offsets, cached_block_data) = compact.load_block_from(
+                    (cached_block_ranges, cached_block_data) = compact.load_block_from(
                         block_index,
                         compact_sizes_reader
                             .as_mut()
@@ -749,7 +787,7 @@ impl ArchiveSequencesStream {
                 compact.decode_group_into(
                     block_index,
                     group,
-                    &cached_block_offsets,
+                    &cached_block_ranges,
                     &cached_block_data,
                     &mut sizes,
                 )?;
@@ -1244,7 +1282,7 @@ fn is_compact_bucket_sizes_file(path: &Path) -> io::Result<bool> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
     match reader.read_exact(&mut magic) {
-        Ok(()) => Ok(&magic == BUCKET_SIZES_MAGIC),
+        Ok(()) => Ok(&magic == BUCKET_SIZES_MAGIC || &magic == BUCKET_SIZES_COMPACT_MAGIC),
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(err) => Err(err),
     }
@@ -1268,37 +1306,88 @@ impl CompactSizesIndex {
         &self,
         block_index: usize,
         file: &mut File,
-    ) -> io::Result<(Vec<u32>, Vec<u8>)> {
+    ) -> io::Result<(Vec<(usize, usize)>, Vec<u8>)> {
         let block = self.blocks.get(block_index).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "compact size block is not indexed")
         })?;
-        file.seek(std::io::SeekFrom::Start(block.offsets_file_offset))?;
-        let mut offsets = vec![0u32; block.group_count + 1];
-        let mut bytes = [0u8; 4];
-        for offset in &mut offsets {
-            file.read_exact(&mut bytes)?;
-            *offset = u32::from_le_bytes(bytes);
+        let mut offsets = Vec::new();
+        if !self.length_prefixed {
+            file.seek(std::io::SeekFrom::Start(block.offsets_file_offset))?;
+            offsets.resize(block.group_count + 1, 0u32);
+            let mut bytes = [0u8; 4];
+            for offset in &mut offsets {
+                file.read_exact(&mut bytes)?;
+                *offset = u32::from_le_bytes(bytes);
+            }
         }
         file.seek(std::io::SeekFrom::Start(block.data_offset))?;
         let mut compressed = vec![0u8; block.data_len];
         file.read_exact(&mut compressed)?;
         let mut decompressed = Vec::new();
         Decoder::new(&compressed[..])?.read_to_end(&mut decompressed)?;
-        let expected_min = offsets.last().copied().unwrap_or(0) as usize;
-        if decompressed.len() < expected_min {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("truncated compact size block in '{}'", self.path.display()),
-            ));
+        let mut ranges = Vec::with_capacity(block.group_count);
+        if self.length_prefixed {
+            let mut cursor = std::io::Cursor::new(decompressed.as_slice());
+            for _ in 0..block.group_count {
+                let group_len = read_varint_u64_from_reader(&mut cursor)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "missing compact size group length",
+                    )
+                })?;
+                let start = cursor.position() as usize;
+                let end = start
+                    .checked_add(usize::try_from(group_len).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compact size group is too large",
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compact size group offset overflow",
+                        )
+                    })?;
+                if end > decompressed.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated compact size block in '{}'", self.path.display()),
+                    ));
+                }
+                ranges.push((start, end));
+                cursor.set_position(end as u64);
+            }
+            if cursor.position() as usize != decompressed.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("trailing compact size data in '{}'", self.path.display()),
+                ));
+            }
+        } else {
+            let expected_min = offsets.last().copied().unwrap_or(0) as usize;
+            if decompressed.len() < expected_min
+                || offsets.windows(2).any(|range| range[0] > range[1])
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("truncated compact size block in '{}'", self.path.display()),
+                ));
+            }
+            ranges.extend(
+                offsets
+                    .windows(2)
+                    .map(|range| (range[0] as usize, range[1] as usize)),
+            );
         }
-        Ok((offsets, decompressed))
+        Ok((ranges, decompressed))
     }
 
     fn decode_group_into(
         &self,
         block_index: usize,
         group: usize,
-        offsets: &[u32],
+        ranges: &[(usize, usize)],
         decompressed: &[u8],
         sizes: &mut Vec<usize>,
     ) -> io::Result<()> {
@@ -1314,12 +1403,9 @@ impl CompactSizesIndex {
                 "compact size group exceeds block",
             ));
         }
-        let start = *offsets.get(local).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing compact size start offset")
-        })? as usize;
-        let end = *offsets.get(local + 1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing compact size end offset")
-        })? as usize;
+        let (start, end) = *ranges.get(local).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing compact size group range")
+        })?;
         if end < start || end > decompressed.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1339,12 +1425,13 @@ fn load_compact_bucket_sizes_index(path: &Path) -> io::Result<CompactSizesIndex>
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
-    if &magic != BUCKET_SIZES_MAGIC {
+    if &magic != BUCKET_SIZES_MAGIC && &magic != BUCKET_SIZES_COMPACT_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("expected compact bucket sizes magic in '{}'", path.display()),
         ));
     }
+    let length_prefixed = &magic == BUCKET_SIZES_COMPACT_MAGIC;
 
     let mut blocks = Vec::new();
     let mut first_group = 0usize;
@@ -1366,11 +1453,15 @@ fn load_compact_bucket_sizes_index(path: &Path) -> io::Result<CompactSizesIndex>
             io::Error::new(io::ErrorKind::InvalidData, "compact size block is too large")
         })?;
         let offsets_file_offset = reader.stream_position()?;
-        let offsets_bytes = (group_count + 1)
-            .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "compact size offsets overflow")
-            })?;
+        let offsets_bytes = if length_prefixed {
+            0
+        } else {
+            (group_count + 1)
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "compact size offsets overflow")
+                })?
+        };
         reader.seek(std::io::SeekFrom::Current(offsets_bytes as i64))?;
         let data_offset = reader.stream_position()?;
         let next_offset = data_offset.checked_add(data_len as u64).ok_or_else(|| {
@@ -1390,6 +1481,7 @@ fn load_compact_bucket_sizes_index(path: &Path) -> io::Result<CompactSizesIndex>
     Ok(CompactSizesIndex {
         path: path.to_path_buf(),
         blocks,
+        length_prefixed,
     })
 }
 fn load_positions(path: &Path, compact_sizes: bool) -> io::Result<ArchivePositions> {
@@ -1406,7 +1498,8 @@ fn load_positions(path: &Path, compact_sizes: bool) -> io::Result<ArchivePositio
         Err(err) => return Err(err),
     }
 
-    if &magic == POSITIONS_MAGIC {
+    if &magic == POSITIONS_MAGIC || &magic == POSITIONS_COMPACT_MAGIC {
+        let implicit_sizes = &magic == POSITIONS_COMPACT_MAGIC;
         let count_u64 = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1430,13 +1523,17 @@ fn load_positions(path: &Path, compact_sizes: bool) -> io::Result<ArchivePositio
         let mut legacy_sizes = (!compact_sizes).then(|| Vec::with_capacity(count));
         let mut tigs_pos = 0u64;
         let mut sizes_pos = 0u64;
-        for _ in 0..count {
+        for entry in 0..count {
             let dt = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "truncated tigs delta")
             })?;
-            let ds = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated sizes delta")
-            })?;
+            let ds = if implicit_sizes {
+                u64::from(entry > 0)
+            } else {
+                read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated sizes delta")
+                })?
+            };
             tigs_pos = tigs_pos.checked_add(dt).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "tigs position overflow")
             })?;
@@ -1727,6 +1824,17 @@ fn ensure_archive_complete(root: &Path) -> io::Result<()> {
                 format!("missing archive file '{}'", path.to_string_lossy()),
             ));
         }
+    }
+    let legacy_index = root.join("id_to_color_id.txt.zst");
+    let compact_index = root.join(compress::CID_TO_DATASET_FILE);
+    if !legacy_index.is_file() && !compact_index.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "archive '{}' has neither a CID-to-dataset nor dataset-to-CID membership index",
+                root.display()
+            ),
+        ));
     }
     Ok(())
 }

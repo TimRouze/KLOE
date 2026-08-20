@@ -42,9 +42,12 @@ const CID_TRANSPOSE_BLOCK_BYTES: usize = 64 * 1024;
 const COLOR_RUN_BUFFER_BYTES: usize = 64 * 1024;
 const COLOR_MERGE_FAN_IN: usize = 64;
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
+const BUCKET_SIZES_COMPACT_MAGIC: &[u8; 4] = b"KSB3";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
+const POSITIONS_COMPACT_MAGIC: &[u8; 4] = b"KPS3";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
 pub(crate) const CID_TO_DATASET_MAGIC: &[u8; 4] = b"KCD2";
+const CID_TO_DATASET_COMPACT_MAGIC: &[u8; 4] = b"KCD3";
 pub(crate) const CID_TO_DATASET_FILE: &str = "cid_to_dataset_id.bin";
 const BUCKET_SIZE_BLOCK_MAX_GROUPS: usize = 8_192;
 const BUCKET_SIZE_BLOCK_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
@@ -62,7 +65,7 @@ struct CidDatasetSidecarBlock {
 struct CidDatasetSidecarCache {
     file: File,
     block_index: usize,
-    offsets: Vec<u32>,
+    ranges: Vec<(usize, usize)>,
     data: Vec<u8>,
     decoded_ids: Vec<u32>,
 }
@@ -71,6 +74,7 @@ struct CidDatasetSidecarCache {
 pub(crate) struct CidDatasetSidecar {
     blocks: Vec<CidDatasetSidecarBlock>,
     group_count: usize,
+    length_prefixed: bool,
     cache: Mutex<CidDatasetSidecarCache>,
 }
 
@@ -78,7 +82,7 @@ struct CidDatasetSidecarReader<'a> {
     sidecar: &'a CidDatasetSidecar,
     file: File,
     block_index: usize,
-    offsets: Vec<u32>,
+    ranges: Vec<(usize, usize)>,
     data: Vec<u8>,
 }
 
@@ -87,12 +91,16 @@ impl CidDatasetSidecar {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
-        if &magic != CID_TO_DATASET_MAGIC {
+        let length_prefixed = if &magic == CID_TO_DATASET_MAGIC {
+            false
+        } else if &magic == CID_TO_DATASET_COMPACT_MAGIC {
+            true
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid CID-to-dataset sidecar '{}': bad magic", path.display()),
             ));
-        }
+        };
         let mut blocks = Vec::new();
         let mut group_count = 0usize;
         loop {
@@ -112,11 +120,15 @@ impl CidDatasetSidecar {
                 io::Error::new(io::ErrorKind::InvalidData, "CID sidecar block is too large")
             })?;
             let offsets_file_offset = file.stream_position()?;
-            let offsets_bytes = (block_groups + 1)
-                .checked_mul(std::mem::size_of::<u32>())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "CID sidecar offsets overflow")
-                })?;
+            let offsets_bytes = if length_prefixed {
+                0
+            } else {
+                (block_groups + 1)
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "CID sidecar offsets overflow")
+                    })?
+            };
             let data_offset = offsets_file_offset
                 .checked_add(offsets_bytes as u64)
                 .ok_or_else(|| {
@@ -140,10 +152,11 @@ impl CidDatasetSidecar {
         Ok(Self {
             blocks,
             group_count,
+            length_prefixed,
             cache: Mutex::new(CidDatasetSidecarCache {
                 file: File::open(path)?,
                 block_index: usize::MAX,
-                offsets: Vec::new(),
+                ranges: Vec::new(),
                 data: Vec::new(),
                 decoded_ids: Vec::new(),
             }),
@@ -152,6 +165,19 @@ impl CidDatasetSidecar {
 
     pub(crate) fn len(&self) -> usize {
         self.group_count
+    }
+
+    pub(crate) fn visit_groups(
+        &self,
+        mut visit: impl FnMut(usize, &[u32]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut reader = self.reader()?;
+        let mut dataset_ids = Vec::new();
+        for group in 0..self.group_count {
+            reader.load_group_into(group, &mut dataset_ids, 0)?;
+            visit(group, &dataset_ids)?;
+        }
+        Ok(())
     }
 
     fn reader(&self) -> io::Result<CidDatasetSidecarReader<'_>> {
@@ -165,7 +191,7 @@ impl CidDatasetSidecar {
             sidecar: self,
             file,
             block_index: usize::MAX,
-            offsets: Vec::new(),
+            ranges: Vec::new(),
             data: Vec::new(),
         })
     }
@@ -195,31 +221,19 @@ impl CidDatasetSidecar {
         }
         let mut cache = self.cache.lock().expect("CID sidecar cache lock poisoned");
         if cache.block_index != block_index {
-            cache.file.seek(SeekFrom::Start(block.offsets_file_offset))?;
-            let mut offsets = vec![0u32; block.group_count + 1];
-            let mut bytes = [0u8; 4];
-            for offset in &mut offsets {
-                cache.file.read_exact(&mut bytes)?;
-                *offset = u32::from_le_bytes(bytes);
-            }
-            let mut compressed = vec![0u8; block.data_len];
-            cache.file.seek(SeekFrom::Start(block.data_offset))?;
-            cache.file.read_exact(&mut compressed)?;
-            let data = zstd::decode_all(compressed.as_slice())?;
-            if offsets.windows(2).any(|range| range[0] > range[1])
-                || offsets.last().copied().map(|v| v as usize) != Some(data.len())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "CID sidecar block offsets are invalid for its payload",
-                ));
-            }
-            cache.offsets = offsets;
-            cache.data = data;
+            let CidDatasetSidecarCache {
+                file, ranges, data, ..
+            } = &mut *cache;
+            load_cid_sidecar_block(
+                file,
+                block,
+                self.length_prefixed,
+                ranges,
+                data,
+            )?;
             cache.block_index = block_index;
         }
-        let start = cache.offsets[local] as usize;
-        let end = cache.offsets[local + 1] as usize;
+        let (start, end) = cache.ranges[local];
         let mut ids = std::mem::take(&mut cache.decoded_ids);
         ids.clear();
         let encoded = &cache.data[start..end];
@@ -260,8 +274,17 @@ impl CidDatasetSidecarReader<'_> {
         let block_index = self
             .sidecar
             .blocks
-            .partition_point(|block| block.first_group <= group)
-            .checked_sub(1)
+            .get(self.block_index)
+            .filter(|block| {
+                group >= block.first_group && group < block.first_group + block.group_count
+            })
+            .map(|_| self.block_index)
+            .or_else(|| {
+                self.sidecar
+                    .blocks
+                    .partition_point(|block| block.first_group <= group)
+                    .checked_sub(1)
+            })
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "CID sidecar group is out of range")
             })?;
@@ -276,30 +299,18 @@ impl CidDatasetSidecarReader<'_> {
             ));
         }
         if self.block_index != block_index {
-            self.offsets.resize(block.group_count + 1, 0);
-            let mut offset_bytes = vec![0u8; self.offsets.len() * std::mem::size_of::<u32>()];
-            self.file
-                .read_exact_at(&mut offset_bytes, block.offsets_file_offset)?;
-            for (offset, bytes) in self.offsets.iter_mut().zip(offset_bytes.chunks_exact(4)) {
-                *offset = u32::from_le_bytes(bytes.try_into().expect("four-byte offset"));
-            }
-            let mut compressed = vec![0u8; block.data_len];
-            self.file.read_exact_at(&mut compressed, block.data_offset)?;
-            self.data = zstd::decode_all(compressed.as_slice())?;
-            if self.offsets.windows(2).any(|range| range[0] > range[1])
-                || self.offsets.last().copied().map(|v| v as usize) != Some(self.data.len())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "CID sidecar block offsets are invalid for its payload",
-                ));
-            }
+            load_cid_sidecar_block(
+                &self.file,
+                block,
+                self.sidecar.length_prefixed,
+                &mut self.ranges,
+                &mut self.data,
+            )?;
             self.block_index = block_index;
         }
 
         target.clear();
-        let start = self.offsets[local] as usize;
-        let end = self.offsets[local + 1] as usize;
+        let (start, end) = self.ranges[local];
         let encoded = &self.data[start..end];
         let mut cursor = 0usize;
         let mut previous = 0u64;
@@ -328,6 +339,69 @@ impl CidDatasetSidecarReader<'_> {
     }
 }
 
+fn load_cid_sidecar_block(
+    file: &File,
+    block: &CidDatasetSidecarBlock,
+    length_prefixed: bool,
+    ranges: &mut Vec<(usize, usize)>,
+    data: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut compressed = vec![0u8; block.data_len];
+    file.read_exact_at(&mut compressed, block.data_offset)?;
+    *data = zstd::decode_all(compressed.as_slice())?;
+    ranges.clear();
+    ranges.reserve(block.group_count);
+
+    if length_prefixed {
+        let mut cursor = 0usize;
+        for _ in 0..block.group_count {
+            let group_len = usize::try_from(read_varint_field(
+                data,
+                &mut cursor,
+                "CID dataset group length",
+            )?)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar group is too large")
+            })?;
+            let end = cursor.checked_add(group_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID sidecar group offset overflow")
+            })?;
+            if end > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CID sidecar group extends past its block payload",
+                ));
+            }
+            ranges.push((cursor, end));
+            cursor = end;
+        }
+        if cursor != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID sidecar block has trailing group data",
+            ));
+        }
+    } else {
+        let mut offset_bytes =
+            vec![0u8; (block.group_count + 1) * std::mem::size_of::<u32>()];
+        file.read_exact_at(&mut offset_bytes, block.offsets_file_offset)?;
+        let offsets = offset_bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte offset")) as usize)
+            .collect::<Vec<_>>();
+        if offsets.windows(2).any(|range| range[0] > range[1])
+            || offsets.last().copied() != Some(data.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID sidecar block offsets are invalid for its payload",
+            ));
+        }
+        ranges.extend(offsets.windows(2).map(|range| (range[0], range[1])));
+    }
+    Ok(())
+}
+
 pub(crate) struct CidDatasetSidecarWriter {
     file: BufWriter<File>,
     block_groups: usize,
@@ -338,7 +412,7 @@ pub(crate) struct CidDatasetSidecarWriter {
 impl CidDatasetSidecarWriter {
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
         let mut file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(path)?);
-        file.write_all(CID_TO_DATASET_MAGIC)?;
+        file.write_all(CID_TO_DATASET_COMPACT_MAGIC)?;
         Ok(Self {
             file,
             block_groups: 0,
@@ -412,13 +486,21 @@ impl CidDatasetSidecarWriter {
         if self.block_groups == 0 {
             return Ok(());
         }
-        let compressed = zstd::encode_all(self.block_data.as_slice(), 1)?;
+        let mut length_prefixed = Vec::with_capacity(
+            self.block_data
+                .len()
+                .saturating_add(self.block_groups.saturating_mul(2)),
+        );
+        for offsets in self.block_offsets.windows(2) {
+            let start = offsets[0] as usize;
+            let end = offsets[1] as usize;
+            write_varint_u64((end - start) as u64, &mut length_prefixed);
+            length_prefixed.extend_from_slice(&self.block_data[start..end]);
+        }
+        let compressed = zstd::encode_all(length_prefixed.as_slice(), 1)?;
         self.file
             .write_all(&(self.block_groups as u32).to_le_bytes())?;
         self.file.write_all(&(compressed.len() as u64).to_le_bytes())?;
-        for &offset in &self.block_offsets {
-            self.file.write_all(&offset.to_le_bytes())?;
-        }
         self.file.write_all(&compressed)?;
         self.block_groups = 0;
         self.block_offsets.clear();
@@ -1986,7 +2068,6 @@ impl PositionSpill {
             ));
         }
         write_varint_u64_to_writer(tigs - self.previous_tigs, &mut self.writer)?;
-        write_varint_u64_to_writer(sizes - self.previous_sizes, &mut self.writer)?;
         self.previous_tigs = tigs;
         self.previous_sizes = sizes;
         self.entries += 1;
@@ -2002,14 +2083,14 @@ impl PositionSpill {
 struct StreamFinalize {
     position_path: PathBuf,
     position_entries: u64,
-    cid_spill: DatasetCidSpillFiles,
+    spill_directory: PathBuf,
 }
 
 struct StreamWriterState {
     omni_file: BufWriter<File>,
     size_file: BufWriter<File>,
     cid_dataset_writer: Option<CidDatasetSidecarWriter>,
-    cid_spill: DatasetCidSpill,
+    spill_directory: PathBuf,
     position_spill: PositionSpill,
     size_block_groups: usize,
     size_block_offsets: Vec<u32>,
@@ -2021,9 +2102,9 @@ struct StreamWriterState {
 }
 
 impl StreamWriterState {
-    fn new(unitigs_file_path: String, output_dir: &str, nb_files: usize) -> Result<Self> {
-        let cid_spill = DatasetCidSpill::new(output_dir, nb_files)?;
-        let position_spill = PositionSpill::new(&cid_spill.directory)?;
+    fn new(unitigs_file_path: String, output_dir: &str, _nb_files: usize) -> Result<Self> {
+        let spill_directory = create_id_cid_spill_dir(output_dir)?;
+        let position_spill = PositionSpill::new(&spill_directory)?;
         let cid_dataset_writer = CidDatasetSidecarWriter::create(
             &Path::new(output_dir).join(CID_TO_DATASET_FILE),
         )?;
@@ -2037,11 +2118,11 @@ impl StreamWriterState {
                     IO_BUFFER_CAPACITY,
                     File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
                 );
-                out.write_all(BUCKET_SIZES_MAGIC)?;
+                out.write_all(BUCKET_SIZES_COMPACT_MAGIC)?;
                 out
             },
             cid_dataset_writer: Some(cid_dataset_writer),
-            cid_spill,
+            spill_directory,
             position_spill,
             size_block_groups: 0,
             size_block_offsets: vec![0],
@@ -2058,10 +2139,21 @@ impl StreamWriterState {
             return Ok(());
         }
 
+        let mut length_prefixed = Vec::with_capacity(
+            self.size_block_uncompressed
+                .len()
+                .saturating_add(self.size_block_groups.saturating_mul(2)),
+        );
+        for offsets in self.size_block_offsets.windows(2) {
+            let start = offsets[0] as usize;
+            let end = offsets[1] as usize;
+            write_varint_u64((end - start) as u64, &mut length_prefixed);
+            length_prefixed.extend_from_slice(&self.size_block_uncompressed[start..end]);
+        }
         let mut compressed = Vec::new();
         {
             let mut encoder = Encoder::new(&mut compressed, 1)?;
-            encoder.write_all(&self.size_block_uncompressed)?;
+            encoder.write_all(&length_prefixed)?;
             encoder.finish()?;
         }
 
@@ -2069,9 +2161,6 @@ impl StreamWriterState {
             .write_all(&(self.size_block_groups as u32).to_le_bytes())?;
         self.size_file
             .write_all(&(compressed.len() as u64).to_le_bytes())?;
-        for &offset in &self.size_block_offsets {
-            self.size_file.write_all(&offset.to_le_bytes())?;
-        }
         self.size_file.write_all(&compressed)?;
 
         self.size_block_groups = 0;
@@ -2105,8 +2194,6 @@ impl StreamWriterState {
             .as_mut()
             .expect("CID dataset sidecar writer must be initialized")
             .append_zero_based(dataset_ids_zero_based)?;
-        self.cid_spill
-            .append_group(dataset_ids_zero_based, self.cid)?;
         self.cid += 1;
         Ok(())
     }
@@ -2217,11 +2304,10 @@ impl StreamWriterState {
             self.prev_tigs_size, self.prev_bucket_pos
         );
         let (position_path, position_entries) = self.position_spill.finalize()?;
-        let cid_spill = self.cid_spill.finalize()?;
         Ok(StreamFinalize {
             position_path,
             position_entries,
-            cid_spill,
+            spill_directory: self.spill_directory,
         })
     }
 }
@@ -2636,7 +2722,7 @@ fn write_positions_from_spill(
     filepath: String,
 ) -> Result<()> {
     let mut pos_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(filepath)?);
-    pos_file.write_all(POSITIONS_MAGIC)?;
+    pos_file.write_all(POSITIONS_COMPACT_MAGIC)?;
     write_varint_u64_to_writer(entries, &mut pos_file)?;
     let mut spill_reader =
         BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(position_spill_path)?);
@@ -3009,7 +3095,7 @@ pub(crate) fn sort_by_bucket_streaming(
     worker_threads: usize,
     memory_gb: usize,
     record_rx: mpsc::Receiver<SimplitigBatch>,
-) -> Vec<usize> {
+) {
     let total_timer = PhaseTimer::start();
     let memory_budget = CompressionMemoryBudget::from_gb(memory_gb);
     println!("Starting writing compressed sequences (streaming).");
@@ -3046,22 +3132,10 @@ pub(crate) fn sort_by_bucket_streaming(
         position_timing.wall_sec
     );
     log_phase_timing("post_ggcat.write_positions", position_timing);
-    let id_timer = PhaseTimer::start();
-    let write_id_cid = match write_id_to_color_id_from_partitions(
-        output_dir.clone() + "id_to_color_id.txt.zst",
-        triple.cid_spill,
-        memory_budget,
-    ) {
-        Ok(id_cid_line_sizes) => id_cid_line_sizes,
-        Err(e) => panic!("error writting id to color id list: {e:?}"),
-    };
-    let id_timing = id_timer.finish();
-    println!("Write id to cid wall time: {:.3}s", id_timing.wall_sec);
-    log_phase_timing("post_ggcat.write_id_to_cid", id_timing);
+    let _ = fs::remove_dir(&triple.spill_directory);
     let total_timing = total_timer.finish();
     println!("Compression took: {:.3}s", total_timing.wall_sec);
     log_phase_timing("post_ggcat.total", total_timing);
-    write_id_cid
 }
 
 fn stream_sorted_records_from_chunks(
@@ -3493,7 +3567,7 @@ pub(crate) fn compress_ggcat_sources(
     });
 
     let sort_start = Instant::now();
-    let id_cid_line_sizes = sort_by_bucket_streaming(
+    sort_by_bucket_streaming(
         &output_dir.to_string(),
         dataset_count as u32,
         threads,
@@ -3515,7 +3589,10 @@ pub(crate) fn compress_ggcat_sources(
         }
     }
 
-    write_filenames_id_offsets(output_dir, &filenames, &id_cid_line_sizes)?;
+    // The CID-to-dataset sidecar is the canonical membership index. Keeping the
+    // transposed dataset-to-CID index would duplicate the same relation and is
+    // especially costly for large collections.
+    write_filenames_id_offsets(output_dir, &filenames, &vec![0; filenames.len()])?;
     Ok(())
 }
 
@@ -3605,6 +3682,36 @@ mod structured_output_tests {
         let mut ids = Vec::new();
         map.merge_source_into(1, &mut ids).unwrap();
         assert_eq!(ids, vec![12, 15]);
+    }
+
+    #[test]
+    fn cid_dataset_sidecar_reads_legacy_offset_blocks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-cid-to-dataset.bin");
+        let payload = vec![0, 2, 6, 1, 3];
+        let compressed = zstd::encode_all(payload.as_slice(), 1).unwrap();
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        writer.write_all(CID_TO_DATASET_MAGIC).unwrap();
+        writer.write_all(&2u32.to_le_bytes()).unwrap();
+        writer
+            .write_all(&(compressed.len() as u64).to_le_bytes())
+            .unwrap();
+        for offset in [0u32, 3, 5] {
+            writer.write_all(&offset.to_le_bytes()).unwrap();
+        }
+        writer.write_all(&compressed).unwrap();
+        writer.write_all(&0u32.to_le_bytes()).unwrap();
+        writer.flush().unwrap();
+
+        let sidecar = CidDatasetSidecar::open(&path).unwrap();
+        let mut groups = Vec::new();
+        sidecar
+            .visit_groups(|_, ids| {
+                groups.push(ids.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(groups, vec![vec![1, 3, 9], vec![2, 5]]);
     }
 
     #[test]
