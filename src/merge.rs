@@ -11,6 +11,7 @@ use ggcat_api::{
 use zstd::Decoder;
 
 use crate::compress;
+use crate::packed_tigs::PackedTigsReader;
 
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
 const BUCKET_SIZES_COMPACT_MAGIC: &[u8; 4] = b"KSB3";
@@ -732,7 +733,7 @@ impl ArchiveSequencesStream {
                 format!("archive input block {} is outside the configured block range", block),
             )
         })?;
-        let mut tigs_reader = BufReader::with_capacity(1024 * 1024, File::open(&self.tigs_path)?);
+        let mut tigs_reader = PackedTigsReader::open(&self.tigs_path)?;
         let mut legacy_sizes_reader = if self.compact_sizes.is_none() {
             Some(BufReader::with_capacity(
                 1024 * 1024,
@@ -752,7 +753,6 @@ impl ArchiveSequencesStream {
         let mut encoded = Vec::new();
         let mut sequence = Vec::new();
         let mut sizes = Vec::new();
-        let mut current_tigs_pos = None;
 
         for cid in block_data.cid_start..block_data.cid_end {
             let color_offset = cid - block_data.cid_start;
@@ -801,21 +801,18 @@ impl ArchiveSequencesStream {
                 )?;
             }
 
-            if current_tigs_pos != Some(tigs_pos) {
-                tigs_reader.seek(std::io::SeekFrom::Start(tigs_pos))?;
-                current_tigs_pos = Some(tigs_pos);
-            }
+            let mut current_tigs_pos = tigs_pos;
             for &size in &sizes {
                 if size == 0 {
                     continue;
                 }
                 encoded.resize(size.div_ceil(4), 0);
-                tigs_reader.read_exact(&mut encoded)?;
-                current_tigs_pos = Some(
-                    current_tigs_pos
-                        .unwrap_or(tigs_pos)
-                        .saturating_add(encoded.len() as u64),
-                );
+                tigs_reader.read_exact_at(current_tigs_pos, &mut encoded)?;
+                current_tigs_pos = current_tigs_pos
+                    .checked_add(encoded.len() as u64)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "packed-tig offset overflow")
+                    })?;
                 decode_packed_sequence(&encoded, size, &mut sequence);
                 callback(
                     DnaSequence {
@@ -877,6 +874,21 @@ impl ArchiveInfo {
                 format!(
                     "positions file '{}' is empty",
                     positions_path.to_string_lossy()
+                ),
+            ));
+        }
+        let expected_tigs_len = positions.tigs(positions.len() - 1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "positions omit final tig offset")
+        })?;
+        let actual_tigs_len = PackedTigsReader::open(&tigs_path)?.logical_len();
+        if actual_tigs_len != expected_tigs_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "packed-tig logical size mismatch in '{}': positions={}, tigs={}",
+                    root.display(),
+                    expected_tigs_len,
+                    actual_tigs_len
                 ),
             ));
         }

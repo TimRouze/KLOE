@@ -20,6 +20,7 @@ use std::time::Instant;
 use tempfile::Builder as TempBuilder;
 use zstd::Encoder;
 
+use crate::packed_tigs::PackedTigsWriter;
 use crate::records::{SimplitigBatch, SimplitigRecord};
 use crate::utils::{Convert, Converter};
 
@@ -2087,7 +2088,7 @@ struct StreamFinalize {
 }
 
 struct StreamWriterState {
-    omni_file: BufWriter<File>,
+    tigs_file: PackedTigsWriter,
     size_file: BufWriter<File>,
     cid_dataset_writer: Option<CidDatasetSidecarWriter>,
     spill_directory: PathBuf,
@@ -2109,10 +2110,7 @@ impl StreamWriterState {
             &Path::new(output_dir).join(CID_TO_DATASET_FILE),
         )?;
         Ok(Self {
-            omni_file: BufWriter::with_capacity(
-                IO_BUFFER_CAPACITY,
-                File::create(unitigs_file_path)?,
-            ),
+            tigs_file: PackedTigsWriter::create(unitigs_file_path)?,
             size_file: {
                 let mut out = BufWriter::with_capacity(
                     IO_BUFFER_CAPACITY,
@@ -2217,7 +2215,7 @@ impl StreamWriterState {
             self.prev_tigs_size += encoded_seq.len() as u64;
             self.encoded_seq_buffer.extend_from_slice(&encoded_seq);
             if self.encoded_seq_buffer.len() >= ENCODED_SEQ_BUFFER_TARGET {
-                self.omni_file.write_all(&self.encoded_seq_buffer)?;
+                self.tigs_file.write_all(&self.encoded_seq_buffer)?;
                 self.encoded_seq_buffer.clear();
             }
 
@@ -2252,7 +2250,7 @@ impl StreamWriterState {
     ) -> Result<()> {
         let mut encoded_reader =
             BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(encoded_tigs_path)?);
-        io::copy(&mut encoded_reader, &mut self.omni_file)?;
+        io::copy(&mut encoded_reader, &mut self.tigs_file)?;
         self.prev_tigs_size += encoded_tigs_len;
 
         self.prev_bucket_pos += 1;
@@ -2274,7 +2272,7 @@ impl StreamWriterState {
         encoded_tigs: &[u8],
         group_sizes: &[u8],
     ) -> Result<()> {
-        self.omni_file.write_all(encoded_tigs)?;
+        self.tigs_file.write_all(encoded_tigs)?;
         self.prev_tigs_size += encoded_tigs.len() as u64;
 
         self.prev_bucket_pos += 1;
@@ -2288,11 +2286,11 @@ impl StreamWriterState {
 
     fn finalize(mut self) -> Result<StreamFinalize> {
         if !self.encoded_seq_buffer.is_empty() {
-            self.omni_file.write_all(&self.encoded_seq_buffer)?;
+            self.tigs_file.write_all(&self.encoded_seq_buffer)?;
             self.encoded_seq_buffer.clear();
         }
         self.flush_size_block()?;
-        self.omni_file.flush()?;
+        self.tigs_file.finish()?;
         self.size_file.flush()?;
         self.cid_dataset_writer
             .take()

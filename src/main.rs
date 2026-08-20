@@ -3,6 +3,7 @@
 mod compress;
 mod decompress;
 mod merge;
+mod packed_tigs;
 mod records;
 mod utils;
 use clap::Parser;

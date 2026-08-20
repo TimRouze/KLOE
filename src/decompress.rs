@@ -8,6 +8,7 @@ use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlo
 use zstd::Decoder;
 
 use crate::compress::{CID_TO_DATASET_FILE, CidDatasetSidecar};
+use crate::packed_tigs::PackedTigsReader;
 use crate::utils::vec2str;
 
 const BUCKET_SIZES_MAGIC: &[u8; 4] = b"KSB2";
@@ -421,7 +422,7 @@ fn decompress_sidecar(
         }
     }
 
-    let mut tigs_file = BufReader::new(File::open(tigs_filename)?);
+    let mut tigs_file = PackedTigsReader::open(tigs_filename)?;
     let mut selected_ids = Vec::<u32>::new();
     let mut tig_buffer = Vec::<u8>::new();
     let mut sizes = Vec::<usize>::new();
@@ -467,10 +468,11 @@ fn decompress_sidecar(
             );
         }
         let tigs_pos = tig_positions[cid];
-        tigs_file.seek(std::io::SeekFrom::Start(tigs_pos))?;
+        let mut packed_position = tigs_pos;
         for &size in &sizes {
             tig_buffer.resize(size.div_ceil(4), 0);
-            tigs_file.read_exact(&mut tig_buffer)?;
+            tigs_file.read_exact_at(packed_position, &mut tig_buffer)?;
+            packed_position += tig_buffer.len() as u64;
             let tig = vec2str(&tig_buffer, &size);
             for &file_id in &selected_ids {
                 let writer = match writers.entry(file_id) {
