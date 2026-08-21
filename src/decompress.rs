@@ -1,9 +1,12 @@
 use core::panic;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 
+use crossbeam::channel::{bounded, Receiver};
 use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
 use zstd::Decoder;
 
@@ -16,6 +19,20 @@ const BUCKET_SIZES_COMPACT_MAGIC: &[u8; 4] = b"KSB3";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
 const POSITIONS_COMPACT_MAGIC: &[u8; 4] = b"KPS3";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
+const DECOMPRESS_BATCH_BASES: usize = 8 * 1024 * 1024;
+const PACKED_BASES: [[u8; 4]; 256] = {
+    let mut table = [[b'A'; 4]; 256];
+    let mut byte = 0usize;
+    while byte < table.len() {
+        let mut base = 0usize;
+        while base < 4 {
+            table[byte][base] = [b'A', b'C', b'G', b'T'][(byte >> (2 * base)) & 0b11];
+            base += 1;
+        }
+        byte += 1;
+    }
+    table
+};
 
 //   =========================================================================================== DECOMPRESSION ==============================================================================
 
@@ -270,6 +287,7 @@ pub fn decompress_with_options(
             } else {
                 Some(&wanted_filenames)
             },
+            ggcat_cfg.threads,
         )?;
         if ggcat_cfg.enabled {
             run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
@@ -390,10 +408,10 @@ fn decompress_sidecar(
     out_dir: &str,
     filenames: &[(String, u32)],
     wanted_filenames: Option<&[(String, u32)]>,
+    threads: usize,
 ) -> Result<()> {
     let sidecar = CidDatasetSidecar::open(sidecar_filename)?;
     let tig_positions = preload_tig_positions(positions_filename)?;
-    let mut sizes_reader = SequentialCompactSizesReader::open(size_filename)?;
     if tig_positions.len() != sidecar.len().saturating_add(1) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -411,23 +429,208 @@ fn decompress_sidecar(
             .map(|(_, file_id)| *file_id)
             .collect::<HashSet<_>>()
     });
-    let mut writers: HashMap<u32, BufWriter<File>> = HashMap::new();
     if let Some(wanted) = wanted_filenames {
-        for (path, file_id) in wanted {
-            let output_path = dump_output_path(out_dir, path);
-            writers.insert(
-                *file_id,
-                BufWriter::new(File::options().append(true).create(true).open(output_path)?),
-            );
+        for (path, _) in wanted {
+            File::options()
+                .append(true)
+                .create(true)
+                .open(dump_output_path(out_dir, path))?;
         }
     }
+    let selected_datasets = wanted_ids
+        .as_ref()
+        .map_or(filenames.len(), HashSet::len)
+        .max(1);
+    let thread_budget = threads.max(1);
+    let writer_count = selected_datasets
+        .min((thread_budget / 2).max(1))
+        .min(32);
+    let decoder_count = thread_budget
+        .saturating_sub(writer_count)
+        .max(1)
+        .min(16);
+    let output_paths = Arc::new(
+        filenames
+            .iter()
+            .map(|(path, _)| dump_output_path(out_dir, path))
+            .collect::<Vec<_>>(),
+    );
+    let mut path_shards = HashMap::<PathBuf, usize>::new();
+    let writer_routes = Arc::new(
+        output_paths
+            .iter()
+            .map(|path| {
+                let next_shard = path_shards.len() % writer_count;
+                *path_shards.entry(path.clone()).or_insert(next_shard)
+            })
+            .collect::<Vec<_>>(),
+    );
+    println!(
+        "Parallel decompression pipeline: {} decoders, {} writer shards, {} MiB batches",
+        decoder_count,
+        writer_count,
+        DECOMPRESS_BATCH_BASES / (1024 * 1024)
+    );
 
+    let (job_tx, job_rx) = bounded::<DecodeJob>(decoder_count * 2);
+    let (decoded_tx, decoded_rx) = bounded::<Result<DecodedBatch>>(decoder_count * 2);
+    let producer_groups = sidecar.len();
+    let producer_tigs = tigs_filename.to_owned();
+    let producer_sizes = size_filename.to_owned();
+    let producer_filenames = filenames.len();
+    let producer = thread::spawn(move || {
+        produce_decode_jobs(
+            sidecar,
+            tig_positions,
+            &producer_tigs,
+            &producer_sizes,
+            producer_filenames,
+            wanted_ids,
+            job_tx,
+        )
+    });
+
+    let mut decoders = Vec::with_capacity(decoder_count);
+    for _ in 0..decoder_count {
+        let receiver = job_rx.clone();
+        let sender = decoded_tx.clone();
+        decoders.push(thread::spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                let result = decode_fasta_batch(job);
+                let failed = result.is_err();
+                if sender.send(result).is_err() || failed {
+                    while receiver.recv().is_ok() {}
+                    break;
+                }
+            }
+        }));
+    }
+    drop(job_rx);
+    drop(decoded_tx);
+
+    let mut writer_senders = Vec::with_capacity(writer_count);
+    let mut writers = Vec::with_capacity(writer_count);
+    for shard in 0..writer_count {
+        let (sender, receiver) = bounded::<WriteBatch>(2);
+        writer_senders.push(sender);
+        let paths = Arc::clone(&output_paths);
+        let routes = Arc::clone(&writer_routes);
+        writers.push(thread::spawn(move || {
+            write_output_shard(receiver, paths, routes, shard)
+        }));
+    }
+
+    let mut pending = BTreeMap::<u64, DecodedBatch>::new();
+    let mut next_ordinal = 0u64;
+    let mut pipeline_error = None;
+    while let Ok(decoded) = decoded_rx.recv() {
+        match decoded {
+            Ok(batch) => {
+                if pipeline_error.is_some() {
+                    continue;
+                }
+                pending.insert(batch.ordinal, batch);
+                while let Some(batch) = pending.remove(&next_ordinal) {
+                    if pipeline_error.is_none() {
+                        if let Err(err) =
+                            dispatch_write_batch(batch, &writer_senders, &writer_routes)
+                        {
+                            pipeline_error = Some(err);
+                        }
+                    }
+                    next_ordinal += 1;
+                }
+            }
+            Err(err) if pipeline_error.is_none() => pipeline_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    drop(writer_senders);
+
+    let producer_stats = producer
+        .join()
+        .map_err(|_| io::Error::other("decompression producer thread panicked"))?;
+    if let Err(err) = producer_stats.as_ref() {
+        if pipeline_error.is_none() {
+            pipeline_error = Some(io::Error::new(err.kind(), err.to_string()));
+        }
+    }
+    for decoder in decoders {
+        if decoder.join().is_err() && pipeline_error.is_none() {
+            pipeline_error = Some(io::Error::other("decompression decoder thread panicked"));
+        }
+    }
+    for writer in writers {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if pipeline_error.is_none() => pipeline_error = Some(err),
+            Err(_) if pipeline_error.is_none() => {
+                pipeline_error = Some(io::Error::other("decompression writer thread panicked"));
+            }
+            _ => {}
+        }
+    }
+    if let Some(err) = pipeline_error {
+        return Err(err);
+    }
+    let stats = producer_stats?;
+    if stats.archive_groups != producer_groups {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompression producer did not visit every archive group",
+        ));
+    }
+    println!(
+        "Decompression complete: {} unitigs written across {} selected CIDs",
+        stats.total_unitigs, stats.selected_cids
+    );
+    Ok(())
+}
+
+struct DecodeJob {
+    ordinal: u64,
+    sizes: Vec<usize>,
+    encoded: Vec<u8>,
+    dataset_ids: Arc<Vec<u32>>,
+}
+
+struct DecodedBatch {
+    ordinal: u64,
+    unitigs: usize,
+    fasta: Arc<Vec<u8>>,
+    dataset_ids: Arc<Vec<u32>>,
+}
+
+struct WriteBatch {
+    dataset_ids: Vec<u32>,
+    fasta: Arc<Vec<u8>>,
+}
+
+struct DecompressionStats {
+    selected_cids: usize,
+    total_unitigs: u64,
+    archive_groups: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_decode_jobs(
+    sidecar: CidDatasetSidecar,
+    tig_positions: Vec<u64>,
+    tigs_filename: &str,
+    size_filename: &str,
+    filename_count: usize,
+    wanted_ids: Option<HashSet<u32>>,
+    sender: crossbeam::channel::Sender<DecodeJob>,
+) -> Result<DecompressionStats> {
+    let mut sizes_reader = SequentialCompactSizesReader::open(size_filename)?;
     let mut tigs_file = PackedTigsReader::open(tigs_filename)?;
     let mut selected_ids = Vec::<u32>::new();
-    let mut tig_buffer = Vec::<u8>::new();
     let mut sizes = Vec::<usize>::new();
     let mut selected_cids = 0usize;
     let mut total_unitigs = 0u64;
+    let mut ordinal = 0u64;
+    let archive_groups = sidecar.len();
+
     sidecar.visit_groups(|cid, dataset_ids| {
         if !sizes_reader.next_group_into(&mut sizes)? {
             return Err(io::Error::new(
@@ -440,7 +643,7 @@ fn decompress_sidecar(
             let file_id = one_based.checked_sub(1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "sidecar contains dataset ID zero")
             })?;
-            if file_id as usize >= filenames.len() {
+            if file_id as usize >= filename_count {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("sidecar dataset ID {} is out of range", one_based),
@@ -458,36 +661,70 @@ fn decompress_sidecar(
         }
 
         selected_cids += 1;
-        if selected_cids % 1000 == 1 || cid + 1 == sidecar.len() {
+        if selected_cids % 1000 == 1 || cid + 1 == archive_groups {
             println!(
-                "Processing selected CID {} (archive CID {}/{}, {} unitigs written so far)",
+                "Queuing selected CID {} (archive CID {}/{}, {} unitigs queued so far)",
                 selected_cids,
                 cid + 1,
-                sidecar.len(),
+                archive_groups,
                 total_unitigs
             );
         }
-        let tigs_pos = tig_positions[cid];
-        let mut packed_position = tigs_pos;
-        for &size in &sizes {
-            tig_buffer.resize(size.div_ceil(4), 0);
-            tigs_file.read_exact_at(packed_position, &mut tig_buffer)?;
-            packed_position += tig_buffer.len() as u64;
-            let tig = vec2str(&tig_buffer, &size);
-            for &file_id in &selected_ids {
-                let writer = match writers.entry(file_id) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let output_path = dump_output_path(out_dir, &filenames[file_id as usize].0);
-                        entry.insert(BufWriter::new(
-                            File::options().append(true).create(true).open(output_path)?,
-                        ))
-                    }
-                };
-                writeln!(writer, ">")?;
-                writeln!(writer, "{}", tig)?;
+        let dataset_ids = Arc::new(selected_ids.clone());
+        let mut packed_position = tig_positions[cid];
+        let expected_end = tig_positions[cid + 1];
+        let mut start = 0usize;
+        while start < sizes.len() {
+            let mut end = start;
+            let mut output_bytes = 0usize;
+            let mut encoded_bytes = 0usize;
+            while end < sizes.len() {
+                let record_bytes = sizes[end].checked_add(3).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "FASTA record size overflow")
+                })?;
+                if end > start && output_bytes.saturating_add(record_bytes) > DECOMPRESS_BATCH_BASES
+                {
+                    break;
+                }
+                output_bytes = output_bytes.checked_add(record_bytes).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "FASTA batch size overflow")
+                })?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(sizes[end].div_ceil(4))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "packed-tig batch overflow")
+                    })?;
+                end += 1;
             }
-            total_unitigs += 1;
+            let mut encoded = vec![0u8; encoded_bytes];
+            tigs_file.read_exact_at(packed_position, &mut encoded)?;
+            packed_position = packed_position
+                .checked_add(encoded_bytes as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tig offset overflow"))?;
+            sender
+                .send(DecodeJob {
+                    ordinal,
+                    sizes: sizes[start..end].to_vec(),
+                    encoded,
+                    dataset_ids: Arc::clone(&dataset_ids),
+                })
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "decoders stopped"))?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "batch count overflow"))?;
+            total_unitigs = total_unitigs
+                .checked_add((end - start) as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unitig count overflow"))?;
+            start = end;
+        }
+        if packed_position != expected_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CID {} sizes describe packed range ending at {}, expected {}",
+                    cid, packed_position, expected_end
+                ),
+            ));
         }
         Ok(())
     })?;
@@ -497,14 +734,136 @@ fn decompress_sidecar(
             "bucket sizes contain more groups than the CID sidecar",
         ));
     }
-    for (_, mut writer) in writers {
-        writer.flush()?;
+    Ok(DecompressionStats {
+        selected_cids,
+        total_unitigs,
+        archive_groups,
+    })
+}
+
+fn decode_fasta_batch(job: DecodeJob) -> Result<DecodedBatch> {
+    let output_bytes = job.sizes.iter().try_fold(0usize, |total, &size| {
+        size.checked_add(3)
+            .and_then(|record| total.checked_add(record))
+    });
+    let output_bytes = output_bytes.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "decoded FASTA batch size overflow")
+    })?;
+    let mut fasta = Vec::with_capacity(output_bytes);
+    let mut cursor = 0usize;
+    for &size in &job.sizes {
+        let encoded_len = size.div_ceil(4);
+        let end = cursor.checked_add(encoded_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "packed-tig cursor overflow")
+        })?;
+        let encoded = job.encoded.get(cursor..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated packed-tig decode batch")
+        })?;
+        fasta.extend_from_slice(b">\n");
+        let mut remaining = size;
+        for &packed in encoded {
+            let count = remaining.min(4);
+            fasta.extend_from_slice(&PACKED_BASES[packed as usize][..count]);
+            remaining -= count;
+        }
+        fasta.push(b'\n');
+        cursor = end;
     }
-    println!(
-        "Decompression complete: {} unitigs written across {} selected CIDs",
-        total_unitigs, selected_cids
-    );
+    if cursor != job.encoded.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packed-tig decode batch contains trailing bytes",
+        ));
+    }
+    Ok(DecodedBatch {
+        ordinal: job.ordinal,
+        unitigs: job.sizes.len(),
+        fasta: Arc::new(fasta),
+        dataset_ids: job.dataset_ids,
+    })
+}
+
+fn dispatch_write_batch(
+    batch: DecodedBatch,
+    writer_senders: &[crossbeam::channel::Sender<WriteBatch>],
+    writer_routes: &[usize],
+) -> Result<()> {
+    if batch.unitigs == 0 {
+        return Ok(());
+    }
+    let mut shard_ids = (0..writer_senders.len())
+        .map(|_| Vec::<u32>::new())
+        .collect::<Vec<_>>();
+    for &file_id in batch.dataset_ids.iter() {
+        let shard = *writer_routes.get(file_id as usize).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "output dataset ID is out of range")
+        })?;
+        shard_ids[shard].push(file_id);
+    }
+    for (shard, dataset_ids) in shard_ids.into_iter().enumerate() {
+        if dataset_ids.is_empty() {
+            continue;
+        }
+        writer_senders[shard]
+            .send(WriteBatch {
+                dataset_ids,
+                fasta: Arc::clone(&batch.fasta),
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer shard stopped"))?;
+    }
     Ok(())
+}
+
+fn write_output_shard(
+    receiver: Receiver<WriteBatch>,
+    output_paths: Arc<Vec<PathBuf>>,
+    writer_routes: Arc<Vec<usize>>,
+    shard: usize,
+) -> Result<()> {
+    let mut writers = HashMap::<u32, File>::new();
+    while let Ok(batch) = receiver.recv() {
+        for file_id in batch.dataset_ids {
+            if writer_routes.get(file_id as usize).copied() != Some(shard) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dataset was routed to the wrong writer shard",
+                ));
+            }
+            let path = output_paths.get(file_id as usize).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "output dataset ID is out of range")
+            })?;
+            let writer = match writers.entry(file_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let file = File::options().append(true).create(true).open(path)?;
+                    entry.insert(file)
+                }
+            };
+            writer.write_all(batch.fasta.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod parallel_decompression_tests {
+    use super::*;
+
+    #[test]
+    fn packed_batch_decodes_directly_to_ordered_fasta() {
+        let decoded = decode_fasta_batch(DecodeJob {
+            ordinal: 7,
+            sizes: vec![5, 3],
+            encoded: vec![0xe4, 0x00, 0x1b],
+            dataset_ids: Arc::new(vec![0, 2]),
+        })
+        .unwrap();
+
+        assert_eq!(decoded.ordinal, 7);
+        assert_eq!(decoded.unitigs, 2);
+        assert_eq!(decoded.fasta.as_slice(), b">\nACGTA\n>\nTGC\n");
+        assert_eq!(decoded.dataset_ids.as_slice(), &[0, 2]);
+    }
 }
 
 struct SequentialCompactSizesReader {
