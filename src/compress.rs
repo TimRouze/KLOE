@@ -3212,48 +3212,68 @@ fn capture_structured_ggcat_output(
     k: usize,
     worker_threads: usize,
 ) -> Result<StructuredGgcatCapture> {
-    // This pool must remain independent from GGCAT's pool: the producer may be
-    // blocked waiting for this consumer while a chunk is being sorted.
-    let sort_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_threads.max(1))
-        .thread_name(|index| format!("kloe-color-sort-{index}"))
-        .build()
-        .map_err(|err| io::Error::other(format!("create color-sort worker pool: {err}")))?;
+    // Sort/write one half-budget chunk while GGCAT fills the other.  A rendezvous
+    // channel permits exactly one chunk in each stage, so pipelining does not
+    // increase the previous peak record-buffer memory.
+    let chunk_target = memory_budget.color_chunk_bytes().div_ceil(2).max(1);
+    let sort_threads = (worker_threads / 4).max(1);
+    let (sort_tx, sort_rx) = mpsc::sync_channel::<Vec<SortedColorRecord>>(0);
+    let sort_chunk_dir = chunk_dir.clone();
+    let sort_thread = thread::spawn(move || -> Result<(Vec<PathBuf>, ChunkFlushMetrics)> {
+        let sort_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(sort_threads)
+            .thread_name(|index| format!("kloe-color-sort-{index}"))
+            .build()
+            .map_err(|err| io::Error::other(format!("create color-sort worker pool: {err}")))?;
+        let mut chunk_files = Vec::new();
+        let mut chunk_flush_metrics = ChunkFlushMetrics::default();
+        for mut chunk in sort_rx {
+            flush_sorted_chunk_timed(
+                &mut chunk,
+                &mut chunk_files,
+                &sort_chunk_dir,
+                &sort_pool,
+                &mut chunk_flush_metrics,
+            )?;
+        }
+        Ok((chunk_files, chunk_flush_metrics))
+    });
+
     let mut records = Vec::new();
-    let mut chunk_files = Vec::new();
     let mut chunk_bytes = 0usize;
-    let mut chunk_flush_metrics = ChunkFlushMetrics::default();
     let mut input_sequences_count = 0usize;
     let mut emitted_segments_count = 0usize;
 
-    for block in receiver {
-        let (sequences, segments) = visit_structured_ggcat_block(&block, k, |record| {
-            chunk_bytes = chunk_bytes
-                .saturating_add(std::mem::size_of::<ColorIndexType>() + record.seq.len());
-            records.push(record);
-            if chunk_bytes >= memory_budget.color_chunk_bytes() {
-                flush_sorted_chunk_timed(
-                    &mut records,
-                    &mut chunk_files,
-                    &chunk_dir,
-                    &sort_pool,
-                    &mut chunk_flush_metrics,
-                )?;
-                chunk_bytes = 0;
-            }
-            Ok(())
-        })?;
-        input_sequences_count = input_sequences_count.saturating_add(sequences);
-        emitted_segments_count = emitted_segments_count.saturating_add(segments);
-    }
-
-    flush_sorted_chunk_timed(
-        &mut records,
-        &mut chunk_files,
-        &chunk_dir,
-        &sort_pool,
-        &mut chunk_flush_metrics,
-    )?;
+    let capture_result = (|| -> Result<()> {
+        for block in receiver {
+            let (sequences, segments) = visit_structured_ggcat_block(&block, k, |record| {
+                chunk_bytes = chunk_bytes
+                    .saturating_add(std::mem::size_of::<ColorIndexType>() + record.seq.len());
+                records.push(record);
+                if chunk_bytes >= chunk_target {
+                    sort_tx.send(std::mem::take(&mut records)).map_err(|_| {
+                        io::Error::other("structured color-sort worker disconnected")
+                    })?;
+                    chunk_bytes = 0;
+                }
+                Ok(())
+            })?;
+            input_sequences_count = input_sequences_count.saturating_add(sequences);
+            emitted_segments_count = emitted_segments_count.saturating_add(segments);
+        }
+        if !records.is_empty() {
+            sort_tx
+                .send(std::mem::take(&mut records))
+                .map_err(|_| io::Error::other("structured color-sort worker disconnected"))?;
+        }
+        Ok(())
+    })();
+    drop(sort_tx);
+    let sort_result = sort_thread
+        .join()
+        .map_err(|_| io::Error::other("structured color-sort worker panicked"))?;
+    capture_result?;
+    let (chunk_files, chunk_flush_metrics) = sort_result?;
     let initial_chunk_count = chunk_files.len();
     let chunk_files = reduce_sorted_color_chunks(chunk_files, &chunk_dir)?;
     Ok(StructuredGgcatCapture {
