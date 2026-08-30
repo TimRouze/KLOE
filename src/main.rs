@@ -69,6 +69,12 @@ struct Args {
     /// Join archive containers without rebuilding the graph or removing shared redundancy
     #[arg(long = "structural-merge", default_value_t = false)]
     structural_merge: bool,
+    /// Compress: preserve abundance fields; decompress: restore them in FASTA headers
+    #[arg(long = "abundance", default_value_t = false)]
+    abundance: bool,
+    /// Logarithm base used for 8-bit abundance quantization
+    #[arg(long = "abundance-log-base", default_value_t = 1.05)]
+    abundance_log_base: f64,
 }
 fn main() {
     let args = Args::parse();
@@ -113,6 +119,7 @@ fn main() {
                 use_unitigs,
                 use_matchtigs,
                 use_eulertigs,
+                restore_abundance: args.abundance,
             };
             if let Err(err) = decompress::decompress_with_options(
                 &String::from("bucket_sizes.txt"),
@@ -144,6 +151,7 @@ fn main() {
             let ggcat_cfg = compress::GgcatCompressionConfig {
                 memory_gb: memory,
                 temp_dir,
+                abundance_log_base: args.abundance.then_some(args.abundance_log_base),
             };
             if let Err(err) = compress::compress_with_ggcat(
                 &output_dir,
@@ -212,11 +220,7 @@ fn is_compressed_dir_complete(input_dir: String) {
     } else if !Path::new(&format!("{input_dir}/bucket_sizes.txt")).exists() {
         panic!("Tigs sizes file not found");
     } else if !Path::new(&format!("{input_dir}/id_to_color_id.txt.zst")).exists()
-        && !Path::new(&format!(
-            "{input_dir}/{}",
-            compress::CID_TO_DATASET_FILE
-        ))
-        .exists()
+        && !Path::new(&format!("{input_dir}/{}", compress::CID_TO_DATASET_FILE)).exists()
     {
         panic!("archive membership index not found");
     } else if !Path::new(&format!("{input_dir}/tigs_kloe.fa")).exists() {

@@ -10,7 +10,7 @@ use crossbeam::channel::{bounded, Receiver};
 use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
 use zstd::Decoder;
 
-use crate::compress::{CID_TO_DATASET_FILE, CidDatasetSidecar};
+use crate::compress::{CidDatasetSidecar, CID_TO_DATASET_FILE};
 use crate::packed_tigs::PackedTigsReader;
 use crate::utils::vec2str;
 
@@ -70,6 +70,7 @@ pub struct GgcatRebuildConfig {
     pub use_unitigs: bool,
     pub use_matchtigs: bool,
     pub use_eulertigs: bool,
+    pub restore_abundance: bool,
 }
 
 impl Default for GgcatRebuildConfig {
@@ -83,6 +84,7 @@ impl Default for GgcatRebuildConfig {
             use_unitigs: false,
             use_matchtigs: false,
             use_eulertigs: false,
+            restore_abundance: false,
         }
     }
 }
@@ -172,6 +174,11 @@ fn collect_dump_fastas(out_dir: &str) -> std::io::Result<Vec<PathBuf>> {
 }
 
 fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result<()> {
+    if cfg.restore_abundance {
+        eprintln!(
+            "Warning: Dump_*.fa files retain abundance headers; the combined GGCAT rebuild output does not preserve per-dataset abundance."
+        );
+    }
     let mode = resolve_rebuild_mode(cfg.use_unitigs, cfg.use_matchtigs, cfg.use_eulertigs);
     let dump_fastas = collect_dump_fastas(out_dir)?;
     if dump_fastas.is_empty() {
@@ -288,11 +295,19 @@ pub fn decompress_with_options(
                 Some(&wanted_filenames)
             },
             ggcat_cfg.threads,
+            ggcat_cfg.restore_abundance,
         )?;
         if ggcat_cfg.enabled {
             run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
         }
         return Ok(());
+    }
+
+    if ggcat_cfg.restore_abundance {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--abundance was requested but this legacy archive has no abundance metadata",
+        ));
     }
 
     if wanted_files_path != "" {
@@ -369,7 +384,10 @@ fn load_archive_filenames(filename_id_path: &str) -> Result<Vec<(String, u32)>> 
         let line = line_result?;
         let path = line.rsplit_once(':').map(|(path, _)| path).unwrap_or(&line);
         let file_id = u32::try_from(file_id).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "archive has more than u32::MAX datasets")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive has more than u32::MAX datasets",
+            )
         })?;
         filenames.push((path.to_owned(), file_id));
     }
@@ -409,8 +427,18 @@ fn decompress_sidecar(
     filenames: &[(String, u32)],
     wanted_filenames: Option<&[(String, u32)]>,
     threads: usize,
+    restore_abundance: bool,
 ) -> Result<()> {
     let sidecar = CidDatasetSidecar::open(sidecar_filename)?;
+    if restore_abundance && sidecar.abundance_log_base().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--abundance was requested but this archive has no abundance metadata",
+        ));
+    }
+    if restore_abundance {
+        println!("Restoring logarithmically discretized abundance values in FASTA headers");
+    }
     let tig_positions = preload_tig_positions(positions_filename)?;
     if tig_positions.len() != sidecar.len().saturating_add(1) {
         return Err(io::Error::new(
@@ -442,13 +470,8 @@ fn decompress_sidecar(
         .map_or(filenames.len(), HashSet::len)
         .max(1);
     let thread_budget = threads.max(1);
-    let writer_count = selected_datasets
-        .min((thread_budget / 2).max(1))
-        .min(32);
-    let decoder_count = thread_budget
-        .saturating_sub(writer_count)
-        .max(1)
-        .min(16);
+    let writer_count = selected_datasets.min((thread_budget / 2).max(1)).min(32);
+    let decoder_count = thread_budget.saturating_sub(writer_count).max(1).min(16);
     let output_paths = Arc::new(
         filenames
             .iter()
@@ -486,6 +509,7 @@ fn decompress_sidecar(
             &producer_sizes,
             producer_filenames,
             wanted_ids,
+            restore_abundance,
             job_tx,
         )
     });
@@ -592,13 +616,23 @@ struct DecodeJob {
     sizes: Vec<usize>,
     encoded: Vec<u8>,
     dataset_ids: Arc<Vec<u32>>,
+    abundance_codes: Option<Arc<Vec<u8>>>,
+    abundance_log_base: Option<f64>,
 }
 
 struct DecodedBatch {
     ordinal: u64,
     unitigs: usize,
     fasta: Arc<Vec<u8>>,
+    abundance_sequences: Option<Arc<DecodedSequences>>,
     dataset_ids: Arc<Vec<u32>>,
+    abundance_codes: Option<Arc<Vec<u8>>>,
+    abundance_log_base: Option<f64>,
+}
+
+struct DecodedSequences {
+    bases: Vec<u8>,
+    offsets: Vec<u32>,
 }
 
 struct WriteBatch {
@@ -620,6 +654,7 @@ fn produce_decode_jobs(
     size_filename: &str,
     filename_count: usize,
     wanted_ids: Option<HashSet<u32>>,
+    restore_abundance: bool,
     sender: crossbeam::channel::Sender<DecodeJob>,
 ) -> Result<DecompressionStats> {
     let mut sizes_reader = SequentialCompactSizesReader::open(size_filename)?;
@@ -631,7 +666,10 @@ fn produce_decode_jobs(
     let mut ordinal = 0u64;
     let archive_groups = sidecar.len();
 
-    sidecar.visit_groups(|cid, dataset_ids| {
+    let abundance_log_base = restore_abundance
+        .then(|| sidecar.abundance_log_base())
+        .flatten();
+    sidecar.visit_groups_with_abundance(|cid, dataset_ids, group_abundance_codes| {
         if !sizes_reader.next_group_into(&mut sizes)? {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -639,9 +677,13 @@ fn produce_decode_jobs(
             ));
         }
         selected_ids.clear();
-        for &one_based in dataset_ids {
+        let mut selected_abundance_codes = Vec::new();
+        for (membership_index, &one_based) in dataset_ids.iter().enumerate() {
             let file_id = one_based.checked_sub(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "sidecar contains dataset ID zero")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sidecar contains dataset ID zero",
+                )
             })?;
             if file_id as usize >= filename_count {
                 return Err(io::Error::new(
@@ -654,6 +696,15 @@ fn produce_decode_jobs(
                 .is_none_or(|wanted| wanted.contains(&file_id))
             {
                 selected_ids.push(file_id);
+                if abundance_log_base.is_some() {
+                    let codes = group_abundance_codes.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "archive abundance metadata is incomplete",
+                        )
+                    })?;
+                    selected_abundance_codes.push(codes[membership_index]);
+                }
             }
         }
         if selected_ids.is_empty() {
@@ -671,6 +722,8 @@ fn produce_decode_jobs(
             );
         }
         let dataset_ids = Arc::new(selected_ids.clone());
+        let abundance_codes =
+            abundance_log_base.map(|_| Arc::new(selected_abundance_codes.clone()));
         let mut packed_position = tig_positions[cid];
         let expected_end = tig_positions[cid + 1];
         let mut start = 0usize;
@@ -707,14 +760,18 @@ fn produce_decode_jobs(
                     sizes: sizes[start..end].to_vec(),
                     encoded,
                     dataset_ids: Arc::clone(&dataset_ids),
+                    abundance_codes: abundance_codes.as_ref().map(Arc::clone),
+                    abundance_log_base,
                 })
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "decoders stopped"))?;
-            ordinal = ordinal
-                .checked_add(1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "batch count overflow"))?;
+            ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "batch count overflow")
+            })?;
             total_unitigs = total_unitigs
                 .checked_add((end - start) as u64)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unitig count overflow"))?;
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "unitig count overflow")
+                })?;
             start = end;
         }
         if packed_position != expected_end {
@@ -747,40 +804,148 @@ fn decode_fasta_batch(job: DecodeJob) -> Result<DecodedBatch> {
             .and_then(|record| total.checked_add(record))
     });
     let output_bytes = output_bytes.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "decoded FASTA batch size overflow")
-    })?;
-    let mut fasta = Vec::with_capacity(output_bytes);
-    let mut cursor = 0usize;
-    for &size in &job.sizes {
-        let encoded_len = size.div_ceil(4);
-        let end = cursor.checked_add(encoded_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "packed-tig cursor overflow")
-        })?;
-        let encoded = job.encoded.get(cursor..end).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated packed-tig decode batch")
-        })?;
-        fasta.extend_from_slice(b">\n");
-        let mut remaining = size;
-        for &packed in encoded {
-            let count = remaining.min(4);
-            fasta.extend_from_slice(&PACKED_BASES[packed as usize][..count]);
-            remaining -= count;
-        }
-        fasta.push(b'\n');
-        cursor = end;
-    }
-    if cursor != job.encoded.len() {
-        return Err(io::Error::new(
+        io::Error::new(
             io::ErrorKind::InvalidData,
-            "packed-tig decode batch contains trailing bytes",
-        ));
-    }
+            "decoded FASTA batch size overflow",
+        )
+    })?;
+    let build_fasta = |abundance: Option<u64>| -> Result<Vec<u8>> {
+        let header_extra = abundance.map_or(0, |value| value.to_string().len() + 8);
+        let mut fasta = Vec::with_capacity(
+            output_bytes.saturating_add(header_extra.saturating_mul(job.sizes.len())),
+        );
+        let mut cursor = 0usize;
+        for &size in &job.sizes {
+            let encoded_len = size.div_ceil(4);
+            let end = cursor.checked_add(encoded_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "packed-tig cursor overflow")
+            })?;
+            let encoded = job.encoded.get(cursor..end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated packed-tig decode batch",
+                )
+            })?;
+            if let Some(value) = abundance {
+                write!(fasta, "> ka:f:{value}\n")?;
+            } else {
+                fasta.extend_from_slice(b">\n");
+            }
+            let mut remaining = size;
+            for &packed in encoded {
+                let count = remaining.min(4);
+                fasta.extend_from_slice(&PACKED_BASES[packed as usize][..count]);
+                remaining -= count;
+            }
+            fasta.push(b'\n');
+            cursor = end;
+        }
+        if cursor != job.encoded.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packed-tig decode batch contains trailing bytes",
+            ));
+        }
+        Ok(fasta)
+    };
+
+    let (fasta, abundance_sequences) = match (job.abundance_codes.as_ref(), job.abundance_log_base)
+    {
+        (None, None) => (Arc::new(build_fasta(None)?), None),
+        (Some(codes), Some(_)) => {
+            if codes.len() != job.dataset_ids.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decoded abundance count differs from dataset membership count",
+                ));
+            }
+            let total_bases = job
+                .sizes
+                .iter()
+                .try_fold(0usize, |total, size| total.checked_add(*size))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "decoded base count overflow")
+                })?;
+            let mut bases = Vec::with_capacity(total_bases);
+            let mut offsets = Vec::with_capacity(job.sizes.len() + 1);
+            offsets.push(0);
+            let mut cursor = 0usize;
+            for &size in &job.sizes {
+                let encoded_len = size.div_ceil(4);
+                let end = cursor.checked_add(encoded_len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "packed-tig cursor overflow")
+                })?;
+                let encoded = job.encoded.get(cursor..end).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated packed-tig decode batch",
+                    )
+                })?;
+                let mut remaining = size;
+                for &packed in encoded {
+                    let count = remaining.min(4);
+                    bases.extend_from_slice(&PACKED_BASES[packed as usize][..count]);
+                    remaining -= count;
+                }
+                offsets.push(u32::try_from(bases.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decoded abundance batch exceeds 4 GiB",
+                    )
+                })?);
+                cursor = end;
+            }
+            if cursor != job.encoded.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "packed-tig decode batch contains trailing bytes",
+                ));
+            }
+            (
+                Arc::new(Vec::new()),
+                Some(Arc::new(DecodedSequences { bases, offsets })),
+            )
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive abundance metadata is incomplete",
+            ))
+        }
+    };
     Ok(DecodedBatch {
         ordinal: job.ordinal,
         unitigs: job.sizes.len(),
-        fasta: Arc::new(fasta),
+        fasta,
+        abundance_sequences,
         dataset_ids: job.dataset_ids,
+        abundance_codes: job.abundance_codes,
+        abundance_log_base: job.abundance_log_base,
     })
+}
+
+fn build_abundance_fasta(sequences: &DecodedSequences, abundance: u64) -> Result<Vec<u8>> {
+    let header = format!("> ka:f:{abundance}\n");
+    let mut fasta = Vec::with_capacity(
+        sequences
+            .bases
+            .len()
+            .saturating_add(header.len().saturating_mul(sequences.offsets.len())),
+    );
+    for range in sequences.offsets.windows(2) {
+        let start = range[0] as usize;
+        let end = range[1] as usize;
+        let sequence = sequences.bases.get(start..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded abundance sequence offsets are invalid",
+            )
+        })?;
+        fasta.extend_from_slice(header.as_bytes());
+        fasta.extend_from_slice(sequence);
+        fasta.push(b'\n');
+    }
+    Ok(fasta)
 }
 
 fn dispatch_write_batch(
@@ -792,24 +957,75 @@ fn dispatch_write_batch(
         return Ok(());
     }
     let mut shard_ids = (0..writer_senders.len())
-        .map(|_| Vec::<u32>::new())
+        .map(|_| Vec::<(u32, Option<u8>)>::new())
         .collect::<Vec<_>>();
-    for &file_id in batch.dataset_ids.iter() {
+    for (index, &file_id) in batch.dataset_ids.iter().enumerate() {
         let shard = *writer_routes.get(file_id as usize).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "output dataset ID is out of range")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "output dataset ID is out of range",
+            )
         })?;
-        shard_ids[shard].push(file_id);
+        let abundance = batch.abundance_codes.as_ref().map(|codes| codes[index]);
+        shard_ids[shard].push((file_id, abundance));
     }
-    for (shard, dataset_ids) in shard_ids.into_iter().enumerate() {
-        if dataset_ids.is_empty() {
-            continue;
+    if let Some(sequences) = batch.abundance_sequences.as_ref() {
+        let log_base = batch.abundance_log_base.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive abundance log base is missing",
+            )
+        })?;
+        let mut codes = batch
+            .abundance_codes
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive abundance codes are missing",
+                )
+            })?
+            .as_ref()
+            .clone();
+        codes.sort_unstable();
+        codes.dedup();
+        for code in codes {
+            let abundance = crate::compress::decode_abundance(code, log_base);
+            let fasta = Arc::new(build_abundance_fasta(sequences, abundance)?);
+            for (shard, memberships) in shard_ids.iter().enumerate() {
+                let dataset_ids = memberships
+                    .iter()
+                    .filter_map(|&(file_id, membership_code)| {
+                        (membership_code == Some(code)).then_some(file_id)
+                    })
+                    .collect::<Vec<_>>();
+                if !dataset_ids.is_empty() {
+                    writer_senders[shard]
+                        .send(WriteBatch {
+                            dataset_ids,
+                            fasta: Arc::clone(&fasta),
+                        })
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::BrokenPipe, "writer shard stopped")
+                        })?;
+                }
+            }
         }
-        writer_senders[shard]
-            .send(WriteBatch {
-                dataset_ids,
-                fasta: Arc::clone(&batch.fasta),
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer shard stopped"))?;
+    } else {
+        for (shard, memberships) in shard_ids.into_iter().enumerate() {
+            if memberships.is_empty() {
+                continue;
+            }
+            writer_senders[shard]
+                .send(WriteBatch {
+                    dataset_ids: memberships
+                        .into_iter()
+                        .map(|(file_id, _)| file_id)
+                        .collect(),
+                    fasta: Arc::clone(&batch.fasta),
+                })
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer shard stopped"))?;
+        }
     }
     Ok(())
 }
@@ -830,7 +1046,10 @@ fn write_output_shard(
                 ));
             }
             let path = output_paths.get(file_id as usize).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "output dataset ID is out of range")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "output dataset ID is out of range",
+                )
             })?;
             let writer = match writers.entry(file_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -856,6 +1075,8 @@ mod parallel_decompression_tests {
             sizes: vec![5, 3],
             encoded: vec![0xe4, 0x00, 0x1b],
             dataset_ids: Arc::new(vec![0, 2]),
+            abundance_codes: None,
+            abundance_log_base: None,
         })
         .unwrap();
 
@@ -863,6 +1084,25 @@ mod parallel_decompression_tests {
         assert_eq!(decoded.unitigs, 2);
         assert_eq!(decoded.fasta.as_slice(), b">\nACGTA\n>\nTGC\n");
         assert_eq!(decoded.dataset_ids.as_slice(), &[0, 2]);
+    }
+
+    #[test]
+    fn abundance_batch_decodes_bases_once_and_restores_header() {
+        let code = crate::compress::encode_abundance(17, 1.05);
+        let decoded = decode_fasta_batch(DecodeJob {
+            ordinal: 9,
+            sizes: vec![5, 3],
+            encoded: vec![0xe4, 0x00, 0x1b],
+            dataset_ids: Arc::new(vec![0]),
+            abundance_codes: Some(Arc::new(vec![code])),
+            abundance_log_base: Some(1.05),
+        })
+        .unwrap();
+        assert!(decoded.fasta.is_empty());
+        let sequences = decoded.abundance_sequences.unwrap();
+        let abundance = crate::compress::decode_abundance(code, 1.05);
+        let fasta = build_abundance_fasta(&sequences, abundance).unwrap();
+        assert_eq!(fasta, b"> ka:f:17\nACGTA\n> ka:f:17\nTGC\n");
     }
 }
 
@@ -906,11 +1146,7 @@ impl SequentialCompactSizesReader {
         }
         let (start, end) = self.ranges[self.next_range];
         self.next_range += 1;
-        decode_varint_deltas_to_sizes_into(
-            &self.data[start..end],
-            "compact bucket group",
-            sizes,
-        )?;
+        decode_varint_deltas_to_sizes_into(&self.data[start..end], "compact bucket group", sizes)?;
         Ok(true)
     }
 
@@ -934,9 +1170,10 @@ impl SequentialCompactSizesReader {
         }
         let mut compressed_len_buf = [0u8; 8];
         self.file.read_exact(&mut compressed_len_buf)?;
-        let compressed_len = usize::try_from(u64::from_le_bytes(compressed_len_buf)).map_err(
-            |_| io::Error::new(io::ErrorKind::InvalidData, "bucket-size block is too large"),
-        )?;
+        let compressed_len =
+            usize::try_from(u64::from_le_bytes(compressed_len_buf)).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bucket-size block is too large")
+            })?;
 
         let mut offsets = Vec::new();
         if !self.length_prefixed {
@@ -1019,10 +1256,16 @@ fn preload_tig_positions(positions_filename: &str) -> Result<Vec<u64>> {
     if &magic == POSITIONS_MAGIC || &magic == POSITIONS_COMPACT_MAGIC {
         let implicit_sizes = &magic == POSITIONS_COMPACT_MAGIC;
         let entries = read_varint_u64_from_reader(&mut file)?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "missing positions entry count")
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing positions entry count",
+            )
         })?;
         let entries = usize::try_from(entries).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "positions entry count is too large")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "positions entry count is too large",
+            )
         })?;
         let mut positions = Vec::with_capacity(entries);
         let mut position = 0u64;
@@ -1344,14 +1587,13 @@ fn preload_sizes(size_filename: &str) -> Result<HashMap<u64, Vec<usize>>> {
             let mut compact_cursor = std::io::Cursor::new(decompressed.as_slice());
             for i in 0..groups {
                 let (start, end) = if length_prefixed {
-                    let group_len = read_varint_u64_from_reader(&mut compact_cursor)?.ok_or_else(
-                        || {
+                    let group_len =
+                        read_varint_u64_from_reader(&mut compact_cursor)?.ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "missing compact bucket group length",
                             )
-                        },
-                    )?;
+                        })?;
                     let start = compact_cursor.position() as usize;
                     let end = start
                         .checked_add(usize::try_from(group_len).map_err(|_| {
