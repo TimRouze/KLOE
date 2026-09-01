@@ -21,7 +21,7 @@ use std::time::Instant;
 use tempfile::Builder as TempBuilder;
 use zstd::Encoder;
 
-use crate::packed_tigs::PackedTigsWriter;
+use crate::packed_tigs::{PackedTigsReader, PackedTigsWriter};
 use crate::records::{SimplitigBatch, SimplitigRecord};
 use crate::utils::{Convert, Converter};
 
@@ -48,6 +48,26 @@ const BUCKET_SIZES_COMPACT_MAGIC: &[u8; 4] = b"KSB3";
 const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
 const POSITIONS_COMPACT_MAGIC: &[u8; 4] = b"KPS3";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
+pub(crate) const DATASET_TO_CID_MAGIC: &[u8; 4] = b"KDI4";
+pub(crate) const DATASET_TO_CID_FLAG_ABUNDANCE: u8 = 1;
+pub(crate) const DATASET_TO_CID_FLAG_ADAPTIVE: u8 = 2;
+pub(crate) const DATASET_TO_CID_FLAG_MAJORITY: u8 = 4;
+pub(crate) const DATASET_POSTING_DELTA: u8 = 0;
+pub(crate) const DATASET_POSTING_BITMAP: u8 = 1;
+pub(crate) const DATASET_POSTING_MAJORITY_XOR: u8 = 2;
+const MAX_DATASET_POSTING_BITMAP_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DATASET_TO_CID_FILE: &str = "dataset_to_cid.bin";
+pub(crate) const FILENAME_INDEX_MAGIC: &[u8; 4] = b"KFN4";
+pub(crate) const FILENAME_INDEX_FILE: &str = "filenames.idx";
+pub(crate) const POSITIONS_INDEX_MAGIC: &[u8; 4] = b"KPX4";
+pub(crate) const POSITIONS_INDEX_FILE: &str = "positions_kloe.idx";
+pub(crate) const BUCKET_SIZES_INDEX_MAGIC: &[u8; 4] = b"KSX4";
+pub(crate) const BUCKET_SIZES_INDEX_FILE: &str = "bucket_sizes.idx";
+pub(crate) const TIGS_INDEX_FILE: &str = "tigs_kloe.idx";
+pub(crate) const ABUNDANCE_BASE_FILE: &str = "abundance_base.bin";
+pub(crate) const ABUNDANCE_BASE_INDEX_FILE: &str = "abundance_base.idx";
+pub(crate) const ARCHIVE_MANIFEST_FILE: &str = "manifest.kloe";
+const ARCHIVE_MANIFEST_MAGIC: &[u8; 4] = b"KLM4";
 pub(crate) const CID_TO_DATASET_MAGIC: &[u8; 4] = b"KCD2";
 const CID_TO_DATASET_COMPACT_MAGIC: &[u8; 4] = b"KCD3";
 const CID_TO_DATASET_ABUNDANCE_MAGIC: &[u8; 4] = b"KCD4";
@@ -64,6 +84,8 @@ pub(crate) const CID_TO_DATASET_FILE: &str = "cid_to_dataset_id.bin";
 const ABUNDANCE_CODES_PER_DATASET: usize = 256;
 const BUCKET_SIZE_BLOCK_MAX_GROUPS: usize = 8_192;
 const BUCKET_SIZE_BLOCK_MAX_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+const POSITION_INDEX_STRIDE: usize = 256;
+const SIZE_INDEX_STRIDE: usize = 256;
 
 #[derive(Debug)]
 struct CidDatasetSidecarBlock {
@@ -1483,23 +1505,588 @@ pub(crate) fn write_filenames_id_offsets(
     filenames: &[String],
     id_cid_line_sizes: &[usize],
 ) -> Result<()> {
-    if filenames.len() != id_cid_line_sizes.len() {
+    if id_cid_line_sizes.len() != filenames.len()
+        && id_cid_line_sizes.len() != filenames.len().saturating_add(1)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "filenames count ({}) differs from id->cid offsets count ({})",
+                "filenames count ({}) is incompatible with dataset boundary count ({})",
                 filenames.len(),
                 id_cid_line_sizes.len()
             ),
         ));
     }
 
+    #[derive(Clone, Copy)]
+    struct FilenameRecord {
+        hash: u64,
+        dataset_id: u32,
+        name_offset: u64,
+        name_len: u32,
+    }
+
     let mut fof_id = BufWriter::new(File::create(output_dir.to_owned() + "filenames_id.txt")?);
-    for (filename, offset) in filenames.iter().zip(id_cid_line_sizes.iter()) {
-        fof_id.write_all(format!("{filename}:{offset}\n").as_bytes())?;
+    let mut file_offset = 0u64;
+    let mut records = Vec::with_capacity(filenames.len());
+    let indexed_v4 = id_cid_line_sizes.len() == filenames.len().saturating_add(1);
+    for (dataset_id, filename) in filenames.iter().enumerate() {
+        let offset = if indexed_v4 {
+            0
+        } else {
+            id_cid_line_sizes[dataset_id]
+        };
+        let line = format!("{filename}:{offset}\n");
+        fof_id.write_all(line.as_bytes())?;
+        if dataset_id >= u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many datasets for filename index",
+            ));
+        }
+        records.push(FilenameRecord {
+            hash: stable_filename_hash(filename.as_bytes()),
+            dataset_id: dataset_id as u32,
+            name_offset: file_offset,
+            name_len: u32::try_from(filename.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "dataset filename is too long")
+            })?,
+        });
+        file_offset = file_offset
+            .checked_add(line.len() as u64)
+            .ok_or_else(|| io::Error::other("filename table offset overflow"))?;
     }
     fof_id.flush()?;
+
+    // Structural legacy archives do not have dataset-major postings.
+    if !indexed_v4 {
+        return Ok(());
+    }
+
+    // Keep the load factor at or below 75%. The resulting open-addressed table
+    // is directly queryable on disk and avoids reading or rebuilding a map at
+    // decompression time.
+    let minimum_capacity = records.len().saturating_mul(4).div_ceil(3).max(1);
+    let capacity = minimum_capacity
+        .checked_next_power_of_two()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filename hash table capacity overflow",
+            )
+        })?;
+    let mut slots = vec![None; capacity];
+    for record in &records {
+        let mut slot = record.hash as usize & (capacity - 1);
+        loop {
+            if slots[slot].is_none() {
+                slots[slot] = Some((record.hash, record.dataset_id));
+                break;
+            }
+            slot = (slot + 1) & (capacity - 1);
+        }
+    }
+
+    let mut index = BufWriter::with_capacity(
+        IO_BUFFER_CAPACITY,
+        File::create(output_dir.to_owned() + FILENAME_INDEX_FILE)?,
+    );
+    index.write_all(FILENAME_INDEX_MAGIC)?;
+    index.write_all(&(filenames.len() as u64).to_le_bytes())?;
+    index.write_all(&(capacity as u64).to_le_bytes())?;
+    for &boundary in id_cid_line_sizes {
+        index.write_all(&(boundary as u64).to_le_bytes())?;
+    }
+    for record in &records {
+        index.write_all(&record.name_offset.to_le_bytes())?;
+        index.write_all(&record.name_len.to_le_bytes())?;
+    }
+    for slot in slots {
+        if let Some((hash, dataset_id)) = slot {
+            index.write_all(&hash.to_le_bytes())?;
+            index.write_all(&dataset_id.to_le_bytes())?;
+        } else {
+            index.write_all(&0u64.to_le_bytes())?;
+            index.write_all(&u32::MAX.to_le_bytes())?;
+        }
+    }
+    index.flush()?;
     Ok(())
+}
+
+pub(crate) fn stable_filename_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MembershipEdge {
+    cid: u64,
+    dataset: u32,
+    abundance: u8,
+}
+
+fn write_membership_edge(writer: &mut impl Write, edge: MembershipEdge) -> Result<()> {
+    writer.write_all(&edge.cid.to_le_bytes())?;
+    writer.write_all(&edge.dataset.to_le_bytes())?;
+    writer.write_all(&[edge.abundance, 0, 0, 0])
+}
+
+fn read_membership_edge(reader: &mut impl Read) -> Result<Option<MembershipEdge>> {
+    let mut bytes = [0u8; 16];
+    match reader.read_exact(&mut bytes) {
+        Ok(()) => Ok(Some(MembershipEdge {
+            cid: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            dataset: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            abundance: bytes[12],
+        })),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn flush_membership_run(
+    edges: &mut Vec<MembershipEdge>,
+    runs: &mut Vec<PathBuf>,
+    directory: &Path,
+) -> Result<()> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+    edges.par_sort_unstable_by_key(|edge| (edge.cid, edge.dataset));
+    let path = directory.join(format!("membership_{:06}.run", runs.len()));
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&path)?);
+    for edge in edges.drain(..) {
+        write_membership_edge(&mut writer, edge)?;
+    }
+    writer.flush()?;
+    runs.push(path);
+    Ok(())
+}
+
+fn merge_membership_runs(
+    paths: &[PathBuf],
+    output: &Path,
+    mut visit: Option<&mut dyn FnMut(MembershipEdge) -> Result<()>>,
+) -> Result<()> {
+    let mut readers = paths
+        .iter()
+        .map(|path| BufReader::with_capacity(COLOR_RUN_BUFFER_BYTES, File::open(path).unwrap()))
+        .collect::<Vec<_>>();
+    let mut heap = BinaryHeap::<std::cmp::Reverse<(u64, u32, u8, usize)>>::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        if let Some(edge) = read_membership_edge(reader)? {
+            heap.push(std::cmp::Reverse((
+                edge.cid,
+                edge.dataset,
+                edge.abundance,
+                index,
+            )));
+        }
+    }
+    let mut writer = if visit.is_none() {
+        Some(BufWriter::with_capacity(
+            IO_BUFFER_CAPACITY,
+            File::create(output)?,
+        ))
+    } else {
+        None
+    };
+    while let Some(std::cmp::Reverse((cid, dataset, abundance, index))) = heap.pop() {
+        let edge = MembershipEdge {
+            cid,
+            dataset,
+            abundance,
+        };
+        if let Some(visit) = visit.as_deref_mut() {
+            visit(edge)?;
+        } else {
+            write_membership_edge(writer.as_mut().unwrap(), edge)?;
+        }
+        if let Some(next) = read_membership_edge(&mut readers[index])? {
+            heap.push(std::cmp::Reverse((
+                next.cid,
+                next.dataset,
+                next.abundance,
+                index,
+            )));
+        }
+    }
+    if let Some(writer) = writer.as_mut() {
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
+    data_path: &Path,
+    index_path: &Path,
+    output_path: &Path,
+    work_directory: &Path,
+    expected_groups: usize,
+) -> Result<Arc<CidDatasetSidecar>> {
+    let mut index = File::open(index_path)?;
+    let mut magic = [0u8; 4];
+    index.read_exact(&mut magic)?;
+    if &magic != FILENAME_INDEX_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid dataset directory",
+        ));
+    }
+    let mut value = [0u8; 8];
+    index.read_exact(&mut value)?;
+    let dataset_count = usize::try_from(u64::from_le_bytes(value))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dataset count is too large"))?;
+    index.read_exact(&mut value)?; // hash-table capacity
+    let mut offsets = vec![0u8; dataset_count.saturating_add(1).saturating_mul(8)];
+    index.read_exact(&mut offsets)?;
+
+    let mut data = File::open(data_path)?;
+    data.read_exact(&mut magic)?;
+    if &magic != DATASET_TO_CID_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid dataset-to-CID payload",
+        ));
+    }
+    let mut flags = [0u8; 1];
+    data.read_exact(&mut flags)?;
+    if flags[0]
+        & !(DATASET_TO_CID_FLAG_ABUNDANCE
+            | DATASET_TO_CID_FLAG_ADAPTIVE
+            | DATASET_TO_CID_FLAG_MAJORITY)
+        != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported dataset-to-CID flags",
+        ));
+    }
+    let abundance_log_base = if flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE != 0 {
+        data.read_exact(&mut value)?;
+        Some(f64::from_le_bytes(value))
+    } else {
+        None
+    };
+    let adaptive = flags[0] & DATASET_TO_CID_FLAG_ADAPTIVE != 0;
+    let cid_count = if adaptive {
+        data.read_exact(&mut value)?;
+        Some(u64::from_le_bytes(value))
+    } else {
+        None
+    };
+    let majority_frame = if flags[0] & DATASET_TO_CID_FLAG_MAJORITY != 0 {
+        if !adaptive || abundance_log_base.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid majority dataset posting flags",
+            ));
+        }
+        data.read_exact(&mut value)?;
+        Some((data.stream_position()?, u64::from_le_bytes(value)))
+    } else {
+        None
+    };
+
+    let run_directory = work_directory.join(format!(
+        ".kloe-membership-transpose-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&run_directory)?;
+    let edge_capacity = (64 * 1024 * 1024 / std::mem::size_of::<MembershipEdge>()).max(1);
+    let mut edges = Vec::with_capacity(edge_capacity);
+    let mut runs = Vec::new();
+    for dataset in 0..dataset_count {
+        let offset = u64::from_le_bytes(offsets[dataset * 8..dataset * 8 + 8].try_into().unwrap());
+        let end = u64::from_le_bytes(
+            offsets[dataset * 8 + 8..dataset * 8 + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let compressed_len = end.checked_sub(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dataset posting offsets are not monotonic",
+            )
+        })?;
+        let mut cid_file = File::open(data_path)?;
+        cid_file.seek(SeekFrom::Start(offset))?;
+        let (codec, payload_len) = if adaptive {
+            if compressed_len < 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated adaptive dataset posting frame",
+                ));
+            }
+            let mut codec = [0u8; 1];
+            cid_file.read_exact(&mut codec)?;
+            (codec[0], compressed_len - 1)
+        } else {
+            (DATASET_POSTING_DELTA, compressed_len)
+        };
+        if codec == DATASET_POSTING_BITMAP || codec == DATASET_POSTING_MAJORITY_XOR {
+            if abundance_log_base.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bitmap postings cannot contain abundance values",
+                ));
+            }
+            let universe = cid_count.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "bitmap CID universe is missing")
+            })?;
+            if universe != expected_groups as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bitmap CID universe does not match archive",
+                ));
+            }
+            let mut decoder = zstd::Decoder::new(cid_file.take(payload_len))?.single_frame();
+            let mut reference_decoder = if codec == DATASET_POSTING_MAJORITY_XOR {
+                let (reference_offset, reference_len) = majority_frame.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "majority-XOR posting has no reference bitmap",
+                    )
+                })?;
+                let mut reference = File::open(data_path)?;
+                reference.seek(SeekFrom::Start(reference_offset))?;
+                Some(zstd::Decoder::new(reference.take(reference_len))?.single_frame())
+            } else {
+                None
+            };
+            let mut cid = 0u64;
+            while cid < universe {
+                let mut byte = [0u8; 1];
+                decoder.read_exact(&mut byte)?;
+                if let Some(reference) = reference_decoder.as_mut() {
+                    let mut base = [0u8; 1];
+                    reference.read_exact(&mut base)?;
+                    byte[0] ^= base[0];
+                }
+                for bit in 0..8 {
+                    if cid >= universe {
+                        break;
+                    }
+                    if byte[0] & (1u8 << bit) != 0 {
+                        edges.push(MembershipEdge {
+                            cid,
+                            dataset: u32::try_from(dataset + 1).map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "dataset ID overflow")
+                            })?,
+                            abundance: 0,
+                        });
+                        if edges.len() == edge_capacity {
+                            flush_membership_run(&mut edges, &mut runs, &run_directory)?;
+                        }
+                    }
+                    cid += 1;
+                }
+            }
+            continue;
+        }
+        if codec != DATASET_POSTING_DELTA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported dataset posting codec",
+            ));
+        }
+        let (mut decoder, mut abundance_decoder) = if abundance_log_base.is_some() {
+            if payload_len < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated abundance posting frame",
+                ));
+            }
+            cid_file.read_exact(&mut value)?;
+            let cid_len = u64::from_le_bytes(value);
+            let abundance_len = payload_len
+                .checked_sub(8)
+                .and_then(|len| len.checked_sub(cid_len))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid abundance posting lengths",
+                    )
+                })?;
+            let decoder = zstd::Decoder::new(cid_file.take(cid_len))?.single_frame();
+            let mut abundance_file = File::open(data_path)?;
+            abundance_file.seek(SeekFrom::Start(offset + u64::from(adaptive) + 8 + cid_len))?;
+            let abundance_decoder =
+                zstd::Decoder::new(abundance_file.take(abundance_len))?.single_frame();
+            (decoder, Some(abundance_decoder))
+        } else {
+            (
+                zstd::Decoder::new(cid_file.take(payload_len))?.single_frame(),
+                None,
+            )
+        };
+        let mut cid = 0u64;
+        while let Some(delta) = read_optional_varint_u64(&mut decoder)? {
+            cid = cid.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "dataset posting CID overflow")
+            })?;
+            if cid >= expected_groups as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dataset posting CID outside archive",
+                ));
+            }
+            let abundance = if abundance_log_base.is_some() {
+                let mut residual = [0u8; 1];
+                abundance_decoder
+                    .as_mut()
+                    .expect("abundance decoder initialized")
+                    .read_exact(&mut residual)?;
+                residual[0]
+            } else {
+                0
+            };
+            edges.push(MembershipEdge {
+                cid,
+                dataset: u32::try_from(dataset + 1).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "dataset ID overflow")
+                })?,
+                abundance,
+            });
+            if edges.len() == edge_capacity {
+                flush_membership_run(&mut edges, &mut runs, &run_directory)?;
+            }
+        }
+    }
+    flush_membership_run(&mut edges, &mut runs, &run_directory)?;
+    if runs.is_empty() && expected_groups != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dataset index has no memberships",
+        ));
+    }
+    let mut pass = 0usize;
+    while runs.len() > COLOR_MERGE_FAN_IN {
+        let mut next = Vec::new();
+        for (group, paths) in runs.chunks(COLOR_MERGE_FAN_IN).enumerate() {
+            let path = run_directory.join(format!("merge_{pass:03}_{group:06}.run"));
+            merge_membership_runs(paths, &path, None)?;
+            for old in paths {
+                fs::remove_file(old)?;
+            }
+            next.push(path);
+        }
+        runs = next;
+        pass += 1;
+    }
+
+    let mut writer = CidDatasetSidecarWriter::create_with_abundance(
+        output_path,
+        abundance_log_base,
+        abundance_log_base.map(|_| dataset_count),
+    )?;
+    let mut current_cid = 0u64;
+    let mut current_ids = Vec::<u32>::new();
+    let mut current_codes = Vec::<u8>::new();
+    let mut saw_edge = false;
+    let mut abundance_bases = if abundance_log_base.is_some() {
+        let root = data_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dataset index has no archive directory",
+            )
+        })?;
+        let reader = PackedTigsReader::open_indexed(
+            root.join(ABUNDANCE_BASE_FILE),
+            root.join(ABUNDANCE_BASE_INDEX_FILE),
+        )?;
+        if reader.logical_len() != expected_groups as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "abundance base stream does not match archive CID count",
+            ));
+        }
+        Some(reader)
+    } else {
+        None
+    };
+    let mut current_base = 0u8;
+    let mut visit = |edge: MembershipEdge| -> Result<()> {
+        if saw_edge && edge.cid != current_cid {
+            if edge.cid != current_cid + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dataset index omits a CID",
+                ));
+            }
+            writer.append_zero_based_with_abundance(
+                &current_ids
+                    .iter()
+                    .map(|id| *id as usize - 1)
+                    .collect::<Vec<_>>(),
+                abundance_log_base.map(|_| current_codes.as_slice()),
+            )?;
+            current_ids.clear();
+            current_codes.clear();
+            current_cid = edge.cid;
+            if let Some(reader) = abundance_bases.as_mut() {
+                reader.read_exact_at(edge.cid, std::slice::from_mut(&mut current_base))?;
+            }
+        } else if !saw_edge {
+            if edge.cid != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dataset index does not begin at CID zero",
+                ));
+            }
+            current_cid = edge.cid;
+            saw_edge = true;
+            if let Some(reader) = abundance_bases.as_mut() {
+                reader.read_exact_at(edge.cid, std::slice::from_mut(&mut current_base))?;
+            }
+        }
+        if current_ids.last().is_some_and(|last| *last >= edge.dataset) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate or unsorted dataset membership",
+            ));
+        }
+        current_ids.push(edge.dataset);
+        if abundance_log_base.is_some() {
+            current_codes.push(current_base.wrapping_add(edge.abundance));
+        }
+        Ok(())
+    };
+    let sink = run_directory.join("unused");
+    merge_membership_runs(&runs, &sink, Some(&mut visit))?;
+    drop(visit);
+    if saw_edge {
+        writer.append_zero_based_with_abundance(
+            &current_ids
+                .iter()
+                .map(|id| *id as usize - 1)
+                .collect::<Vec<_>>(),
+            abundance_log_base.map(|_| current_codes.as_slice()),
+        )?;
+    }
+    writer.finish()?;
+    for run in runs {
+        fs::remove_file(run)?;
+    }
+    let _ = fs::remove_dir(&run_directory);
+    let sidecar = Arc::new(CidDatasetSidecar::open(output_path)?);
+    if sidecar.len() != expected_groups {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "temporary CID transpose has wrong group count",
+        ));
+    }
+    fs::remove_file(output_path)?;
+    Ok(sidecar)
 }
 
 fn to_io_err(context: &str, err: impl std::fmt::Display) -> io::Error {
@@ -2932,6 +3519,12 @@ struct DatasetCidSpill {
     directory: PathBuf,
     datasets_per_partition: usize,
     dataset_count: usize,
+    cid_count: usize,
+    majority_path: PathBuf,
+    majority_writer: BufWriter<File>,
+    majority_byte: u8,
+    majority_bits: u8,
+    abundance_log_base: Option<f64>,
 }
 
 struct DatasetCidSpillFiles {
@@ -2939,10 +3532,17 @@ struct DatasetCidSpillFiles {
     directory: PathBuf,
     datasets_per_partition: usize,
     dataset_count: usize,
+    cid_count: usize,
+    majority_path: PathBuf,
+    abundance_log_base: Option<f64>,
 }
 
 impl DatasetCidSpill {
-    fn new(output_dir: &str, dataset_count: usize) -> Result<Self> {
+    fn new(
+        output_dir: &str,
+        dataset_count: usize,
+        abundance_log_base: Option<f64>,
+    ) -> Result<Self> {
         let directory = create_id_cid_spill_dir(output_dir)?;
         let partition_count = dataset_count
             .div_ceil(DATASETS_PER_CID_PARTITION)
@@ -2959,6 +3559,9 @@ impl DatasetCidSpill {
             ));
             paths.push(path);
         }
+        let majority_path = directory.join("majority_membership.bin");
+        let majority_writer =
+            BufWriter::with_capacity(CID_PARTITION_BUFFER_BYTES, File::create(&majority_path)?);
         println!(
             "Dataset-to-CID spill: datasets={}, partitions={}, datasets_per_partition={}",
             dataset_count, partition_count, datasets_per_partition
@@ -2970,16 +3573,59 @@ impl DatasetCidSpill {
             directory,
             datasets_per_partition,
             dataset_count,
+            cid_count: 0,
+            majority_path,
+            majority_writer,
+            majority_byte: 0,
+            majority_bits: 0,
+            abundance_log_base,
         })
     }
 
-    fn append_group(&mut self, dataset_ids: &[usize], cid: usize) -> Result<()> {
+    fn append_group(
+        &mut self,
+        dataset_ids: &[usize],
+        abundance_codes: Option<&[u8]>,
+        cid: usize,
+    ) -> Result<()> {
+        match (self.abundance_log_base, abundance_codes) {
+            (Some(_), Some(codes)) if codes.len() == dataset_ids.len() => {}
+            (Some(_), _) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dataset-to-CID abundance codes do not match memberships",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "abundance codes supplied for a non-abundance dataset-to-CID index",
+                ))
+            }
+            (None, None) => {}
+        }
         let cid = u64::try_from(cid).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "CID cannot be represented as u64",
             )
         })?;
+        if cid != self.cid_count as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CID order is not contiguous while building majority membership",
+            ));
+        }
+        if dataset_ids.len().saturating_mul(2) >= self.dataset_count {
+            self.majority_byte |= 1u8 << self.majority_bits;
+        }
+        self.majority_bits += 1;
+        if self.majority_bits == 8 {
+            self.majority_writer.write_all(&[self.majority_byte])?;
+            self.majority_byte = 0;
+            self.majority_bits = 0;
+        }
+        self.cid_count += 1;
         let mut start = 0usize;
         while start < dataset_ids.len() {
             let first_dataset = dataset_ids[start];
@@ -3012,7 +3658,7 @@ impl DatasetCidSpill {
             write_varint_u64_to_writer((end - start) as u64, &mut *writer)?;
             let partition_start = partition.saturating_mul(self.datasets_per_partition);
             let mut previous_dataset = partition_start;
-            for &dataset in &dataset_ids[start..end] {
+            for (local_index, &dataset) in dataset_ids[start..end].iter().enumerate() {
                 if dataset >= self.dataset_count || dataset < previous_dataset {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -3020,6 +3666,12 @@ impl DatasetCidSpill {
                     ));
                 }
                 write_varint_u64_to_writer((dataset - previous_dataset) as u64, &mut *writer)?;
+                if let Some(codes) = abundance_codes {
+                    // The CID's first abundance is stored once in the indexed
+                    // base stream. Dataset postings keep only deviations from
+                    // that base, which are strongly concentrated around zero.
+                    writer.write_all(&[codes[start + local_index].wrapping_sub(codes[0])])?;
+                }
                 previous_dataset = dataset;
             }
             self.last_cids[partition] = cid;
@@ -3033,11 +3685,19 @@ impl DatasetCidSpill {
             writer.flush()?;
         }
         drop(self.writers);
+        if self.majority_bits != 0 {
+            self.majority_writer.write_all(&[self.majority_byte])?;
+        }
+        self.majority_writer.flush()?;
+        drop(self.majority_writer);
         Ok(DatasetCidSpillFiles {
             paths: self.paths,
             directory: self.directory,
             datasets_per_partition: self.datasets_per_partition,
             dataset_count: self.dataset_count,
+            cid_count: self.cid_count,
+            majority_path: self.majority_path,
+            abundance_log_base: self.abundance_log_base,
         })
     }
 }
@@ -3089,12 +3749,18 @@ struct StreamFinalize {
     position_path: PathBuf,
     position_entries: u64,
     spill_directory: PathBuf,
+    dataset_cid_spill: DatasetCidSpillFiles,
 }
 
 struct StreamWriterState {
     tigs_file: PackedTigsWriter,
+    abundance_bases: Option<PackedTigsWriter>,
     size_file: BufWriter<File>,
-    cid_dataset_writer: Option<CidDatasetSidecarWriter>,
+    size_index_path: PathBuf,
+    size_file_bytes: u64,
+    size_groups_written: u64,
+    size_blocks: Vec<(u64, u32, u64, u64)>,
+    dataset_cid_spill: Option<DatasetCidSpill>,
     spill_directory: PathBuf,
     position_spill: PositionSpill,
     size_block_groups: usize,
@@ -3115,13 +3781,20 @@ impl StreamWriterState {
     ) -> Result<Self> {
         let spill_directory = create_id_cid_spill_dir(output_dir)?;
         let position_spill = PositionSpill::new(&spill_directory)?;
-        let cid_dataset_writer = CidDatasetSidecarWriter::create_with_abundance(
-            &Path::new(output_dir).join(CID_TO_DATASET_FILE),
-            abundance_log_base,
-            abundance_log_base.map(|_| nb_files),
-        )?;
+        let dataset_cid_spill = DatasetCidSpill::new(output_dir, nb_files, abundance_log_base)?;
         Ok(Self {
-            tigs_file: PackedTigsWriter::create(unitigs_file_path)?,
+            tigs_file: PackedTigsWriter::create_indexed(
+                unitigs_file_path,
+                Path::new(output_dir).join(TIGS_INDEX_FILE),
+            )?,
+            abundance_bases: if abundance_log_base.is_some() {
+                Some(PackedTigsWriter::create_indexed(
+                    Path::new(output_dir).join(ABUNDANCE_BASE_FILE),
+                    Path::new(output_dir).join(ABUNDANCE_BASE_INDEX_FILE),
+                )?)
+            } else {
+                None
+            },
             size_file: {
                 let mut out = BufWriter::with_capacity(
                     IO_BUFFER_CAPACITY,
@@ -3130,7 +3803,11 @@ impl StreamWriterState {
                 out.write_all(BUCKET_SIZES_COMPACT_MAGIC)?;
                 out
             },
-            cid_dataset_writer: Some(cid_dataset_writer),
+            size_index_path: Path::new(output_dir).join(BUCKET_SIZES_INDEX_FILE),
+            size_file_bytes: BUCKET_SIZES_COMPACT_MAGIC.len() as u64,
+            size_groups_written: 0,
+            size_blocks: Vec::new(),
+            dataset_cid_spill: Some(dataset_cid_spill),
             spill_directory,
             position_spill,
             size_block_groups: 0,
@@ -3166,11 +3843,37 @@ impl StreamWriterState {
             encoder.finish()?;
         }
 
+        let group_count = u32::try_from(self.size_block_groups).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "too many groups in size block")
+        })?;
+        let compressed_len = u64::try_from(compressed.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compressed size block is too large",
+            )
+        })?;
+        let data_offset = self
+            .size_file_bytes
+            .checked_add(12)
+            .ok_or_else(|| io::Error::other("size file offset overflow"))?;
+        self.size_blocks.push((
+            self.size_groups_written,
+            group_count,
+            data_offset,
+            compressed_len,
+        ));
         self.size_file
             .write_all(&(self.size_block_groups as u32).to_le_bytes())?;
         self.size_file
             .write_all(&(compressed.len() as u64).to_le_bytes())?;
         self.size_file.write_all(&compressed)?;
+        self.size_file_bytes = data_offset
+            .checked_add(compressed_len)
+            .ok_or_else(|| io::Error::other("size file offset overflow"))?;
+        self.size_groups_written = self
+            .size_groups_written
+            .checked_add(u64::from(group_count))
+            .ok_or_else(|| io::Error::other("size group count overflow"))?;
 
         self.size_block_groups = 0;
         self.size_block_offsets.clear();
@@ -3203,10 +3906,26 @@ impl StreamWriterState {
         dataset_ids_zero_based: &[usize],
         abundance_codes: Option<&[u8]>,
     ) -> Result<()> {
-        self.cid_dataset_writer
+        match (&mut self.abundance_bases, abundance_codes) {
+            (Some(writer), Some(codes)) if !codes.is_empty() => writer.write_all(&[codes[0]])?,
+            (Some(_), _) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "abundance color set has no base code",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected abundance codes in non-abundance archive",
+                ))
+            }
+            (None, None) => {}
+        }
+        self.dataset_cid_spill
             .as_mut()
-            .expect("CID dataset sidecar writer must be initialized")
-            .append_zero_based_with_abundance(dataset_ids_zero_based, abundance_codes)?;
+            .expect("dataset-to-CID spill must be initialized")
+            .append_group(dataset_ids_zero_based, abundance_codes, self.cid)?;
         self.cid += 1;
         Ok(())
     }
@@ -3309,11 +4028,43 @@ impl StreamWriterState {
         }
         self.flush_size_block()?;
         self.tigs_file.finish()?;
+        if let Some(abundance_bases) = self.abundance_bases.take() {
+            abundance_bases.finish()?;
+        }
         self.size_file.flush()?;
-        self.cid_dataset_writer
+        let mut size_index =
+            BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&self.size_index_path)?);
+        size_index.write_all(BUCKET_SIZES_INDEX_MAGIC)?;
+        size_index.write_all(&self.size_groups_written.to_le_bytes())?;
+        size_index.write_all(&(self.size_blocks.len() as u64).to_le_bytes())?;
+        size_index.write_all(&(SIZE_INDEX_STRIDE as u32).to_le_bytes())?;
+        size_index.write_all(&0u32.to_le_bytes())?;
+        for (first_group, group_count, data_offset, data_len) in &self.size_blocks {
+            size_index.write_all(&first_group.to_le_bytes())?;
+            size_index.write_all(&group_count.to_le_bytes())?;
+            size_index.write_all(&0u32.to_le_bytes())?;
+            size_index.write_all(&data_offset.to_le_bytes())?;
+            size_index.write_all(&data_len.to_le_bytes())?;
+        }
+        let routing_count = self.size_groups_written.div_ceil(SIZE_INDEX_STRIDE as u64);
+        size_index.write_all(&routing_count.to_le_bytes())?;
+        let mut block_index = 0usize;
+        for route in 0..routing_count {
+            let group = route * SIZE_INDEX_STRIDE as u64;
+            while block_index + 1 < self.size_blocks.len()
+                && self.size_blocks[block_index].0 + u64::from(self.size_blocks[block_index].1)
+                    <= group
+            {
+                block_index += 1;
+            }
+            size_index.write_all(&(block_index as u32).to_le_bytes())?;
+        }
+        size_index.flush()?;
+        let dataset_cid_spill = self
+            .dataset_cid_spill
             .take()
-            .expect("CID dataset sidecar writer must be initialized")
-            .finish()?;
+            .expect("dataset-to-CID spill must be initialized")
+            .finalize()?;
 
         println!(
             "Completed compression: total tigs={}, total sizes={}",
@@ -3324,6 +4075,7 @@ impl StreamWriterState {
             position_path,
             position_entries,
             spill_directory: self.spill_directory,
+            dataset_cid_spill,
         })
     }
 }
@@ -3771,14 +4523,44 @@ fn write_positions_from_spill(
     position_spill_path: &Path,
     entries: u64,
     filepath: String,
+    index_filepath: String,
 ) -> Result<()> {
     let mut pos_file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(filepath)?);
     pos_file.write_all(POSITIONS_COMPACT_MAGIC)?;
     write_varint_u64_to_writer(entries, &mut pos_file)?;
     let mut spill_reader =
         BufReader::with_capacity(IO_BUFFER_CAPACITY, File::open(position_spill_path)?);
-    io::copy(&mut spill_reader, &mut pos_file)?;
+    let mut checkpoints = Vec::<(u64, u64)>::new();
+    let mut absolute = 0u64;
+    let mut seen = 0u64;
+    while let Some(delta) = read_optional_varint_u64(&mut spill_reader)? {
+        absolute = absolute
+            .checked_add(delta)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "position index overflow"))?;
+        write_varint_u64_to_writer(delta, &mut pos_file)?;
+        if seen as usize % POSITION_INDEX_STRIDE == 0 {
+            checkpoints.push((spill_reader.stream_position()?, absolute));
+        }
+        seen += 1;
+    }
+    if seen != entries {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("position spill has {seen} entries, expected {entries}"),
+        ));
+    }
     pos_file.flush()?;
+
+    let mut index = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(index_filepath)?);
+    index.write_all(POSITIONS_INDEX_MAGIC)?;
+    index.write_all(&(POSITION_INDEX_STRIDE as u32).to_le_bytes())?;
+    index.write_all(&entries.to_le_bytes())?;
+    index.write_all(&(checkpoints.len() as u64).to_le_bytes())?;
+    for (relative_after, position) in checkpoints {
+        index.write_all(&relative_after.to_le_bytes())?;
+        index.write_all(&position.to_le_bytes())?;
+    }
+    index.flush()?;
     fs::remove_file(position_spill_path)?;
     Ok(())
 }
@@ -3871,6 +4653,7 @@ fn transpose_cid_partition(
     spill_dir: &Path,
     datasets_per_partition: usize,
     dataset_count: usize,
+    abundance_enabled: bool,
     payload_writer: &mut DatasetPayloadWriter,
 ) -> Result<(u64, u64)> {
     let dataset_start = partition_index.saturating_mul(datasets_per_partition);
@@ -3922,6 +4705,13 @@ fn transpose_cid_partition(
                 ));
             }
             let state = &mut datasets[dataset - dataset_start];
+            let abundance = if abundance_enabled {
+                let mut code = [0u8; 1];
+                reader.read_exact(&mut code)?;
+                Some(code[0])
+            } else {
+                None
+            };
             if state.seen && cid < state.last_cid {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -3937,6 +4727,9 @@ fn transpose_cid_partition(
                 cid
             };
             write_varint_u64(delta, &mut state.encoded_deltas);
+            if let Some(code) = abundance {
+                state.encoded_deltas.push(code);
+            }
             state.last_cid = cid;
             state.seen = true;
             records += 1;
@@ -3978,23 +4771,90 @@ struct DatasetPayloadWriter {
     dataset_count: usize,
     total_size: usize,
     current_dataset: Option<usize>,
-    payload_path: PathBuf,
-    payload_encoder: Option<Encoder<'static, File>>,
+    cid_payload_path: PathBuf,
+    abundance_payload_path: PathBuf,
+    cid_encoder: Option<Encoder<'static, File>>,
+    abundance_encoder: Option<Encoder<'static, File>>,
+    abundance_enabled: bool,
+    cid_count: u64,
+    current_postings: u64,
+    bitmap_payload_path: PathBuf,
+    xor_payload_path: PathBuf,
+    majority_bitmap_path: Option<PathBuf>,
+    delta_datasets: u64,
+    bitmap_datasets: u64,
+    majority_xor_datasets: u64,
     payload_bytes: u64,
 }
 
 impl DatasetPayloadWriter {
-    fn new(path: &str, spill_dir: &Path, dataset_count: usize) -> Result<Self> {
+    fn new(
+        path: &str,
+        spill_dir: &Path,
+        dataset_count: usize,
+        cid_count: usize,
+        majority_bitmap_path: &Path,
+        abundance_log_base: Option<f64>,
+    ) -> Result<Self> {
         let mut output = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(path)?);
-        output.write_all(ID_TO_CID_MAGIC)?;
+        output.write_all(DATASET_TO_CID_MAGIC)?;
+        let flags = DATASET_TO_CID_FLAG_ADAPTIVE
+            | u8::from(abundance_log_base.is_some()) * DATASET_TO_CID_FLAG_ABUNDANCE
+            | u8::from(abundance_log_base.is_none()) * DATASET_TO_CID_FLAG_MAJORITY;
+        output.write_all(&[flags])?;
+        if let Some(base) = abundance_log_base {
+            output.write_all(&base.to_le_bytes())?;
+        }
+        let cid_count = u64::try_from(cid_count)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "CID count is too large"))?;
+        output.write_all(&cid_count.to_le_bytes())?;
+        let mut header_size = DATASET_TO_CID_MAGIC.len()
+            + 1
+            + usize::from(abundance_log_base.is_some()) * std::mem::size_of::<f64>()
+            + std::mem::size_of::<u64>();
+        let majority_bitmap_path = if abundance_log_base.is_none() {
+            let compressed_path = spill_dir.join("majority_membership.zst.tmp");
+            let compressed_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&compressed_path)?;
+            let mut encoder = Encoder::new(compressed_file, 1)?;
+            let mut majority = File::open(majority_bitmap_path)?;
+            io::copy(&mut majority, &mut encoder)?;
+            let mut compressed_file = encoder.finish()?;
+            let compressed_len = compressed_file.seek(SeekFrom::End(0))?;
+            compressed_file.seek(SeekFrom::Start(0))?;
+            output.write_all(&compressed_len.to_le_bytes())?;
+            io::copy(&mut compressed_file, &mut output)?;
+            header_size = header_size
+                .checked_add(8 + compressed_len as usize)
+                .ok_or_else(|| io::Error::other("dataset posting header size overflow"))?;
+            fs::remove_file(compressed_path)?;
+            Some(majority_bitmap_path.to_path_buf())
+        } else {
+            None
+        };
         Ok(Self {
             output,
             offsets: Vec::with_capacity(dataset_count),
             dataset_count,
-            total_size: ID_TO_CID_MAGIC.len(),
+            total_size: header_size,
             current_dataset: None,
-            payload_path: spill_dir.join("dataset_payload.zst.tmp"),
-            payload_encoder: None,
+            cid_payload_path: spill_dir.join("dataset_cids.zst.tmp"),
+            abundance_payload_path: spill_dir.join("dataset_abundance.zst.tmp"),
+            cid_encoder: None,
+            abundance_encoder: None,
+            abundance_enabled: abundance_log_base.is_some(),
+            cid_count,
+            current_postings: 0,
+            bitmap_payload_path: spill_dir.join("dataset_bitmap.zst.tmp"),
+            xor_payload_path: spill_dir.join("dataset_majority_xor.zst.tmp"),
+            majority_bitmap_path,
+            delta_datasets: 0,
+            bitmap_datasets: 0,
+            majority_xor_datasets: 0,
             payload_bytes: 0,
         })
     }
@@ -4010,10 +4870,23 @@ impl DatasetPayloadWriter {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&self.payload_path)?;
+            .open(&self.cid_payload_path)?;
         let encoder = Encoder::new(payload_file, 1)?;
+        let abundance_encoder = if self.abundance_enabled {
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&self.abundance_payload_path)?;
+            Some(Encoder::new(file, 1)?)
+        } else {
+            None
+        };
         self.current_dataset = Some(dataset);
-        self.payload_encoder = Some(encoder);
+        self.current_postings = 0;
+        self.cid_encoder = Some(encoder);
+        self.abundance_encoder = abundance_encoder;
         Ok(())
     }
 
@@ -4023,24 +4896,144 @@ impl DatasetPayloadWriter {
             .take()
             .ok_or_else(|| io::Error::other("no active dataset payload"))?;
         let encoder = self
-            .payload_encoder
+            .cid_encoder
             .take()
             .ok_or_else(|| io::Error::other("missing dataset payload encoder"))?;
-        let mut payload_file = encoder.finish()?;
-        let payload_len = payload_file.seek(SeekFrom::End(0))?;
-        payload_file.seek(SeekFrom::Start(0))?;
+        let mut cid_file = encoder.finish()?;
+        let cid_len = cid_file.seek(SeekFrom::End(0))?;
+        cid_file.seek(SeekFrom::Start(0))?;
         self.offsets.push(self.total_size);
-        self.output.write_all(&payload_len.to_le_bytes())?;
-        io::copy(&mut payload_file, &mut self.output)?;
-        self.total_size = self
-            .total_size
-            .checked_add(8)
-            .and_then(|size| size.checked_add(payload_len as usize))
-            .ok_or_else(|| io::Error::other("id-to-CID output size overflow"))?;
-        self.payload_bytes = self.payload_bytes.saturating_add(payload_len);
-        drop(payload_file);
+        if let Some(encoder) = self.abundance_encoder.take() {
+            let mut abundance_file = encoder.finish()?;
+            let abundance_len = abundance_file.seek(SeekFrom::End(0))?;
+            abundance_file.seek(SeekFrom::Start(0))?;
+            self.output.write_all(&[DATASET_POSTING_DELTA])?;
+            self.output.write_all(&cid_len.to_le_bytes())?;
+            io::copy(&mut cid_file, &mut self.output)?;
+            io::copy(&mut abundance_file, &mut self.output)?;
+            self.total_size = self
+                .total_size
+                .checked_add(1 + 8)
+                .and_then(|size| size.checked_add(cid_len as usize))
+                .and_then(|size| size.checked_add(abundance_len as usize))
+                .ok_or_else(|| io::Error::other("id-to-CID output size overflow"))?;
+            self.payload_bytes = self
+                .payload_bytes
+                .saturating_add(cid_len)
+                .saturating_add(abundance_len);
+            self.delta_datasets += 1;
+        } else if let Some((codec, mut bitmap_file, bitmap_len)) =
+            self.build_smaller_bitmap_payload(cid_len)?
+        {
+            self.output.write_all(&[codec])?;
+            io::copy(&mut bitmap_file, &mut self.output)?;
+            self.total_size = self
+                .total_size
+                .checked_add(1 + bitmap_len as usize)
+                .ok_or_else(|| io::Error::other("id-to-CID output size overflow"))?;
+            self.payload_bytes = self.payload_bytes.saturating_add(bitmap_len);
+            if codec == DATASET_POSTING_BITMAP {
+                self.bitmap_datasets += 1;
+            } else {
+                self.majority_xor_datasets += 1;
+            }
+        } else {
+            self.output.write_all(&[DATASET_POSTING_DELTA])?;
+            io::copy(&mut cid_file, &mut self.output)?;
+            self.total_size = self
+                .total_size
+                .checked_add(1 + cid_len as usize)
+                .ok_or_else(|| io::Error::other("id-to-CID output size overflow"))?;
+            self.payload_bytes = self.payload_bytes.saturating_add(cid_len);
+            self.delta_datasets += 1;
+        }
         debug_assert_eq!(self.offsets.len(), dataset + 1);
         Ok(())
+    }
+
+    fn build_smaller_bitmap_payload(&self, delta_len: u64) -> Result<Option<(u8, File, u64)>> {
+        let bitmap_bytes = self.cid_count.div_ceil(8);
+        // A full bitmap scan is allowed only when it is bounded by eight times
+        // the number of returned CIDs. This preserves O(output) query time.
+        if self.cid_count == 0
+            || self.current_postings.saturating_mul(8) < self.cid_count
+            || bitmap_bytes > MAX_DATASET_POSTING_BITMAP_BYTES
+        {
+            return Ok(None);
+        }
+        let mut bitmap = vec![0u8; bitmap_bytes as usize];
+        // Reopen rather than clone: duplicated Unix file descriptors share a
+        // cursor, which would otherwise consume the delta payload selected as
+        // the fallback representation.
+        let source = File::open(&self.cid_payload_path)?;
+        let mut decoder = zstd::Decoder::new(source)?.single_frame();
+        let mut cid = 0u64;
+        while let Some(delta) = read_optional_varint_u64(&mut decoder)? {
+            cid = cid.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "dataset posting CID overflow")
+            })?;
+            if cid >= self.cid_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dataset posting CID outside bitmap universe",
+                ));
+            }
+            bitmap[(cid / 8) as usize] |= 1u8 << (cid % 8);
+        }
+        let bitmap_file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.bitmap_payload_path)?;
+        let mut encoder = Encoder::new(bitmap_file, 1)?;
+        encoder.write_all(&bitmap)?;
+        let mut bitmap_file = encoder.finish()?;
+        let bitmap_len = bitmap_file.seek(SeekFrom::End(0))?;
+        bitmap_file.seek(SeekFrom::Start(0))?;
+        let mut best_codec = DATASET_POSTING_BITMAP;
+        let mut best_len = bitmap_len;
+        if let Some(majority_path) = self.majority_bitmap_path.as_ref() {
+            let mut majority = File::open(majority_path)?;
+            let mut reference = vec![0u8; 1024 * 1024];
+            let mut offset = 0usize;
+            while offset < bitmap.len() {
+                let chunk_len = (bitmap.len() - offset).min(reference.len());
+                majority.read_exact(&mut reference[..chunk_len])?;
+                for (value, base) in bitmap[offset..offset + chunk_len]
+                    .iter_mut()
+                    .zip(&reference[..chunk_len])
+                {
+                    *value ^= *base;
+                }
+                offset += chunk_len;
+            }
+            let xor_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&self.xor_payload_path)?;
+            let mut encoder = Encoder::new(xor_file, 1)?;
+            encoder.write_all(&bitmap)?;
+            let xor_file = encoder.finish()?;
+            let xor_len = xor_file.metadata()?.len();
+            if xor_len < best_len {
+                best_codec = DATASET_POSTING_MAJORITY_XOR;
+                best_len = xor_len;
+            }
+        }
+        if best_len >= delta_len {
+            return Ok(None);
+        }
+        let selected_path = if best_codec == DATASET_POSTING_BITMAP {
+            &self.bitmap_payload_path
+        } else {
+            &self.xor_payload_path
+        };
+        let mut selected = File::open(selected_path)?;
+        selected.seek(SeekFrom::Start(0))?;
+        Ok(Some((best_codec, selected, best_len)))
     }
 
     fn advance_to(&mut self, dataset: usize) -> Result<()> {
@@ -4078,13 +5071,37 @@ impl DatasetPayloadWriter {
             ));
         }
         self.advance_to(dataset)?;
-        self.payload_encoder
-            .as_mut()
-            .ok_or_else(|| io::Error::other("missing dataset payload encoder"))?
-            .write_all(encoded_deltas)
+        if self.abundance_enabled {
+            let mut cursor = std::io::Cursor::new(encoded_deltas);
+            while let Some(delta) = read_optional_varint_u64(&mut cursor)? {
+                self.current_postings = self.current_postings.saturating_add(1);
+                write_varint_u64_to_writer(
+                    delta,
+                    self.cid_encoder
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("missing dataset CID encoder"))?,
+                )?;
+                let mut deviation = [0u8; 1];
+                cursor.read_exact(&mut deviation)?;
+                self.abundance_encoder
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("missing dataset abundance encoder"))?
+                    .write_all(&deviation)?;
+            }
+            Ok(())
+        } else {
+            let mut cursor = std::io::Cursor::new(encoded_deltas);
+            while read_optional_varint_u64(&mut cursor)?.is_some() {
+                self.current_postings = self.current_postings.saturating_add(1);
+            }
+            self.cid_encoder
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing dataset CID encoder"))?
+                .write_all(encoded_deltas)
+        }
     }
 
-    fn finish(mut self, dataset_count: usize) -> Result<(Vec<usize>, u64)> {
+    fn finish(mut self, dataset_count: usize) -> Result<(Vec<usize>, u64, u64, u64, u64)> {
         if self.current_dataset.is_some() {
             self.finish_dataset()?;
         }
@@ -4099,23 +5116,47 @@ impl DatasetPayloadWriter {
                 "dataset-to-CID spill contains an out-of-range dataset",
             ));
         }
-        self.output.write_all(&0u64.to_le_bytes())?;
+        // A terminal boundary lets readers derive each compressed frame length
+        // from two adjacent index entries. This avoids one redundant u64 per
+        // dataset in the payload.
+        self.offsets.push(self.total_size);
         self.output.flush()?;
-        if self.payload_path.exists() {
-            fs::remove_file(&self.payload_path)?;
+        if self.cid_payload_path.exists() {
+            fs::remove_file(&self.cid_payload_path)?;
         }
-        Ok((self.offsets, self.payload_bytes))
+        if self.abundance_payload_path.exists() {
+            fs::remove_file(&self.abundance_payload_path)?;
+        }
+        if self.bitmap_payload_path.exists() {
+            fs::remove_file(&self.bitmap_payload_path)?;
+        }
+        if self.xor_payload_path.exists() {
+            fs::remove_file(&self.xor_payload_path)?;
+        }
+        Ok((
+            self.offsets,
+            self.payload_bytes,
+            self.delta_datasets,
+            self.bitmap_datasets,
+            self.majority_xor_datasets,
+        ))
     }
 }
 
-fn write_id_to_color_id_from_partitions(
+fn write_dataset_to_cid_from_partitions(
     cid_file_path: String,
     spill: DatasetCidSpillFiles,
     _memory_budget: CompressionMemoryBudget,
 ) -> std::io::Result<Vec<usize>> {
     let total_timer = PhaseTimer::start();
-    let mut payload_writer =
-        DatasetPayloadWriter::new(&cid_file_path, &spill.directory, spill.dataset_count)?;
+    let mut payload_writer = DatasetPayloadWriter::new(
+        &cid_file_path,
+        &spill.directory,
+        spill.dataset_count,
+        spill.cid_count,
+        &spill.majority_path,
+        spill.abundance_log_base,
+    )?;
     let mut transposed_records = 0u64;
     let mut transpose_bytes = 0u64;
     for (partition_index, path) in spill.paths.iter().enumerate() {
@@ -4125,22 +5166,30 @@ fn write_id_to_color_id_from_partitions(
             &spill.directory,
             spill.datasets_per_partition,
             spill.dataset_count,
+            spill.abundance_log_base.is_some(),
             &mut payload_writer,
         )?;
         transposed_records = transposed_records.saturating_add(records);
         transpose_bytes = transpose_bytes.saturating_add(bytes);
     }
-    let (offsets, total_payload_bytes) = payload_writer.finish(spill.dataset_count)?;
+    let (offsets, total_payload_bytes, delta_datasets, bitmap_datasets, majority_xor_datasets) =
+        payload_writer.finish(spill.dataset_count)?;
+    if spill.majority_path.exists() {
+        fs::remove_file(&spill.majority_path)?;
+    }
     let _ = fs::remove_dir(&spill.directory);
-    log_phase_timing("post_ggcat.id_to_cid.total", total_timer.finish());
+    log_phase_timing("post_ggcat.dataset_to_cid.total", total_timer.finish());
     println!(
-        "[phase-stats] phase=post_ggcat.id_to_cid datasets={} partitions={} datasets_per_partition={} transposed_records={} transpose_bytes={} payload_bytes={}",
+        "[phase-stats] phase=post_ggcat.dataset_to_cid datasets={} partitions={} datasets_per_partition={} transposed_records={} transpose_bytes={} payload_bytes={} delta_datasets={} bitmap_datasets={} majority_xor_datasets={}",
         spill.dataset_count,
         spill.paths.len(),
         spill.datasets_per_partition,
         transposed_records,
         transpose_bytes,
-        total_payload_bytes
+        total_payload_bytes,
+        delta_datasets,
+        bitmap_datasets,
+        majority_xor_datasets
     );
     Ok(offsets)
 }
@@ -4152,7 +5201,7 @@ pub(crate) fn sort_by_bucket_streaming(
     memory_gb: usize,
     abundance_log_base: Option<f64>,
     record_rx: mpsc::Receiver<SimplitigBatch>,
-) {
+) -> (u64, Vec<usize>) {
     let total_timer = PhaseTimer::start();
     let memory_budget = CompressionMemoryBudget::from_gb(memory_gb);
     println!("Starting writing compressed sequences (streaming).");
@@ -4177,10 +5226,12 @@ pub(crate) fn sort_by_bucket_streaming(
     log_phase_timing("post_ggcat.write_stream", write_stream_timing);
     let position_timer = PhaseTimer::start();
     println!("Starting to write positions");
+    let position_entries = triple.position_entries;
     if let Err(e) = write_positions_from_spill(
         &triple.position_path,
         triple.position_entries,
         String::from(output_dir.clone() + "positions_kloe.bin"),
+        String::from(output_dir.clone() + POSITIONS_INDEX_FILE),
     ) {
         panic!("Error writting positions: {e:?}");
     }
@@ -4190,10 +5241,21 @@ pub(crate) fn sort_by_bucket_streaming(
         position_timing.wall_sec
     );
     log_phase_timing("post_ggcat.write_positions", position_timing);
+    let transpose_timer = PhaseTimer::start();
+    let dataset_offsets = match write_dataset_to_cid_from_partitions(
+        output_dir.clone() + DATASET_TO_CID_FILE,
+        triple.dataset_cid_spill,
+        memory_budget,
+    ) {
+        Ok(offsets) => offsets,
+        Err(e) => panic!("Error writing dataset-to-CID postings: {e:?}"),
+    };
+    log_phase_timing("post_ggcat.dataset_to_cid", transpose_timer.finish());
     let _ = fs::remove_dir(&triple.spill_directory);
     let total_timing = total_timer.finish();
     println!("Compression took: {:.3}s", total_timing.wall_sec);
     log_phase_timing("post_ggcat.total", total_timing);
+    (position_entries, dataset_offsets)
 }
 
 fn stream_sorted_records_from_chunks(
@@ -4639,7 +5701,7 @@ pub(crate) fn compress_ggcat_sources(
     });
 
     let sort_start = Instant::now();
-    sort_by_bucket_streaming(
+    let (position_entries, dataset_offsets) = sort_by_bucket_streaming(
         &output_dir.to_string(),
         dataset_count as u32,
         threads,
@@ -4662,10 +5724,28 @@ pub(crate) fn compress_ggcat_sources(
         }
     }
 
-    // The CID-to-dataset sidecar is the canonical membership index. Keeping the
-    // transposed dataset-to-CID index would duplicate the same relation and is
-    // especially costly for large collections.
-    write_filenames_id_offsets(output_dir, &filenames, &vec![0; filenames.len()])?;
+    let cid_count = position_entries.checked_sub(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive positions omit the initial boundary",
+        )
+    })?;
+    let mut manifest = BufWriter::new(File::create(
+        Path::new(output_dir).join(ARCHIVE_MANIFEST_FILE),
+    )?);
+    manifest.write_all(ARCHIVE_MANIFEST_MAGIC)?;
+    manifest.write_all(&4u32.to_le_bytes())?;
+    manifest.write_all(&(k as u32).to_le_bytes())?;
+    manifest.write_all(&(m as u32).to_le_bytes())?;
+    manifest.write_all(&(dataset_count as u64).to_le_bytes())?;
+    manifest.write_all(&cid_count.to_le_bytes())?;
+    manifest.write_all(&u32::from(abundance_log_base.is_some()).to_le_bytes())?;
+    manifest.write_all(&abundance_log_base.unwrap_or(0.0).to_le_bytes())?;
+    manifest.flush()?;
+
+    // Dataset-to-CID is the sole persistent membership relation in v4.  Merge
+    // reconstructs the inverse as a bounded temporary external transpose.
+    write_filenames_id_offsets(output_dir, &filenames, &dataset_offsets)?;
     Ok(())
 }
 

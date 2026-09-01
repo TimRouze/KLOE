@@ -221,13 +221,25 @@ fn is_compressed_dir_complete(input_dir: String) {
         panic!("Tigs sizes file not found");
     } else if !Path::new(&format!("{input_dir}/id_to_color_id.txt.zst")).exists()
         && !Path::new(&format!("{input_dir}/{}", compress::CID_TO_DATASET_FILE)).exists()
+        && !Path::new(&format!("{input_dir}/{}", compress::DATASET_TO_CID_FILE)).exists()
     {
         panic!("archive membership index not found");
     } else if !Path::new(&format!("{input_dir}/tigs_kloe.fa")).exists() {
         panic!("Tigs file not found");
-    } else {
-        println!("Archive complete, starting decompression...");
+    } else if Path::new(&format!("{input_dir}/{}", compress::DATASET_TO_CID_FILE)).exists() {
+        for index in [
+            compress::ARCHIVE_MANIFEST_FILE,
+            compress::FILENAME_INDEX_FILE,
+            compress::POSITIONS_INDEX_FILE,
+            compress::BUCKET_SIZES_INDEX_FILE,
+            compress::TIGS_INDEX_FILE,
+        ] {
+            if !Path::new(&format!("{input_dir}/{index}")).exists() {
+                panic!("KLOE v4 index not found: {input_dir}/{index}");
+            }
+        }
     }
+    println!("Archive complete, starting decompression...");
 }
 
 #[cfg(test)]
@@ -237,6 +249,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
     const K: usize = 31;
@@ -246,6 +259,11 @@ mod tests {
     const SEQ_ONLY_2: &str = "GGATCCGGATCCGGATCCGGATCCGGATCCGGATCCA";
     const SEQ_SHARED_23: &str = "CCGTAACCGTAACCGTAACCGTAACCGTAACCGTAAC";
     const SEQ_ONLY_3: &str = "ATGCTTATGCTTATGCTTATGCTTATGCTTATGCTTA";
+
+    fn ggcat_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn write_fasta(path: &Path, seqs: &[&str]) {
         let mut fasta = String::new();
@@ -396,6 +414,7 @@ mod tests {
         output_dir: &Path,
         k: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ggcat_guard = ggcat_test_lock();
         // Create a file-of-files list
         let fof_path = output_dir.join("input.fof");
         let mut fof = File::create(&fof_path)?;
@@ -986,6 +1005,76 @@ mod tests {
     }
 
     #[test]
+    fn indexed_abundance_archive_restores_targeted_headers_without_cid_sidecar() {
+        let _ggcat_guard = ggcat_test_lock();
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive = workdir.path().join("archive");
+        let output = workdir.path().join("output");
+        fs::create_dir_all(&archive).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let first = workdir.path().join("abundance_a.fa");
+        let second = workdir.path().join("abundance_b.fa");
+        fs::write(&first, ">a ka:f:17\nACGTACGTACGTACGT\n").unwrap();
+        fs::write(&second, ">b ka:f:31\nACGTACGTACGTACGT\n").unwrap();
+        let fof = workdir.path().join("input.fof");
+        fs::write(&fof, format!("{}\n{}\n", first.display(), second.display())).unwrap();
+        compress::compress_with_ggcat(
+            &(archive.display().to_string() + "/"),
+            &fof.display().to_string(),
+            1,
+            7,
+            5,
+            10,
+            false,
+            false,
+            false,
+            false,
+            false,
+            compress::GgcatCompressionConfig {
+                memory_gb: 1,
+                temp_dir: workdir.path().join("tmp").display().to_string(),
+                abundance_log_base: Some(1.05),
+            },
+        )
+        .unwrap();
+        assert!(!archive.join(compress::CID_TO_DATASET_FILE).exists());
+
+        let wanted = workdir.path().join("wanted.txt");
+        fs::write(
+            &wanted,
+            format!("{}\n{}\n", first.display(), second.display()),
+        )
+        .unwrap();
+        decompress::decompress_with_options(
+            &"bucket_sizes.txt".to_string(),
+            &"id_to_color_id.txt.zst".to_string(),
+            &"tigs_kloe.fa".to_string(),
+            &"positions_kloe.bin".to_string(),
+            &"filenames_id.txt".to_string(),
+            &(output.display().to_string() + "/"),
+            &wanted.display().to_string(),
+            archive.display().to_string() + "/",
+            decompress::GgcatRebuildConfig {
+                restore_abundance: true,
+                ..decompress::GgcatRebuildConfig::default()
+            },
+        )
+        .unwrap();
+        let first_dump = fs::read_to_string(make_dump_path(&output, &first)).unwrap();
+        let second_dump = fs::read_to_string(make_dump_path(&output, &second)).unwrap();
+        let restored_17 = compress::decode_abundance(compress::encode_abundance(17, 1.05), 1.05);
+        let restored_31 = compress::decode_abundance(compress::encode_abundance(31, 1.05), 1.05);
+        assert!(
+            first_dump.contains(&format!("ka:f:{restored_17}")),
+            "{first_dump}"
+        );
+        assert!(
+            second_dump.contains(&format!("ka:f:{restored_31}")),
+            "{second_dump}"
+        );
+    }
+
+    #[test]
     fn merge_two_archives_preserves_per_file_kmer_content() {
         let workdir = tempfile::tempdir().expect("create temp workdir");
         let archive_a = workdir.path().join("archive_a");
@@ -1017,22 +1106,26 @@ mod tests {
         run_compression(&[b_file1.clone(), b_file2.clone()], &archive_b, K)
             .expect("compress archive B");
         for archive in [&archive_a, &archive_b] {
-            assert!(archive.join(compress::CID_TO_DATASET_FILE).is_file());
+            assert!(archive.join(compress::DATASET_TO_CID_FILE).is_file());
             assert!(
-                !archive.join("id_to_color_id.txt.zst").exists(),
+                !archive.join(compress::CID_TO_DATASET_FILE).exists()
+                    && !archive.join("id_to_color_id.txt.zst").exists(),
                 "new archives must not duplicate the membership relation"
             );
         }
 
-        merge::merge_archives(
-            &archive_a.display().to_string(),
-            &archive_b.display().to_string(),
-            &merged_archive.display().to_string(),
-            K,
-            1,
-        )
-        .expect("merge archives");
-        assert!(merged_archive.join(compress::CID_TO_DATASET_FILE).is_file());
+        {
+            let _ggcat_guard = ggcat_test_lock();
+            merge::merge_archives(
+                &archive_a.display().to_string(),
+                &archive_b.display().to_string(),
+                &merged_archive.display().to_string(),
+                K,
+                1,
+            )
+            .expect("merge archives");
+        }
+        assert!(merged_archive.join(compress::DATASET_TO_CID_FILE).is_file());
         assert!(!merged_archive.join("id_to_color_id.txt.zst").exists());
 
         run_full_decompression(&merged_archive, &merged_out);

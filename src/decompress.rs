@@ -1,7 +1,9 @@
 use core::panic;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Result, Seek, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -10,7 +12,14 @@ use crossbeam::channel::{bounded, Receiver};
 use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
 use zstd::Decoder;
 
-use crate::compress::{CidDatasetSidecar, CID_TO_DATASET_FILE};
+use crate::compress::{
+    stable_filename_hash, CidDatasetSidecar, ABUNDANCE_BASE_FILE, ABUNDANCE_BASE_INDEX_FILE,
+    BUCKET_SIZES_INDEX_FILE, BUCKET_SIZES_INDEX_MAGIC, CID_TO_DATASET_FILE, DATASET_POSTING_BITMAP,
+    DATASET_POSTING_DELTA, DATASET_POSTING_MAJORITY_XOR, DATASET_TO_CID_FILE,
+    DATASET_TO_CID_FLAG_ABUNDANCE, DATASET_TO_CID_FLAG_ADAPTIVE, DATASET_TO_CID_FLAG_MAJORITY,
+    DATASET_TO_CID_MAGIC, FILENAME_INDEX_FILE, FILENAME_INDEX_MAGIC, POSITIONS_INDEX_FILE,
+    POSITIONS_INDEX_MAGIC, TIGS_INDEX_FILE,
+};
 use crate::packed_tigs::PackedTigsReader;
 use crate::utils::vec2str;
 
@@ -20,6 +29,13 @@ const POSITIONS_MAGIC: &[u8; 4] = b"KPS2";
 const POSITIONS_COMPACT_MAGIC: &[u8; 4] = b"KPS3";
 const ID_TO_CID_MAGIC: &[u8; 4] = b"KIC2";
 const DECOMPRESS_BATCH_BASES: usize = 8 * 1024 * 1024;
+const FILENAME_INDEX_HEADER_BYTES: u64 = 20;
+const DATASET_BOUNDARY_BYTES: u64 = 8;
+const DATASET_NAME_RECORD_BYTES: u64 = 12;
+const FILENAME_HASH_SLOT_BYTES: u64 = 12;
+const POSITION_INDEX_HEADER_BYTES: u64 = 24;
+const SIZE_INDEX_HEADER_BYTES: u64 = 28;
+const SIZE_INDEX_RECORD_BYTES: u64 = 32;
 const PACKED_BASES: [[u8; 4]; 256] = {
     let mut table = [[b'A'; 4]; 256];
     let mut byte = 0usize;
@@ -35,6 +51,720 @@ const PACKED_BASES: [[u8; 4]; 256] = {
 };
 
 //   =========================================================================================== DECOMPRESSION ==============================================================================
+
+#[derive(Clone, Copy)]
+struct FilenameIndexRecord {
+    hash: u64,
+    dataset_id: u32,
+}
+
+struct FilenameIndex {
+    index: File,
+    names: File,
+    count: u64,
+    capacity: u64,
+    names_offset: u64,
+    hash_offset: u64,
+}
+
+impl FilenameIndex {
+    fn open(index_path: &Path, names_path: &Path) -> Result<Self> {
+        let mut index = File::open(index_path)?;
+        let mut magic = [0u8; 4];
+        index.read_exact(&mut magic)?;
+        if &magic != FILENAME_INDEX_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid filename index",
+            ));
+        }
+        let mut count = [0u8; 8];
+        index.read_exact(&mut count)?;
+        let count = u64::from_le_bytes(count);
+        let mut capacity = [0u8; 8];
+        index.read_exact(&mut capacity)?;
+        let capacity = u64::from_le_bytes(capacity);
+        if capacity == 0 || !capacity.is_power_of_two() || count > capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid filename hash table capacity",
+            ));
+        }
+        let names_offset = FILENAME_INDEX_HEADER_BYTES
+            .checked_add(
+                count
+                    .saturating_add(1)
+                    .saturating_mul(DATASET_BOUNDARY_BYTES),
+            )
+            .ok_or_else(|| io::Error::other("dataset directory size overflow"))?;
+        let hash_offset = names_offset
+            .checked_add(count.saturating_mul(DATASET_NAME_RECORD_BYTES))
+            .ok_or_else(|| io::Error::other("dataset directory size overflow"))?;
+        let expected = hash_offset
+            .checked_add(capacity.saturating_mul(FILENAME_HASH_SLOT_BYTES))
+            .ok_or_else(|| io::Error::other("filename index size overflow"))?;
+        if index.metadata()?.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid filename index length",
+            ));
+        }
+        Ok(Self {
+            index,
+            names: File::open(names_path)?,
+            count,
+            capacity,
+            names_offset,
+            hash_offset,
+        })
+    }
+
+    fn record(&self, slot: u64) -> Result<FilenameIndexRecord> {
+        let mut bytes = [0u8; FILENAME_HASH_SLOT_BYTES as usize];
+        self.index.read_exact_at(
+            &mut bytes,
+            self.hash_offset + slot * FILENAME_HASH_SLOT_BYTES,
+        )?;
+        Ok(FilenameIndexRecord {
+            hash: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            dataset_id: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        })
+    }
+
+    fn name_record(&self, dataset_id: u32) -> Result<(u64, u32)> {
+        if u64::from(dataset_id) >= self.count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filename hash slot contains an invalid dataset ID",
+            ));
+        }
+        let mut bytes = [0u8; DATASET_NAME_RECORD_BYTES as usize];
+        self.index.read_exact_at(
+            &mut bytes,
+            self.names_offset + u64::from(dataset_id) * DATASET_NAME_RECORD_BYTES,
+        )?;
+        Ok((
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        ))
+    }
+
+    fn lookup(&self, name: &str) -> Result<Option<u32>> {
+        let hash = stable_filename_hash(name.as_bytes());
+        let mut slot = hash & (self.capacity - 1);
+        for _ in 0..self.capacity {
+            let record = self.record(slot)?;
+            if record.dataset_id == u32::MAX {
+                return Ok(None);
+            }
+            if record.hash == hash {
+                let (name_offset, name_len) = self.name_record(record.dataset_id)?;
+                if name_len as usize == name.len() {
+                    let mut stored = vec![0u8; name_len as usize];
+                    self.names.read_exact_at(&mut stored, name_offset)?;
+                    if stored == name.as_bytes() {
+                        return Ok(Some(record.dataset_id));
+                    }
+                }
+            }
+            slot = (slot + 1) & (self.capacity - 1);
+        }
+        Ok(None)
+    }
+}
+
+struct DatasetPostingIndex {
+    index: File,
+    data_path: PathBuf,
+    dataset_count: u64,
+    abundance_log_base: Option<f64>,
+    adaptive: bool,
+    cid_count: Option<u64>,
+    majority_frame: Option<(u64, u64)>,
+}
+
+type PostingDecoder = Decoder<'static, BufReader<std::io::Take<File>>>;
+
+impl DatasetPostingIndex {
+    fn open(index_path: &Path, data_path: &Path) -> Result<Self> {
+        let mut index = File::open(index_path)?;
+        let mut magic = [0u8; 4];
+        index.read_exact(&mut magic)?;
+        if &magic != FILENAME_INDEX_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid dataset directory",
+            ));
+        }
+        let mut count = [0u8; 8];
+        index.read_exact(&mut count)?;
+        let dataset_count = u64::from_le_bytes(count);
+        let mut capacity = [0u8; 8];
+        index.read_exact(&mut capacity)?;
+        let capacity = u64::from_le_bytes(capacity);
+        let expected = FILENAME_INDEX_HEADER_BYTES
+            .saturating_add(dataset_count.saturating_add(1).saturating_mul(8))
+            .saturating_add(dataset_count.saturating_mul(DATASET_NAME_RECORD_BYTES))
+            .saturating_add(capacity.saturating_mul(FILENAME_HASH_SLOT_BYTES));
+        if capacity == 0 || !capacity.is_power_of_two() || index.metadata()?.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid dataset directory length",
+            ));
+        }
+
+        let mut data = File::open(data_path)?;
+        data.read_exact(&mut magic)?;
+        if &magic != DATASET_TO_CID_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid dataset-to-CID payload",
+            ));
+        }
+        let mut flags = [0u8; 1];
+        data.read_exact(&mut flags)?;
+        if flags[0]
+            & !(DATASET_TO_CID_FLAG_ABUNDANCE
+                | DATASET_TO_CID_FLAG_ADAPTIVE
+                | DATASET_TO_CID_FLAG_MAJORITY)
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported dataset-to-CID flags",
+            ));
+        }
+        let abundance_log_base = if flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE != 0 {
+            let mut base = [0u8; 8];
+            data.read_exact(&mut base)?;
+            let base = f64::from_le_bytes(base);
+            if !base.is_finite() || base <= 1.0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid abundance log base",
+                ));
+            }
+            Some(base)
+        } else {
+            None
+        };
+        let adaptive = flags[0] & DATASET_TO_CID_FLAG_ADAPTIVE != 0;
+        let cid_count = if adaptive {
+            let mut count = [0u8; 8];
+            data.read_exact(&mut count)?;
+            Some(u64::from_le_bytes(count))
+        } else {
+            None
+        };
+        let majority_frame = if flags[0] & DATASET_TO_CID_FLAG_MAJORITY != 0 {
+            if !adaptive || abundance_log_base.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid majority dataset posting flags",
+                ));
+            }
+            let mut len = [0u8; 8];
+            data.read_exact(&mut len)?;
+            let len = u64::from_le_bytes(len);
+            Some((data.stream_position()?, len))
+        } else {
+            None
+        };
+        Ok(Self {
+            index,
+            data_path: data_path.to_path_buf(),
+            dataset_count,
+            abundance_log_base,
+            adaptive,
+            cid_count,
+            majority_frame,
+        })
+    }
+
+    fn posting_reader(&self, dataset_id: u32) -> Result<DatasetPostingReader> {
+        if u64::from(dataset_id) >= self.dataset_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dataset ID outside posting index",
+            ));
+        }
+        let mut offset_bytes = [0u8; 16];
+        self.index.read_exact_at(
+            &mut offset_bytes,
+            FILENAME_INDEX_HEADER_BYTES + u64::from(dataset_id) * 8,
+        )?;
+        let offset = u64::from_le_bytes(offset_bytes[..8].try_into().unwrap());
+        let end = u64::from_le_bytes(offset_bytes[8..].try_into().unwrap());
+        let compressed_len = end.checked_sub(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dataset posting offsets are not monotonic",
+            )
+        })?;
+        let mut data = File::open(&self.data_path)?;
+        data.seek(std::io::SeekFrom::Start(offset))?;
+        let (codec, payload_offset, payload_len) = if self.adaptive {
+            if compressed_len < 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated adaptive dataset posting frame",
+                ));
+            }
+            let mut codec = [0u8; 1];
+            data.read_exact(&mut codec)?;
+            (codec[0], offset + 1, compressed_len - 1)
+        } else {
+            (DATASET_POSTING_DELTA, offset, compressed_len)
+        };
+        if codec == DATASET_POSTING_BITMAP || codec == DATASET_POSTING_MAJORITY_XOR {
+            if self.abundance_log_base.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bitmap postings cannot contain abundance values",
+                ));
+            }
+            let decoder = Decoder::new(data.take(payload_len))?.single_frame();
+            let reference_decoder = if codec == DATASET_POSTING_MAJORITY_XOR {
+                let (reference_offset, reference_len) = self.majority_frame.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "majority-XOR posting has no reference bitmap",
+                    )
+                })?;
+                let mut reference = File::open(&self.data_path)?;
+                reference.seek(std::io::SeekFrom::Start(reference_offset))?;
+                Some(Decoder::new(reference.take(reference_len))?.single_frame())
+            } else {
+                None
+            };
+            return Ok(DatasetPostingReader {
+                encoding: PostingEncoding::Bitmap {
+                    decoder,
+                    reference_decoder,
+                    current_byte: 0,
+                    bit: 8,
+                    next_cid: 0,
+                    cid_count: self.cid_count.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bitmap CID universe is missing")
+                    })?,
+                },
+                abundance_decoder: None,
+            });
+        }
+        if codec != DATASET_POSTING_DELTA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported dataset posting codec",
+            ));
+        }
+        let (decoder, abundance_decoder) = if self.abundance_log_base.is_some() {
+            if payload_len < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated abundance posting frame",
+                ));
+            }
+            let mut raw_len = [0u8; 8];
+            data.read_exact(&mut raw_len)?;
+            let cid_len = u64::from_le_bytes(raw_len);
+            let abundance_len = payload_len
+                .checked_sub(8)
+                .and_then(|len| len.checked_sub(cid_len))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid abundance posting lengths",
+                    )
+                })?;
+            let decoder = Decoder::new(data.take(cid_len))?.single_frame();
+            let mut abundance_file = File::open(&self.data_path)?;
+            abundance_file.seek(std::io::SeekFrom::Start(payload_offset + 8 + cid_len))?;
+            let abundance_decoder =
+                Decoder::new(abundance_file.take(abundance_len))?.single_frame();
+            (decoder, Some(abundance_decoder))
+        } else {
+            (Decoder::new(data.take(payload_len))?.single_frame(), None)
+        };
+        Ok(DatasetPostingReader {
+            encoding: PostingEncoding::Delta { decoder, cid: 0 },
+            abundance_decoder,
+        })
+    }
+}
+
+enum PostingEncoding {
+    Delta {
+        decoder: PostingDecoder,
+        cid: u64,
+    },
+    Bitmap {
+        decoder: PostingDecoder,
+        reference_decoder: Option<PostingDecoder>,
+        current_byte: u8,
+        bit: u8,
+        next_cid: u64,
+        cid_count: u64,
+    },
+}
+
+struct DatasetPostingReader {
+    encoding: PostingEncoding,
+    abundance_decoder: Option<PostingDecoder>,
+}
+
+impl DatasetPostingReader {
+    fn next(&mut self) -> Result<Option<(u64, Option<u8>)>> {
+        let cid = match &mut self.encoding {
+            PostingEncoding::Delta { decoder, cid } => {
+                let Some(delta) = read_varint_u64_from_reader(decoder)? else {
+                    return Ok(None);
+                };
+                *cid = cid.checked_add(delta).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "dataset CID overflow")
+                })?;
+                *cid
+            }
+            PostingEncoding::Bitmap {
+                decoder,
+                reference_decoder,
+                current_byte,
+                bit,
+                next_cid,
+                cid_count,
+            } => loop {
+                if *next_cid >= *cid_count {
+                    return Ok(None);
+                }
+                if *bit == 8 {
+                    let mut byte = [0u8; 1];
+                    decoder.read_exact(&mut byte)?;
+                    if let Some(reference) = reference_decoder.as_mut() {
+                        let mut base = [0u8; 1];
+                        reference.read_exact(&mut base)?;
+                        byte[0] ^= base[0];
+                    }
+                    *current_byte = byte[0];
+                    *bit = 0;
+                }
+                let cid = *next_cid;
+                let present = (*current_byte & (1u8 << *bit)) != 0;
+                *bit += 1;
+                *next_cid += 1;
+                if present {
+                    break cid;
+                }
+            },
+        };
+        let abundance = if let Some(decoder) = self.abundance_decoder.as_mut() {
+            let mut deviation = [0u8; 1];
+            decoder.read_exact(&mut deviation)?;
+            Some(deviation[0])
+        } else {
+            None
+        };
+        Ok(Some((cid, abundance)))
+    }
+}
+
+struct PositionLookup {
+    positions: File,
+    index: File,
+    data_start: u64,
+    entries: u64,
+    stride: u64,
+    checkpoints: u64,
+    cached_checkpoint: u64,
+    cached_positions: Vec<u64>,
+}
+
+impl PositionLookup {
+    fn open(positions_path: &Path, index_path: &Path) -> Result<Self> {
+        let mut positions = File::open(positions_path)?;
+        let mut magic = [0u8; 4];
+        positions.read_exact(&mut magic)?;
+        if &magic != POSITIONS_COMPACT_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "indexed positions require KPS3",
+            ));
+        }
+        let entries = read_varint_u64_from_reader(&mut positions)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "missing positions count")
+        })?;
+        let data_start = positions.stream_position()?;
+
+        let mut index = File::open(index_path)?;
+        index.read_exact(&mut magic)?;
+        if &magic != POSITIONS_INDEX_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid positions index",
+            ));
+        }
+        let mut stride = [0u8; 4];
+        index.read_exact(&mut stride)?;
+        let stride = u32::from_le_bytes(stride) as u64;
+        let mut value = [0u8; 8];
+        index.read_exact(&mut value)?;
+        if u64::from_le_bytes(value) != entries || stride == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "positions index does not match payload",
+            ));
+        }
+        index.read_exact(&mut value)?;
+        let checkpoints = u64::from_le_bytes(value);
+        if index.metadata()?.len() != POSITION_INDEX_HEADER_BYTES + checkpoints.saturating_mul(16) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid positions index length",
+            ));
+        }
+        Ok(Self {
+            positions,
+            index,
+            data_start,
+            entries,
+            stride,
+            checkpoints,
+            cached_checkpoint: u64::MAX,
+            cached_positions: Vec::new(),
+        })
+    }
+
+    fn load_checkpoint(&mut self, checkpoint: u64) -> Result<()> {
+        if self.cached_checkpoint == checkpoint {
+            return Ok(());
+        }
+        if checkpoint >= self.checkpoints {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "position checkpoint outside index",
+            ));
+        }
+        let mut record = [0u8; 16];
+        self.index
+            .read_exact_at(&mut record, POSITION_INDEX_HEADER_BYTES + checkpoint * 16)?;
+        let relative_after = u64::from_le_bytes(record[..8].try_into().unwrap());
+        let mut position = u64::from_le_bytes(record[8..].try_into().unwrap());
+        let first = checkpoint * self.stride;
+        let end = (first + self.stride).min(self.entries);
+        self.cached_positions.clear();
+        self.cached_positions.push(position);
+        self.positions.seek(std::io::SeekFrom::Start(
+            self.data_start
+                .checked_add(relative_after)
+                .ok_or_else(|| io::Error::other("position checkpoint offset overflow"))?,
+        ))?;
+        for _ in first + 1..end {
+            let delta = read_varint_u64_from_reader(&mut self.positions)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated indexed positions")
+            })?;
+            position = position.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "indexed position overflow")
+            })?;
+            self.cached_positions.push(position);
+        }
+        self.cached_checkpoint = checkpoint;
+        Ok(())
+    }
+
+    fn position(&mut self, entry: u64) -> Result<u64> {
+        if entry >= self.entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "position entry outside index",
+            ));
+        }
+        let checkpoint = entry / self.stride;
+        self.load_checkpoint(checkpoint)?;
+        Ok(self.cached_positions[(entry % self.stride) as usize])
+    }
+
+    fn range(&mut self, cid: u64) -> Result<(u64, u64)> {
+        let start = self.position(cid)?;
+        let end = self.position(cid + 1)?;
+        Ok((start, end))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SizeBlockDescriptor {
+    first_group: u64,
+    group_count: u32,
+    data_offset: u64,
+    data_len: u64,
+}
+
+struct SizeLookup {
+    data: File,
+    index: File,
+    total_groups: u64,
+    block_count: u64,
+    stride: u64,
+    routing_offset: u64,
+    cached_block: u64,
+    cached_ranges: Vec<(usize, usize)>,
+    cached_data: Vec<u8>,
+}
+
+impl SizeLookup {
+    fn open(data_path: &Path, index_path: &Path) -> Result<Self> {
+        let mut index = File::open(index_path)?;
+        let mut magic = [0u8; 4];
+        index.read_exact(&mut magic)?;
+        if &magic != BUCKET_SIZES_INDEX_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid bucket-size index",
+            ));
+        }
+        let mut value = [0u8; 8];
+        index.read_exact(&mut value)?;
+        let total_groups = u64::from_le_bytes(value);
+        index.read_exact(&mut value)?;
+        let block_count = u64::from_le_bytes(value);
+        let mut stride = [0u8; 4];
+        index.read_exact(&mut stride)?;
+        let stride = u32::from_le_bytes(stride) as u64;
+        let mut reserved = [0u8; 4];
+        index.read_exact(&mut reserved)?;
+        if stride == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zero bucket-size index stride",
+            ));
+        }
+        let routing_offset = SIZE_INDEX_HEADER_BYTES
+            .checked_add(block_count.saturating_mul(SIZE_INDEX_RECORD_BYTES))
+            .ok_or_else(|| io::Error::other("bucket-size routing offset overflow"))?;
+        index.read_exact_at(&mut value, routing_offset)?;
+        let routing_count = u64::from_le_bytes(value);
+        if routing_count != total_groups.div_ceil(stride)
+            || index.metadata()?.len() != routing_offset + 8 + routing_count.saturating_mul(4)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid bucket-size routing table",
+            ));
+        }
+        Ok(Self {
+            data: File::open(data_path)?,
+            index,
+            total_groups,
+            block_count,
+            stride,
+            routing_offset,
+            cached_block: u64::MAX,
+            cached_ranges: Vec::new(),
+            cached_data: Vec::new(),
+        })
+    }
+
+    fn descriptor(&self, block: u64) -> Result<SizeBlockDescriptor> {
+        if block >= self.block_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "size block outside index",
+            ));
+        }
+        let mut bytes = [0u8; SIZE_INDEX_RECORD_BYTES as usize];
+        self.index.read_exact_at(
+            &mut bytes,
+            SIZE_INDEX_HEADER_BYTES + block * SIZE_INDEX_RECORD_BYTES,
+        )?;
+        Ok(SizeBlockDescriptor {
+            first_group: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            group_count: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            data_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            data_len: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        })
+    }
+
+    fn block_for_group(&self, group: u64) -> Result<u64> {
+        if group >= self.total_groups {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "size group outside index",
+            ));
+        }
+        let route = group / self.stride;
+        let mut raw = [0u8; 4];
+        self.index
+            .read_exact_at(&mut raw, self.routing_offset + 8 + route * 4)?;
+        let mut block = u32::from_le_bytes(raw) as u64;
+        loop {
+            let descriptor = self.descriptor(block)?;
+            if group >= descriptor.first_group
+                && group < descriptor.first_group + u64::from(descriptor.group_count)
+            {
+                return Ok(block);
+            }
+            block += 1;
+        }
+    }
+
+    fn load_block(&mut self, block: u64) -> Result<()> {
+        if self.cached_block == block {
+            return Ok(());
+        }
+        let descriptor = self.descriptor(block)?;
+        let mut compressed = vec![
+            0u8;
+            usize::try_from(descriptor.data_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed size block is too large",
+                )
+            })?
+        ];
+        self.data
+            .read_exact_at(&mut compressed, descriptor.data_offset)?;
+        self.cached_data = zstd::decode_all(compressed.as_slice())?;
+        self.cached_ranges.clear();
+        let mut cursor = std::io::Cursor::new(self.cached_data.as_slice());
+        for _ in 0..descriptor.group_count {
+            let length = read_varint_u64_from_reader(&mut cursor)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "missing size-group length")
+            })?;
+            let start = cursor.position() as usize;
+            let end = start
+                .checked_add(usize::try_from(length).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "size-group length is too large")
+                })?)
+                .ok_or_else(|| io::Error::other("size-group offset overflow"))?;
+            if end > self.cached_data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated size group",
+                ));
+            }
+            self.cached_ranges.push((start, end));
+            cursor.set_position(end as u64);
+        }
+        if cursor.position() as usize != self.cached_data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trailing size-block data",
+            ));
+        }
+        self.cached_block = block;
+        Ok(())
+    }
+
+    fn group_into(&mut self, group: u64, sizes: &mut Vec<usize>) -> Result<()> {
+        let block = self.block_for_group(group)?;
+        self.load_block(block)?;
+        let descriptor = self.descriptor(block)?;
+        let local = usize::try_from(group - descriptor.first_group).unwrap();
+        let (start, end) = self.cached_ranges[local];
+        decode_varint_deltas_to_sizes_into(
+            &self.cached_data[start..end],
+            "indexed size group",
+            sizes,
+        )
+    }
+}
 
 /// High-level decompression entry point.
 pub fn decompress(
@@ -265,6 +995,61 @@ pub fn decompress_with_options(
     println!("Writing decompressed data in {out_dir}");
     ensure_output_dir(out_dir)?;
 
+    let archive_root = Path::new(&input_dir);
+    let dataset_data_path = archive_root.join(DATASET_TO_CID_FILE);
+    let dataset_index_path = archive_root.join(FILENAME_INDEX_FILE);
+    let filename_index_path = archive_root.join(FILENAME_INDEX_FILE);
+    let positions_index_path = archive_root.join(POSITIONS_INDEX_FILE);
+    let sizes_index_path = archive_root.join(BUCKET_SIZES_INDEX_FILE);
+    let tigs_index_path = archive_root.join(TIGS_INDEX_FILE);
+    if !wanted_files_path.is_empty()
+        && dataset_data_path.is_file()
+        && dataset_index_path.is_file()
+        && filename_index_path.is_file()
+        && positions_index_path.is_file()
+        && sizes_index_path.is_file()
+        && tigs_index_path.is_file()
+    {
+        decompress_indexed_targeted(
+            archive_root,
+            &(input_dir.clone() + filename_id),
+            &(input_dir.clone() + positions_filename),
+            &(input_dir.clone() + size_filename),
+            &(input_dir.clone() + tigs_filename),
+            wanted_files_path,
+            out_dir,
+            ggcat_cfg.restore_abundance,
+        )?;
+        if ggcat_cfg.enabled {
+            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
+        }
+        return Ok(());
+    }
+    if wanted_files_path.is_empty()
+        && dataset_data_path.is_file()
+        && dataset_index_path.is_file()
+        && positions_index_path.is_file()
+        && sizes_index_path.is_file()
+        && tigs_index_path.is_file()
+    {
+        let filenames = load_archive_filenames(&(input_dir.clone() + filename_id))?;
+        for batch in filenames.chunks(128) {
+            decompress_indexed_selected_batch(
+                archive_root,
+                &(input_dir.clone() + positions_filename),
+                &(input_dir.clone() + size_filename),
+                &(input_dir.clone() + tigs_filename),
+                batch,
+                out_dir,
+                ggcat_cfg.restore_abundance,
+            )?;
+        }
+        if ggcat_cfg.enabled {
+            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
+        }
+        return Ok(());
+    }
+
     let filenames_path = input_dir.clone() + filename_id;
     let filenames = load_archive_filenames(&filenames_path)?;
     let sidecar_path = Path::new(&input_dir).join(CID_TO_DATASET_FILE);
@@ -374,6 +1159,261 @@ pub fn decompress_with_options(
     if ggcat_cfg.enabled {
         run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
     }
+    Ok(())
+}
+
+fn indexed_wanted_datasets(
+    filename_index_path: &Path,
+    filename_table_path: &Path,
+    wanted_files_path: &str,
+) -> Result<Vec<(String, u32)>> {
+    let filename_index = FilenameIndex::open(filename_index_path, filename_table_path)?;
+    let wanted_reader = BufReader::new(File::open(wanted_files_path)?);
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for line in wanted_reader.lines() {
+        let name = line?;
+        match filename_index.lookup(&name)? {
+            Some(dataset_id) if seen.insert(dataset_id) => selected.push((name, dataset_id)),
+            Some(_) => {}
+            None => println!(
+                "FILE {} NOT FOUND IN ARCHIVE, CHECK SPELLING OR ACTUAL PRESENCE IN ARCHIVE",
+                name
+            ),
+        }
+    }
+    Ok(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decompress_indexed_targeted(
+    archive_root: &Path,
+    filename_table_path: &str,
+    positions_path: &str,
+    sizes_path: &str,
+    tigs_path: &str,
+    wanted_files_path: &str,
+    out_dir: &str,
+    restore_abundance: bool,
+) -> Result<()> {
+    let selected = indexed_wanted_datasets(
+        &archive_root.join(FILENAME_INDEX_FILE),
+        Path::new(filename_table_path),
+        wanted_files_path,
+    )?;
+    if selected.is_empty() {
+        println!("No requested datasets were found in the archive");
+        return Ok(());
+    }
+
+    for batch in selected.chunks(128) {
+        decompress_indexed_selected_batch(
+            archive_root,
+            positions_path,
+            sizes_path,
+            tigs_path,
+            batch,
+            out_dir,
+            restore_abundance,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decompress_indexed_selected_batch(
+    archive_root: &Path,
+    positions_path: &str,
+    sizes_path: &str,
+    tigs_path: &str,
+    selected: &[(String, u32)],
+    out_dir: &str,
+    restore_abundance: bool,
+) -> Result<()> {
+    let postings = DatasetPostingIndex::open(
+        &archive_root.join(FILENAME_INDEX_FILE),
+        &archive_root.join(DATASET_TO_CID_FILE),
+    )?;
+    if restore_abundance && postings.abundance_log_base.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--abundance was requested but this archive has no abundance metadata",
+        ));
+    }
+    let abundance_log_base = restore_abundance
+        .then_some(postings.abundance_log_base)
+        .flatten();
+
+    let mut readers = selected
+        .iter()
+        .map(|(_, dataset_id)| postings.posting_reader(*dataset_id))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::<Reverse<(u64, usize, u8)>>::new();
+    for (reader_index, reader) in readers.iter_mut().enumerate() {
+        if let Some((cid, abundance)) = reader.next()? {
+            heap.push(Reverse((cid, reader_index, abundance.unwrap_or(0))));
+        }
+    }
+
+    let mut positions = PositionLookup::open(
+        Path::new(positions_path),
+        &archive_root.join(POSITIONS_INDEX_FILE),
+    )?;
+    let mut sizes = SizeLookup::open(
+        Path::new(sizes_path),
+        &archive_root.join(BUCKET_SIZES_INDEX_FILE),
+    )?;
+    let mut tigs =
+        PackedTigsReader::open_indexed(Path::new(tigs_path), archive_root.join(TIGS_INDEX_FILE))?;
+    let mut abundance_bases = if abundance_log_base.is_some() {
+        let reader = PackedTigsReader::open_indexed(
+            archive_root.join(ABUNDANCE_BASE_FILE),
+            archive_root.join(ABUNDANCE_BASE_INDEX_FILE),
+        )?;
+        if reader.logical_len() != positions.entries.saturating_sub(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "abundance base stream does not match archive CID count",
+            ));
+        }
+        Some(reader)
+    } else {
+        None
+    };
+    let mut outputs = selected
+        .iter()
+        .map(|(name, _)| File::create(dump_output_path(out_dir, name)).map(BufWriter::new))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut lengths = Vec::<usize>::new();
+    let mut selected_cids = 0u64;
+    let mut total_tigs = 0u64;
+    while let Some(Reverse((cid, reader_index, abundance))) = heap.pop() {
+        let mut targets = vec![(reader_index, abundance)];
+        if let Some((next_cid, next_abundance)) = readers[reader_index].next()? {
+            heap.push(Reverse((
+                next_cid,
+                reader_index,
+                next_abundance.unwrap_or(0),
+            )));
+        }
+        while heap
+            .peek()
+            .is_some_and(|Reverse((next_cid, _, _))| *next_cid == cid)
+        {
+            let Reverse((_, next_reader, next_code)) = heap.pop().unwrap();
+            targets.push((next_reader, next_code));
+            if let Some((next_cid, next_abundance)) = readers[next_reader].next()? {
+                heap.push(Reverse((
+                    next_cid,
+                    next_reader,
+                    next_abundance.unwrap_or(0),
+                )));
+            }
+        }
+
+        if let Some(reader) = abundance_bases.as_mut() {
+            let mut base = [0u8; 1];
+            reader.read_exact_at(cid, &mut base)?;
+            for (_, code) in &mut targets {
+                *code = base[0].wrapping_add(*code);
+            }
+        }
+
+        sizes.group_into(cid, &mut lengths)?;
+        let (packed_start, packed_end) = positions.range(cid)?;
+        let expected_packed = lengths
+            .iter()
+            .try_fold(0u64, |total, length| {
+                total.checked_add(length.div_ceil(4) as u64)
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CID packed length overflow")
+            })?;
+        if packed_start.checked_add(expected_packed) != Some(packed_end) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CID {cid} lengths do not match its packed interval"),
+            ));
+        }
+
+        let target_ids = Arc::new(
+            targets
+                .iter()
+                .map(|(target, _)| *target as u32)
+                .collect::<Vec<_>>(),
+        );
+        let target_codes = abundance_log_base
+            .map(|_| Arc::new(targets.iter().map(|(_, code)| *code).collect::<Vec<_>>()));
+        let mut packed_position = packed_start;
+        let mut first = 0usize;
+        while first < lengths.len() {
+            let mut end = first;
+            let mut output_bytes = 0usize;
+            let mut packed_bytes = 0usize;
+            while end < lengths.len() {
+                let record_bytes = lengths[end].saturating_add(3);
+                if end > first && output_bytes.saturating_add(record_bytes) > DECOMPRESS_BATCH_BASES
+                {
+                    break;
+                }
+                output_bytes = output_bytes.saturating_add(record_bytes);
+                packed_bytes = packed_bytes
+                    .checked_add(lengths[end].div_ceil(4))
+                    .ok_or_else(|| io::Error::other("targeted packed batch overflow"))?;
+                end += 1;
+            }
+            let mut encoded = vec![0u8; packed_bytes];
+            tigs.read_exact_at(packed_position, &mut encoded)?;
+            packed_position += packed_bytes as u64;
+            let decoded = decode_fasta_batch(DecodeJob {
+                ordinal: 0,
+                sizes: lengths[first..end].to_vec(),
+                encoded,
+                dataset_ids: Arc::clone(&target_ids),
+                abundance_codes: target_codes.as_ref().map(Arc::clone),
+                abundance_log_base,
+            })?;
+            if let Some(sequences) = decoded.abundance_sequences.as_ref() {
+                let mut rendered = HashMap::<u8, Vec<u8>>::new();
+                for &(target, code) in &targets {
+                    let fasta = if let Some(existing) = rendered.get(&code) {
+                        existing
+                    } else {
+                        let abundance = crate::compress::decode_abundance(
+                            code,
+                            abundance_log_base.expect("abundance checked above"),
+                        );
+                        let fasta = build_abundance_fasta(sequences, abundance)?;
+                        rendered.entry(code).or_insert(fasta)
+                    };
+                    outputs[target].write_all(fasta)?;
+                }
+            } else {
+                for &(target, _) in &targets {
+                    outputs[target].write_all(decoded.fasta.as_slice())?;
+                }
+            }
+            first = end;
+        }
+        if packed_position != packed_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "targeted CID ended at the wrong packed position",
+            ));
+        }
+        selected_cids += 1;
+        total_tigs = total_tigs.saturating_add(lengths.len() as u64);
+    }
+    for output in &mut outputs {
+        output.flush()?;
+    }
+    println!(
+        "Output-sensitive targeted decompression complete: datasets={}, CIDs={}, tigs={}",
+        selected.len(),
+        selected_cids,
+        total_tigs
+    );
     Ok(())
 }
 

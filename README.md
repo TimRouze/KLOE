@@ -17,13 +17,46 @@ cargo build -r
 ```
 Builds are configured to always use optimized profiles and native CPU flags from `.cargo/config.toml`.
 
-This will create a compressed KLOE archive with the k-mer content of every files in the input file of file.
-The archive is composed of 5 files:
-- tigs_kloe.fa
-- id_to_color_id.txt.zst
-- positions_kloe.txt.zst
-- bucket_sizes.txt
-- filenames_id.txt
+This creates a KLOE v4 archive containing the k-mer content of every file in the
+input file-of-files. New archives use a dataset-major membership index; they do
+not store the inverse CID-to-dataset relation a second time.
+
+### KLOE v4 archive layout
+
+- `manifest.kloe`: format version, k and minimizer sizes, dataset/CID counts,
+  and abundance configuration.
+- `filenames_id.txt`: dataset names in dataset-ID order.
+- `filenames.idx`: the combined dataset directory. It contains the `N+1`
+  dataset-posting boundaries, ordered name offsets/lengths, and a collision-safe
+  open-addressed name hash table at a maximum 75% load. Hash slots contain only
+  a fingerprint and dataset ID; collisions are verified against the complete
+  name.
+- `dataset_to_cid.bin`: one independently addressable zstd frame per dataset.
+  Sparse datasets use sorted CID deltas encoded as unsigned varints. Dense
+  datasets compare that representation with a CID bitmap and with a bitmap XOR
+  a single archive-wide majority-membership bitmap; KLOE stores the smallest.
+  The bitmap codecs are considered only when scanning the CID universe costs at
+  most eight times the number of returned CIDs. In abundance mode, CID deltas
+  and abundance deviations use separate zstd columns inside the dataset frame.
+- `abundance_base.bin` and `abundance_base.idx` (abundance mode only): one
+  block-compressed, directly indexed base abundance per CID. Dataset postings
+  store deviations from this base, avoiding duplicate absolute codes.
+- `positions_kloe.bin`: delta-varint encoded boundaries into the logical tig
+  stream.
+- `positions_kloe.idx`: an absolute checkpoint every 256 boundaries. At most
+  255 small deltas are decoded to locate an arbitrary CID.
+- `bucket_sizes.txt`: variable-length tig sizes, grouped into independently
+  zstd-compressed metadata blocks.
+- `bucket_sizes.idx`: direct routing from a CID to its compressed size block.
+- `tigs_kloe.fa`: 2-bit DNA in independently zstd-compressed 8 MiB logical
+  blocks.
+- `tigs_kloe.idx`: fixed-size descriptors mapping logical tig offsets directly
+  to compressed blocks.
+
+The small `.idx` files deliberately remain uncompressed: they are fixed-width
+random-access routing structures. The bulk data stays delta/varint encoded and
+zstd compressed. This avoids the previous permanent duplication of the full
+dataset/CID relation while retaining direct access.
 
 For decompression, run:
 ```sh
@@ -78,7 +111,8 @@ Compression is driven by a forked ggcat structured-sequence backend. Sequence an
 color-run data are streamed directly into bounded KLOE binary chunks; no intermediate
 graph FASTA is formatted, stored, or parsed.
 
-The on-disk KLOE archive format is unchanged (`tigs_kloe.fa`, `bucket_sizes.txt`, `positions_kloe.bin`, `id_to_color_id.txt.zst`, `filenames_id.txt`).
+The streamed data is written directly in the KLOE v4 archive layout described
+above. Legacy archives remain readable.
 
 The vendored ggcat fork is pinned to commit:
 `fe6a633e64f60cd7266951d73c1def5cc023fa96`
@@ -88,9 +122,31 @@ post-processing windows, graph-record chunks, group batches, and transpose block
 from this value. Embedded ggcat receives 75% of the budget and uses
 disk-backed intermediate storage; the remainder is reserved for KLOE and I/O.
 
-Dataset-to-color indexes use a linear, CID-monotonic external transpose rather than
-comparison sorting. Graph positions are also generated as external-memory streams,
-so their bulk payloads do not accumulate in RAM as dataset count grows.
+Dataset-to-color indexes use a bounded external transpose into dataset-major,
+CID-monotonic posting lists. Graph positions are also generated as
+external-memory streams, so their bulk payloads do not accumulate in RAM as
+dataset count grows.
+
+### Targeted-query path and complexity
+
+For each requested name, KLOE probes `filenames.idx` on disk and verifies the
+stored name. It then opens only that dataset's zstd posting frame. For each CID
+in the posting list, the size, logical tig range, and compressed DNA blocks are
+located through their indexes; no complete archive metadata file is loaded or
+scanned. Multiple requested datasets are processed in bounded batches and their
+sorted postings are merged so a shared CID is decoded once per batch.
+
+For one requested dataset `S_j`, the expected work is
+`O(query-name bytes + |S_j|)` and memory is bounded independently of the archive
+dataset count. The indexes can introduce only fixed format-level read
+amplification: at most one 256-entry position checkpoint block, one bounded size
+block, and the 8 MiB tig blocks intersecting the requested ranges. Each bitmap
+codec is restricted to datasets containing at least one eighth of the CID
+universe, so its full-universe scan is bounded by a constant multiple of the
+returned posting count. Because every
+visited CID contributes sequence to `S_j`, traversal and emitted-data work are
+output-sensitive. The output file itself necessarily costs `Theta(|S_j|)` to
+write.
 
 
 ## Archive decompression

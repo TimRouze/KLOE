@@ -916,7 +916,7 @@ impl DynamicSequencesStream for ArchiveSequencesStream {
     }
 }
 impl ArchiveInfo {
-    fn load(root: &Path, _k: usize) -> io::Result<Self> {
+    fn load(root: &Path, _k: usize, temp_root: &Path, label: &str) -> io::Result<Self> {
         ensure_archive_complete(root)?;
 
         let positions_path = root.join("positions_kloe.bin");
@@ -962,6 +962,8 @@ impl ArchiveInfo {
 
         let filenames = load_filenames(&filenames_path)?;
         let expected_groups = positions.len().saturating_sub(1);
+        let dataset_index_path = root.join(compress::FILENAME_INDEX_FILE);
+        let dataset_data_path = root.join(compress::DATASET_TO_CID_FILE);
         let cid_to_ids = if cid_sidecar_path.is_file() {
             let sidecar = Arc::new(compress::CidDatasetSidecar::open(&cid_sidecar_path)?);
             if sidecar.len() != expected_groups {
@@ -980,6 +982,22 @@ impl ArchiveInfo {
                 cid_sidecar_path.display()
             );
             ArchiveDatasetIds::Disk(sidecar)
+        } else if dataset_index_path.is_file() && dataset_data_path.is_file() {
+            let temporary_sidecar = temp_root.join(format!(
+                ".kloe-merge-{label}-cid-sidecar-{}.bin",
+                std::process::id()
+            ));
+            println!(
+                "Building bounded temporary CID transpose for archive {}",
+                root.display()
+            );
+            ArchiveDatasetIds::Disk(compress::build_temporary_cid_sidecar_from_dataset_index(
+                &dataset_data_path,
+                &dataset_index_path,
+                &temporary_sidecar,
+                temp_root,
+                expected_groups,
+            )?)
         } else {
             eprintln!(
                 "Archive '{}' predates disk-backed CID memberships; using the compatibility in-memory transpose",
@@ -1150,7 +1168,7 @@ pub fn merge_archives_with_config(
         "Loading archive A from {}",
         archive_a_root.to_string_lossy()
     );
-    let mut archive_a = ArchiveInfo::load(archive_a_root, k)?;
+    let mut archive_a = ArchiveInfo::load(archive_a_root, k, output_root, "a")?;
     let legacy_a_sidecar =
         output_root.join(format!(".kloe-merge-source-a-{}.bin", std::process::id()));
     archive_a.cid_to_ids.ensure_disk_backed(&legacy_a_sidecar)?;
@@ -1158,7 +1176,7 @@ pub fn merge_archives_with_config(
         "Loading archive B from {}",
         archive_b_root.to_string_lossy()
     );
-    let mut archive_b = ArchiveInfo::load(archive_b_root, k)?;
+    let mut archive_b = ArchiveInfo::load(archive_b_root, k, output_root, "b")?;
     let legacy_b_sidecar =
         output_root.join(format!(".kloe-merge-source-b-{}.bin", std::process::id()));
     archive_b.cid_to_ids.ensure_disk_backed(&legacy_b_sidecar)?;
@@ -1935,7 +1953,8 @@ fn ensure_archive_complete(root: &Path) -> io::Result<()> {
     }
     let legacy_index = root.join("id_to_color_id.txt.zst");
     let compact_index = root.join(compress::CID_TO_DATASET_FILE);
-    if !legacy_index.is_file() && !compact_index.is_file() {
+    let dataset_index = root.join(compress::DATASET_TO_CID_FILE);
+    if !legacy_index.is_file() && !compact_index.is_file() && !dataset_index.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
