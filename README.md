@@ -61,9 +61,13 @@ dataset/CID relation while retaining direct access.
 For decompression, run:
 ```sh
 # WHOLE ARCHIVE DECOMPRESSION
-./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -r 16
 # TARGETED DECOMPRESSION
-./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST -r 16
+# UNION OF THE COLORS LISTED IN TARGET/FILES/LIST
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST --color-set-operation union -r 16
+# INTERSECTION OF THE COLORS LISTED IN TARGET/FILES/LIST, AS UNITIGS
+./target/release/kloe decompress -o Output/path/for/decompressed/data -c path/to/compressed/archive/directory -Q TARGET/FILES/LIST --color-set-operation intersection --unitig -r 16
 ```
 
 To merge two existing archives, run:
@@ -150,7 +154,7 @@ write.
 
 
 ## Archive decompression
-When running kloe in compression mode, add "decompress" before any other parameter.
+When running kloe in decompression mode, add "decompress" before any other parameter.
 
 #### compressed-dir -c
 Input directory for decompression, the directory where the compressed kloe archive is saved.
@@ -161,12 +165,31 @@ For targeted decompression, a list of files the user wants to decompress from th
 #### out-dir -o
 Directory in which the decompressed files should be written to.
 
+#### output compression (`--output-compression`)
+Decompressed FASTA is zstd-compressed by default. Select one of:
+
+- `zstd` (default), producing `Dump_*.fa.zst`
+- `gz`, producing `Dump_*.fa.gz`
+- `xz`, producing `Dump_*.fa.xz`
+- `fasta` (aliases: `uncompressed`, `fa`), producing uncompressed `Dump_*.fa`
+
+#### color-set union and intersection (`--color-set-operation`)
+Use `-Q/--wanted-files` to provide the archived dataset names (one per line),
+then select `--color-set-operation union` or `--color-set-operation intersection`.
+KLOE emits each qualifying color-class sequence once in `Dump_union.*` or
+`Dump_intersection.*`. Every requested color must exist in the archive. This
+operation is available for indexed KLOE archives and cannot be combined with
+`--abundance`.
+
 #### ggcat rebuild after decompression (`--ggcat-rebuild`)
-After writing `Dump_*.fa` files, run embedded ggcat on those dumps and produce a rebuilt compacted output in the output directory:
-- `rebuilt_unitigs.fa` when `--unitig` is set
-- `rebuilt_matchtigs.fa` when `--matchtig` is set
-- `rebuilt_eulertigs.fa` when `--eulertig` is set
-- `rebuilt_simplitigs.fa` by default (implemented via ggcat Pathtigs)
+After writing `Dump_*` files, run embedded ggcat on those dumps and produce a
+rebuilt compacted output in the output directory. Supplying `--unitig`,
+`--matchtig`, or `--eulertig` automatically enables this rebuild; those flags
+therefore describe the actual decompressed output rather than being ignored.
+`--ggcat-rebuild` alone rebuilds simplitigs (implemented via ggcat Pathtigs).
+The rebuilt filename is `rebuilt_unitigs.*`, `rebuilt_matchtigs.*`,
+`rebuilt_eulertigs.*`, or `rebuilt_simplitigs.*`, with the suffix selected by
+`--output-compression`.
 
 `-r/--memory` controls the rebuild budget (GB) passed to embedded ggcat.
 

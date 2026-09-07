@@ -66,6 +66,17 @@ struct Args {
     /// During decompression, rebuild tigs from Dump_*.fa using ggcat
     #[arg(long = "ggcat-rebuild", default_value_t = false)]
     ggcat_rebuild: bool,
+    /// Compression used for decompressed FASTA output
+    #[arg(
+        long = "output-compression",
+        alias = "compression",
+        value_enum,
+        default_value_t = decompress::OutputCompression::Zstd
+    )]
+    output_compression: decompress::OutputCompression,
+    /// Emit one FASTA containing the union or intersection of colors listed with -Q
+    #[arg(long = "color-set-operation", alias = "colors-operation", value_enum)]
+    color_set_operation: Option<decompress::ColorSetOperation>,
     /// Join archive containers without rebuilding the graph or removing shared redundancy
     #[arg(long = "structural-merge", default_value_t = false)]
     structural_merge: bool,
@@ -108,10 +119,22 @@ fn main() {
             std::process::exit(2);
         };
         if do_decompress == "decompress" {
+            if args.color_set_operation.is_some() && wanted_path.is_empty() {
+                eprintln!(
+                    "Error: --color-set-operation requires -Q/--wanted-files with the selected colors."
+                );
+                std::process::exit(2);
+            }
+            if args.color_set_operation.is_some() && args.abundance {
+                eprintln!(
+                    "Error: --abundance cannot be combined with --color-set-operation because one combined output has no single per-dataset abundance."
+                );
+                std::process::exit(2);
+            }
             println!("Checking archive integrity...");
             is_compressed_dir_complete(input_dir.clone());
             let rebuild_cfg = decompress::GgcatRebuildConfig {
-                enabled: ggcat_rebuild,
+                enabled: ggcat_rebuild || tig_flags_set > 0,
                 threads,
                 memory_gb: memory,
                 k,
@@ -120,6 +143,8 @@ fn main() {
                 use_matchtigs,
                 use_eulertigs,
                 restore_abundance: args.abundance,
+                output_compression: args.output_compression,
+                color_set_operation: args.color_set_operation,
             };
             if let Err(err) = decompress::decompress_with_options(
                 &String::from("bucket_sizes.txt"),
@@ -247,7 +272,7 @@ mod tests {
     use super::{compress, decompress, merge};
     use std::collections::BTreeSet;
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
@@ -274,7 +299,11 @@ mod tests {
     }
 
     fn parse_fasta_sequences(path: &Path) -> Vec<String> {
-        let content = fs::read_to_string(path).expect("read fasta");
+        let file = File::open(path).expect("open fasta");
+        let (mut reader, _) =
+            niffler::get_reader(Box::new(file)).expect("detect fasta compression");
+        let mut content = String::new();
+        reader.read_to_string(&mut content).expect("read fasta");
         let mut seqs = Vec::new();
         let mut current = String::new();
         for line in content.lines() {
@@ -459,6 +488,7 @@ mod tests {
         full_out_dir: PathBuf,
         targeted_out_dir: PathBuf,
         file1: PathBuf,
+        file2: PathBuf,
         file3: PathBuf,
         dump1_full: PathBuf,
         dump2_full: PathBuf,
@@ -518,6 +548,7 @@ mod tests {
             full_out_dir: full_out_dir.clone(),
             targeted_out_dir: targeted_out_dir.clone(),
             file1: file1.clone(),
+            file2: file2.clone(),
             file3: file3.clone(),
             dump1_full: make_dump_path(&full_out_dir, &file1),
             dump2_full: make_dump_path(&full_out_dir, &file2),
@@ -683,7 +714,7 @@ mod tests {
     fn run_full_decompression(archive_dir: &Path, out_dir: &Path) {
         let archive_dir_s = format!("{}/", archive_dir.display());
         let out_dir_s = format!("{}/", out_dir.display());
-        decompress::decompress(
+        decompress::decompress_with_options(
             &String::from("bucket_sizes.txt"),
             &String::from("id_to_color_id.txt.zst"),
             &String::from("tigs_kloe.fa"),
@@ -692,6 +723,10 @@ mod tests {
             &out_dir_s,
             &String::from(""),
             archive_dir_s,
+            decompress::GgcatRebuildConfig {
+                output_compression: decompress::OutputCompression::Fasta,
+                ..decompress::GgcatRebuildConfig::default()
+            },
         )
         .expect("decompress full archive");
     }
@@ -706,7 +741,7 @@ mod tests {
 
         let archive_dir_s = format!("{}/", archive_dir.display());
         let out_dir_s = format!("{}/", out_dir.display());
-        decompress::decompress(
+        decompress::decompress_with_options(
             &String::from("bucket_sizes.txt"),
             &String::from("id_to_color_id.txt.zst"),
             &String::from("tigs_kloe.fa"),
@@ -715,6 +750,10 @@ mod tests {
             &out_dir_s,
             &wanted.display().to_string(),
             archive_dir_s,
+            decompress::GgcatRebuildConfig {
+                output_compression: decompress::OutputCompression::Fasta,
+                ..decompress::GgcatRebuildConfig::default()
+            },
         )
         .expect("decompress targeted archive");
     }
@@ -740,6 +779,102 @@ mod tests {
                 !fixture.dump2_targeted.exists(),
                 "mode={mode}: targeted decompression should not create non-target files"
             );
+        }
+    }
+
+    #[test]
+    fn selected_color_union_and_intersection_emit_one_deduplicated_fasta() {
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let wanted = fixture.archive_dir.join("wanted_color_set.txt");
+        fs::write(
+            &wanted,
+            format!("{}\n{}\n", fixture.file1.display(), fixture.file2.display()),
+        )
+        .unwrap();
+
+        let run = |operation: decompress::ColorSetOperation, output: &Path| {
+            fs::create_dir_all(output).unwrap();
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(),
+                &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(),
+                &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(),
+                &(output.display().to_string() + "/"),
+                &wanted.display().to_string(),
+                fixture.archive_dir.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    output_compression: decompress::OutputCompression::Fasta,
+                    color_set_operation: Some(operation),
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            )
+            .unwrap();
+        };
+
+        let union_out = fixture._workdir.path().join("out_union");
+        run(decompress::ColorSetOperation::Union, &union_out);
+        let mut union_expected = fixture.expected1.clone();
+        union_expected.extend(fixture.expected2.clone());
+        assert_kmer_equivalent(&union_expected, &union_out.join("Dump_union.fa"), K);
+
+        let intersection_out = fixture._workdir.path().join("out_intersection");
+        run(
+            decompress::ColorSetOperation::Intersection,
+            &intersection_out,
+        );
+        assert_kmer_equivalent(
+            &[SEQ_SHARED_12.to_string()],
+            &intersection_out.join("Dump_intersection.fa"),
+            K,
+        );
+    }
+
+    #[test]
+    fn decompression_unitig_mode_rebuilds_actual_unitigs() {
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let mut expected = fixture.expected1.clone();
+        expected.extend(fixture.expected2.clone());
+        expected.extend(fixture.expected3.clone());
+        let _ggcat_guard = ggcat_test_lock();
+        for (compression, label, suffix) in [
+            (decompress::OutputCompression::Zstd, "zstd", ".fa.zst"),
+            (decompress::OutputCompression::Xz, "xz", ".fa.xz"),
+        ] {
+            let output = fixture
+                ._workdir
+                .path()
+                .join(format!("out_rebuilt_unitigs_{label}"));
+            let temp = fixture
+                ._workdir
+                .path()
+                .join(format!("unitig_rebuild_tmp_{label}"));
+            fs::create_dir_all(&output).unwrap();
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(),
+                &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(),
+                &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(),
+                &(output.display().to_string() + "/"),
+                &String::new(),
+                fixture.archive_dir.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: true,
+                    threads: 1,
+                    memory_gb: 1,
+                    k: K,
+                    temp_dir: temp.display().to_string(),
+                    use_unitigs: true,
+                    output_compression: compression,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            )
+            .unwrap();
+
+            let rebuilt = output.join(format!("rebuilt_unitigs{suffix}"));
+            assert!(rebuilt.is_file(), "{label} unitig output was not created");
+            assert_kmer_equivalent(&expected, &rebuilt, K);
         }
     }
 
@@ -1056,6 +1191,7 @@ mod tests {
             archive.display().to_string() + "/",
             decompress::GgcatRebuildConfig {
                 restore_abundance: true,
+                output_compression: decompress::OutputCompression::Fasta,
                 ..decompress::GgcatRebuildConfig::default()
             },
         )

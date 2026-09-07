@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::thread;
 
 use crossbeam::channel::{bounded, Receiver};
+use flate2::{write::GzEncoder, Compression};
 use ggcat_api::{ExtraElaboration, GGCATConfig, GGCATInstance, GeneralSequenceBlockData};
+use xz2::write::XzEncoder;
+use zstd::stream::write::Encoder as ZstdEncoder;
 use zstd::Decoder;
 
 use crate::compress::{
@@ -801,6 +804,8 @@ pub struct GgcatRebuildConfig {
     pub use_matchtigs: bool,
     pub use_eulertigs: bool,
     pub restore_abundance: bool,
+    pub output_compression: OutputCompression,
+    pub color_set_operation: Option<ColorSetOperation>,
 }
 
 impl Default for GgcatRebuildConfig {
@@ -815,6 +820,105 @@ impl Default for GgcatRebuildConfig {
             use_matchtigs: false,
             use_eulertigs: false,
             restore_abundance: false,
+            output_compression: OutputCompression::Zstd,
+            color_set_operation: None,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputCompression {
+    #[value(alias = "uncompressed", alias = "fa")]
+    Fasta,
+    #[value(alias = "gzip")]
+    Gz,
+    #[default]
+    #[value(alias = "zst")]
+    Zstd,
+    Xz,
+}
+
+impl std::fmt::Display for OutputCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fasta => "fasta",
+            Self::Gz => "gz",
+            Self::Zstd => "zstd",
+            Self::Xz => "xz",
+        })
+    }
+}
+
+impl OutputCompression {
+    fn fasta_suffix(self) -> &'static str {
+        match self {
+            Self::Fasta => ".fa",
+            Self::Gz => ".fa.gz",
+            Self::Zstd => ".fa.zst",
+            Self::Xz => ".fa.xz",
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorSetOperation {
+    Union,
+    Intersection,
+}
+
+impl std::fmt::Display for ColorSetOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Union => "union",
+            Self::Intersection => "intersection",
+        })
+    }
+}
+
+enum FastaOutputWriter {
+    Fasta(BufWriter<File>),
+    Gz(GzEncoder<BufWriter<File>>),
+    Zstd(ZstdEncoder<'static, BufWriter<File>>),
+    Xz(XzEncoder<BufWriter<File>>),
+}
+
+impl FastaOutputWriter {
+    fn create(path: &Path, compression: OutputCompression) -> Result<Self> {
+        let writer = BufWriter::new(File::create(path)?);
+        match compression {
+            OutputCompression::Fasta => Ok(Self::Fasta(writer)),
+            OutputCompression::Gz => Ok(Self::Gz(GzEncoder::new(writer, Compression::default()))),
+            OutputCompression::Zstd => Ok(Self::Zstd(ZstdEncoder::new(writer, 0)?)),
+            OutputCompression::Xz => Ok(Self::Xz(XzEncoder::new(writer, 6))),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Fasta(mut writer) => writer.flush(),
+            Self::Gz(writer) => writer.finish().and_then(|mut writer| writer.flush()),
+            Self::Zstd(writer) => writer.finish().and_then(|mut writer| writer.flush()),
+            Self::Xz(writer) => writer.finish().and_then(|mut writer| writer.flush()),
+        }
+    }
+}
+
+impl Write for FastaOutputWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        match self {
+            Self::Fasta(writer) => writer.write(buf),
+            Self::Gz(writer) => writer.write(buf),
+            Self::Zstd(writer) => writer.write(buf),
+            Self::Xz(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        match self {
+            Self::Fasta(writer) => writer.flush(),
+            Self::Gz(writer) => writer.flush(),
+            Self::Zstd(writer) => writer.flush(),
+            Self::Xz(writer) => writer.flush(),
         }
     }
 }
@@ -875,17 +979,30 @@ fn ensure_output_dir(out_dir: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn dump_output_path(out_dir: &str, source_path: &str) -> PathBuf {
+fn dump_output_path(out_dir: &str, source_path: &str, compression: OutputCompression) -> PathBuf {
     let out_dir_path = normalize_out_dir(out_dir);
     let trunc_filename = Path::new(source_path).file_stem().unwrap_or_default();
     out_dir_path.join(format!(
-        "Dump_{}.fa",
-        trunc_filename.to_str().unwrap_or("unknown")
+        "Dump_{}{}",
+        trunc_filename.to_str().unwrap_or("unknown"),
+        compression.fasta_suffix()
     ))
 }
 
-fn collect_dump_fastas(out_dir: &str) -> std::io::Result<Vec<PathBuf>> {
+fn color_set_output_path(
+    out_dir: &str,
+    operation: ColorSetOperation,
+    compression: OutputCompression,
+) -> PathBuf {
+    normalize_out_dir(out_dir).join(format!("Dump_{}{}", operation, compression.fasta_suffix()))
+}
+
+fn collect_dump_fastas(
+    out_dir: &str,
+    compression: OutputCompression,
+) -> std::io::Result<Vec<PathBuf>> {
     let out_dir_path = normalize_out_dir(out_dir);
+    let suffix = compression.fasta_suffix();
     let mut dump_files = Vec::new();
     for entry_result in fs::read_dir(&out_dir_path)? {
         let entry = entry_result?;
@@ -893,7 +1010,7 @@ fn collect_dump_fastas(out_dir: &str) -> std::io::Result<Vec<PathBuf>> {
         let is_dump = path
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|name| name.starts_with("Dump_") && name.ends_with(".fa"))
+            .map(|name| name.starts_with("Dump_") && name.ends_with(suffix))
             .unwrap_or(false);
         if is_dump {
             dump_files.push(path);
@@ -906,27 +1023,66 @@ fn collect_dump_fastas(out_dir: &str) -> std::io::Result<Vec<PathBuf>> {
 fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result<()> {
     if cfg.restore_abundance {
         eprintln!(
-            "Warning: Dump_*.fa files retain abundance headers; the combined GGCAT rebuild output does not preserve per-dataset abundance."
+            "Warning: decompressed Dump_* files retain abundance headers; the combined GGCAT rebuild output does not preserve per-dataset abundance."
         );
     }
     let mode = resolve_rebuild_mode(cfg.use_unitigs, cfg.use_matchtigs, cfg.use_eulertigs);
-    let dump_fastas = collect_dump_fastas(out_dir)?;
+    let dump_fastas = collect_dump_fastas(out_dir, cfg.output_compression)?;
     if dump_fastas.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "no Dump_*.fa files found to rebuild with ggcat",
+            "no decompressed Dump_* files found to rebuild with ggcat",
         ));
     }
 
     let out_dir_path = ensure_output_dir(out_dir)?;
 
-    let rebuilt_output = out_dir_path.join(format!("rebuilt_{}.fa", rebuild_mode_name(mode)));
+    let rebuilt_output = out_dir_path.join(format!(
+        "rebuilt_{}{}",
+        rebuild_mode_name(mode),
+        cfg.output_compression.fasta_suffix()
+    ));
     let temp_dir = if cfg.temp_dir.is_empty() {
         out_dir_path.join("ggcat_rebuild_tmp")
     } else {
         PathBuf::from(&cfg.temp_dir)
     };
     fs::create_dir_all(&temp_dir)?;
+
+    // GGCAT supports plain, gzip, and zstd FASTA streams, but not xz. Keep xz
+    // available to users by staging plain FASTA inputs and recompressing the
+    // rebuilt graph. The temporary directory is removed automatically.
+    let xz_bridge = if cfg.output_compression == OutputCompression::Xz {
+        Some(
+            tempfile::Builder::new()
+                .prefix("kloe-xz-rebuild-")
+                .tempdir_in(&temp_dir)?,
+        )
+    } else {
+        None
+    };
+    let rebuild_inputs = if let Some(bridge) = xz_bridge.as_ref() {
+        let mut inputs = Vec::with_capacity(dump_fastas.len());
+        for (index, dump) in dump_fastas.iter().enumerate() {
+            let staged = bridge.path().join(format!("input_{index}.fa"));
+            let mut reader = xz2::read::XzDecoder::new(BufReader::new(File::open(dump)?));
+            let mut writer = BufWriter::new(File::create(&staged)?);
+            io::copy(&mut reader, &mut writer)?;
+            writer.flush()?;
+            inputs.push(staged);
+        }
+        inputs
+    } else {
+        dump_fastas
+    };
+    let ggcat_output = xz_bridge
+        .as_ref()
+        .map(|bridge| {
+            bridge
+                .path()
+                .join(format!("rebuilt_{}.fa", rebuild_mode_name(mode)))
+        })
+        .unwrap_or_else(|| rebuilt_output.clone());
 
     let ggcat_memory_gb = cfg.memory_gb.max(1);
     let instance = GGCATInstance::create(GGCATConfig {
@@ -940,7 +1096,7 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
     })
     .map_err(|err| io::Error::other(format!("create ggcat instance: {err}")))?;
 
-    let streams = dump_fastas
+    let streams = rebuild_inputs
         .iter()
         .map(|dump| {
             let resolved = fs::canonicalize(dump).unwrap_or_else(|_| dump.clone());
@@ -959,7 +1115,7 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
     let graph_path = instance
         .build_graph(
             streams,
-            rebuilt_output,
+            ggcat_output,
             None,
             None,
             cfg.k,
@@ -973,9 +1129,16 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
         )
         .map_err(|err| io::Error::other(format!("run ggcat rebuild: {err}")))?;
 
+    if xz_bridge.is_some() {
+        let mut reader = BufReader::new(File::open(&graph_path)?);
+        let mut writer = FastaOutputWriter::create(&rebuilt_output, OutputCompression::Xz)?;
+        io::copy(&mut reader, &mut writer)?;
+        writer.finish()?;
+    }
+
     println!(
         "ggcat rebuild complete: {} (mode={})",
-        graph_path.display(),
+        rebuilt_output.display(),
         rebuild_mode_name(mode)
     );
     Ok(())
@@ -1002,6 +1165,48 @@ pub fn decompress_with_options(
     let positions_index_path = archive_root.join(POSITIONS_INDEX_FILE);
     let sizes_index_path = archive_root.join(BUCKET_SIZES_INDEX_FILE);
     let tigs_index_path = archive_root.join(TIGS_INDEX_FILE);
+    if let Some(operation) = ggcat_cfg.color_set_operation {
+        if wanted_files_path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a color-set union or intersection requires a non-empty wanted-files list",
+            ));
+        }
+        if ggcat_cfg.restore_abundance {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "abundance restoration is not defined for a combined color-set output",
+            ));
+        }
+        if dataset_data_path.is_file()
+            && dataset_index_path.is_file()
+            && filename_index_path.is_file()
+            && positions_index_path.is_file()
+            && sizes_index_path.is_file()
+            && tigs_index_path.is_file()
+        {
+            decompress_indexed_color_set(
+                archive_root,
+                &(input_dir.clone() + filename_id),
+                &(input_dir.clone() + positions_filename),
+                &(input_dir.clone() + size_filename),
+                &(input_dir.clone() + tigs_filename),
+                wanted_files_path,
+                out_dir,
+                operation,
+                ggcat_cfg.output_compression,
+            )?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "color-set union/intersection requires an indexed KLOE archive",
+            ));
+        }
+        if ggcat_cfg.enabled {
+            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
+        }
+        return Ok(());
+    }
     if !wanted_files_path.is_empty()
         && dataset_data_path.is_file()
         && dataset_index_path.is_file()
@@ -1019,6 +1224,7 @@ pub fn decompress_with_options(
             wanted_files_path,
             out_dir,
             ggcat_cfg.restore_abundance,
+            ggcat_cfg.output_compression,
         )?;
         if ggcat_cfg.enabled {
             run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
@@ -1042,6 +1248,7 @@ pub fn decompress_with_options(
                 batch,
                 out_dir,
                 ggcat_cfg.restore_abundance,
+                ggcat_cfg.output_compression,
             )?;
         }
         if ggcat_cfg.enabled {
@@ -1081,6 +1288,7 @@ pub fn decompress_with_options(
             },
             ggcat_cfg.threads,
             ggcat_cfg.restore_abundance,
+            ggcat_cfg.output_compression,
         )?;
         if ggcat_cfg.enabled {
             run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
@@ -1128,7 +1336,8 @@ pub fn decompress_with_options(
             &(input_dir.to_owned() + tigs_filename),
             &(input_dir.to_owned() + size_filename),
             out_dir,
-        );
+            ggcat_cfg.output_compression,
+        )?;
     } else {
         println!("No query file given, decompressing entire archive....");
         let cid_to_id_map = match get_cid_to_id(&(input_dir.clone() + &color_id_filename)) {
@@ -1154,7 +1363,8 @@ pub fn decompress_with_options(
             out_dir,
             filenames_id,
             cid_to_id_map,
-        );
+            ggcat_cfg.output_compression,
+        )?;
     }
     if ggcat_cfg.enabled {
         run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
@@ -1185,6 +1395,179 @@ fn indexed_wanted_datasets(
     Ok(selected)
 }
 
+fn indexed_required_datasets(
+    filename_index_path: &Path,
+    filename_table_path: &Path,
+    wanted_files_path: &str,
+) -> Result<Vec<(String, u32)>> {
+    let filename_index = FilenameIndex::open(filename_index_path, filename_table_path)?;
+    let wanted_reader = BufReader::new(File::open(wanted_files_path)?);
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for line in wanted_reader.lines() {
+        let name = line?;
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let dataset_id = filename_index.lookup(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("selected color '{name}' was not found in the archive"),
+            )
+        })?;
+        if seen.insert(dataset_id) {
+            selected.push((name.to_owned(), dataset_id));
+        }
+    }
+    if selected.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the wanted-files list contains no colors",
+        ));
+    }
+    Ok(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decompress_indexed_color_set(
+    archive_root: &Path,
+    filename_table_path: &str,
+    positions_path: &str,
+    sizes_path: &str,
+    tigs_path: &str,
+    wanted_files_path: &str,
+    out_dir: &str,
+    operation: ColorSetOperation,
+    output_compression: OutputCompression,
+) -> Result<()> {
+    let selected = indexed_required_datasets(
+        &archive_root.join(FILENAME_INDEX_FILE),
+        Path::new(filename_table_path),
+        wanted_files_path,
+    )?;
+    let postings = DatasetPostingIndex::open(
+        &archive_root.join(FILENAME_INDEX_FILE),
+        &archive_root.join(DATASET_TO_CID_FILE),
+    )?;
+    let mut readers = selected
+        .iter()
+        .map(|(_, dataset_id)| postings.posting_reader(*dataset_id))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::<Reverse<(u64, usize, u8)>>::new();
+    for (reader_index, reader) in readers.iter_mut().enumerate() {
+        if let Some((cid, abundance)) = reader.next()? {
+            heap.push(Reverse((cid, reader_index, abundance.unwrap_or(0))));
+        }
+    }
+
+    let mut positions = PositionLookup::open(
+        Path::new(positions_path),
+        &archive_root.join(POSITIONS_INDEX_FILE),
+    )?;
+    let mut sizes = SizeLookup::open(
+        Path::new(sizes_path),
+        &archive_root.join(BUCKET_SIZES_INDEX_FILE),
+    )?;
+    let mut tigs =
+        PackedTigsReader::open_indexed(Path::new(tigs_path), archive_root.join(TIGS_INDEX_FILE))?;
+    let output_path = color_set_output_path(out_dir, operation, output_compression);
+    let mut output = FastaOutputWriter::create(&output_path, output_compression)?;
+    let mut lengths = Vec::<usize>::new();
+    let mut selected_cids = 0u64;
+    let mut total_tigs = 0u64;
+
+    while let Some(Reverse((cid, reader_index, _))) = heap.pop() {
+        let mut membership_count = 1usize;
+        if let Some((next_cid, abundance)) = readers[reader_index].next()? {
+            heap.push(Reverse((next_cid, reader_index, abundance.unwrap_or(0))));
+        }
+        while heap
+            .peek()
+            .is_some_and(|Reverse((next_cid, _, _))| *next_cid == cid)
+        {
+            let Reverse((_, next_reader, _)) = heap.pop().unwrap();
+            membership_count += 1;
+            if let Some((next_cid, abundance)) = readers[next_reader].next()? {
+                heap.push(Reverse((next_cid, next_reader, abundance.unwrap_or(0))));
+            }
+        }
+        let include = match operation {
+            ColorSetOperation::Union => true,
+            ColorSetOperation::Intersection => membership_count == selected.len(),
+        };
+        if !include {
+            continue;
+        }
+
+        sizes.group_into(cid, &mut lengths)?;
+        let (packed_start, packed_end) = positions.range(cid)?;
+        let expected_packed = lengths
+            .iter()
+            .try_fold(0u64, |total, length| {
+                total.checked_add(length.div_ceil(4) as u64)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CID size overflow"))?;
+        if packed_start.checked_add(expected_packed) != Some(packed_end) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CID {cid} lengths do not match its packed interval"),
+            ));
+        }
+
+        let mut packed_position = packed_start;
+        let mut first = 0usize;
+        while first < lengths.len() {
+            let mut end = first;
+            let mut output_bytes = 0usize;
+            let mut packed_bytes = 0usize;
+            while end < lengths.len() {
+                let record_bytes = lengths[end].saturating_add(3);
+                if end > first && output_bytes.saturating_add(record_bytes) > DECOMPRESS_BATCH_BASES
+                {
+                    break;
+                }
+                output_bytes = output_bytes.saturating_add(record_bytes);
+                packed_bytes = packed_bytes
+                    .checked_add(lengths[end].div_ceil(4))
+                    .ok_or_else(|| io::Error::other("color-set packed batch overflow"))?;
+                end += 1;
+            }
+            let mut encoded = vec![0u8; packed_bytes];
+            tigs.read_exact_at(packed_position, &mut encoded)?;
+            packed_position += packed_bytes as u64;
+            let decoded = decode_fasta_batch(DecodeJob {
+                ordinal: 0,
+                sizes: lengths[first..end].to_vec(),
+                encoded,
+                dataset_ids: Arc::new(vec![0]),
+                abundance_codes: None,
+                abundance_log_base: None,
+            })?;
+            output.write_all(decoded.fasta.as_slice())?;
+            first = end;
+        }
+        if packed_position != packed_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "color-set CID ended at the wrong packed position",
+            ));
+        }
+        selected_cids += 1;
+        total_tigs = total_tigs.saturating_add(lengths.len() as u64);
+    }
+    output.finish()?;
+    println!(
+        "Color-set {} complete: colors={}, CIDs={}, tigs={}, output={}",
+        operation,
+        selected.len(),
+        selected_cids,
+        total_tigs,
+        output_path.display()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decompress_indexed_targeted(
     archive_root: &Path,
@@ -1195,6 +1578,7 @@ fn decompress_indexed_targeted(
     wanted_files_path: &str,
     out_dir: &str,
     restore_abundance: bool,
+    output_compression: OutputCompression,
 ) -> Result<()> {
     let selected = indexed_wanted_datasets(
         &archive_root.join(FILENAME_INDEX_FILE),
@@ -1215,6 +1599,7 @@ fn decompress_indexed_targeted(
             batch,
             out_dir,
             restore_abundance,
+            output_compression,
         )?;
     }
     Ok(())
@@ -1229,6 +1614,7 @@ fn decompress_indexed_selected_batch(
     selected: &[(String, u32)],
     out_dir: &str,
     restore_abundance: bool,
+    output_compression: OutputCompression,
 ) -> Result<()> {
     let postings = DatasetPostingIndex::open(
         &archive_root.join(FILENAME_INDEX_FILE),
@@ -1282,7 +1668,12 @@ fn decompress_indexed_selected_batch(
     };
     let mut outputs = selected
         .iter()
-        .map(|(name, _)| File::create(dump_output_path(out_dir, name)).map(BufWriter::new))
+        .map(|(name, _)| {
+            FastaOutputWriter::create(
+                &dump_output_path(out_dir, name, output_compression),
+                output_compression,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let mut lengths = Vec::<usize>::new();
@@ -1405,8 +1796,8 @@ fn decompress_indexed_selected_batch(
         selected_cids += 1;
         total_tigs = total_tigs.saturating_add(lengths.len() as u64);
     }
-    for output in &mut outputs {
-        output.flush()?;
+    for output in outputs {
+        output.finish()?;
     }
     println!(
         "Output-sensitive targeted decompression complete: datasets={}, CIDs={}, tigs={}",
@@ -1468,6 +1859,7 @@ fn decompress_sidecar(
     wanted_filenames: Option<&[(String, u32)]>,
     threads: usize,
     restore_abundance: bool,
+    output_compression: OutputCompression,
 ) -> Result<()> {
     let sidecar = CidDatasetSidecar::open(sidecar_filename)?;
     if restore_abundance && sidecar.abundance_log_base().is_none() {
@@ -1499,10 +1891,10 @@ fn decompress_sidecar(
     });
     if let Some(wanted) = wanted_filenames {
         for (path, _) in wanted {
-            File::options()
-                .append(true)
-                .create(true)
-                .open(dump_output_path(out_dir, path))?;
+            let output_path = dump_output_path(out_dir, path, output_compression);
+            if output_path.exists() {
+                fs::remove_file(output_path)?;
+            }
         }
     }
     let selected_datasets = wanted_ids
@@ -1515,7 +1907,7 @@ fn decompress_sidecar(
     let output_paths = Arc::new(
         filenames
             .iter()
-            .map(|(path, _)| dump_output_path(out_dir, path))
+            .map(|(path, _)| dump_output_path(out_dir, path, output_compression))
             .collect::<Vec<_>>(),
     );
     let mut path_shards = HashMap::<PathBuf, usize>::new();
@@ -1580,7 +1972,7 @@ fn decompress_sidecar(
         let paths = Arc::clone(&output_paths);
         let routes = Arc::clone(&writer_routes);
         writers.push(thread::spawn(move || {
-            write_output_shard(receiver, paths, routes, shard)
+            write_output_shard(receiver, paths, routes, shard, output_compression)
         }));
     }
 
@@ -2075,8 +2467,9 @@ fn write_output_shard(
     output_paths: Arc<Vec<PathBuf>>,
     writer_routes: Arc<Vec<usize>>,
     shard: usize,
+    output_compression: OutputCompression,
 ) -> Result<()> {
-    let mut writers = HashMap::<u32, File>::new();
+    let mut writers = HashMap::<u32, FastaOutputWriter>::new();
     while let Ok(batch) = receiver.recv() {
         for file_id in batch.dataset_ids {
             if writer_routes.get(file_id as usize).copied() != Some(shard) {
@@ -2094,12 +2487,14 @@ fn write_output_shard(
             let writer = match writers.entry(file_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let file = File::options().append(true).create(true).open(path)?;
-                    entry.insert(file)
+                    entry.insert(FastaOutputWriter::create(path, output_compression)?)
                 }
             };
             writer.write_all(batch.fasta.as_slice())?;
         }
+    }
+    for (_, writer) in writers {
+        writer.finish()?;
     }
     Ok(())
 }
@@ -2107,6 +2502,54 @@ fn write_output_shard(
 #[cfg(test)]
 mod parallel_decompression_tests {
     use super::*;
+
+    fn decode_test_output(path: &Path, compression: OutputCompression) -> Vec<u8> {
+        let file = File::open(path).unwrap();
+        let mut decoded = Vec::new();
+        match compression {
+            OutputCompression::Fasta => BufReader::new(file).read_to_end(&mut decoded).unwrap(),
+            OutputCompression::Gz => flate2::read::GzDecoder::new(file)
+                .read_to_end(&mut decoded)
+                .unwrap(),
+            OutputCompression::Zstd => zstd::Decoder::new(file)
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap(),
+            OutputCompression::Xz => xz2::read::XzDecoder::new(file)
+                .read_to_end(&mut decoded)
+                .unwrap(),
+        };
+        decoded
+    }
+
+    #[test]
+    fn output_writers_roundtrip_all_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let fasta = b">record\nACGTACGT\n";
+        for compression in [
+            OutputCompression::Fasta,
+            OutputCompression::Gz,
+            OutputCompression::Zstd,
+            OutputCompression::Xz,
+        ] {
+            let path = temp
+                .path()
+                .join(format!("output{}", compression.fasta_suffix()));
+            let mut writer = FastaOutputWriter::create(&path, compression).unwrap();
+            writer.write_all(fasta).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(decode_test_output(&path, compression), fasta);
+        }
+    }
+
+    #[test]
+    fn default_output_is_zstd() {
+        assert_eq!(
+            GgcatRebuildConfig::default().output_compression,
+            OutputCompression::Zstd
+        );
+        assert_eq!(OutputCompression::Zstd.fasta_suffix(), ".fa.zst");
+    }
 
     #[test]
     fn packed_batch_decodes_directly_to_ordered_fasta() {
@@ -2734,7 +3177,8 @@ fn decompress_all(
     out_dir: &String,
     filenames: Vec<(String, u32)>,
     cid_to_id_map: HashMap<usize, Vec<u32>>,
-) {
+    output_compression: OutputCompression,
+) -> Result<()> {
     let mut tigs_file =
         BufReader::new(File::open(&tigs_filename).expect("Error opening tigs file"));
 
@@ -2746,7 +3190,7 @@ fn decompress_all(
     let all_sizes = preload_sizes(size_filename).expect("Failed to preload sizes");
 
     // Keep output file handles open
-    let mut writers: HashMap<u32, BufWriter<File>> = HashMap::new();
+    let mut writers: HashMap<u32, FastaOutputWriter> = HashMap::new();
 
     let mut sorted_cids: Vec<_> = cid_to_id_map.keys().cloned().collect();
     sorted_cids.sort();
@@ -2810,32 +3254,29 @@ fn decompress_all(
 
             let tig = vec2str(&tig_buffer, size);
             for file_id in file_ids {
-                let writer = writers.entry(*file_id).or_insert_with(|| {
+                if let std::collections::hash_map::Entry::Vacant(entry) = writers.entry(*file_id) {
                     let curr_filename = &filenames[*file_id as usize];
-                    let output_path = dump_output_path(out_dir, &curr_filename.0);
-                    BufWriter::new(
-                        File::options()
-                            .append(true)
-                            .create(true)
-                            .open(output_path)
-                            .expect("Unable to create file"),
-                    )
-                });
-                writeln!(writer, ">").unwrap();
-                writeln!(writer, "{}", tig).unwrap();
+                    let output_path =
+                        dump_output_path(out_dir, &curr_filename.0, output_compression);
+                    entry.insert(FastaOutputWriter::create(&output_path, output_compression)?);
+                }
+                let writer = writers.get_mut(file_id).expect("writer inserted above");
+                writeln!(writer, ">")?;
+                writeln!(writer, "{}", tig)?;
             }
             total_unitigs += 1;
         }
     }
 
     // Flush all writers at the end
-    for (_, mut writer) in writers {
-        writer.flush().unwrap();
+    for (_, writer) in writers {
+        writer.finish()?;
     }
     println!(
         "Decompression complete: {} unitigs written across {} CIDs",
         total_unitigs, total_cids
     );
+    Ok(())
 }
 
 /// Read full id->color_id file and build color id -> list of file ids.
@@ -2959,7 +3400,8 @@ fn decompress_wanted(
     tigs_filename: &String,
     size_filename: &String,
     out_dir: &String,
-) {
+    output_compression: OutputCompression,
+) -> Result<()> {
     let total_cids = cid_to_id_map.len();
     println!("NB COLOR TO DECOMPRESS: {}", total_cids);
     println!("Wanted files:");
@@ -2978,17 +3420,11 @@ fn decompress_wanted(
     let wanted_ids: std::collections::HashSet<u32> = wanted_files.iter().map(|w| w.1).collect();
 
     // Keep output file handles open
-    let mut writers: HashMap<u32, BufWriter<File>> = HashMap::new();
+    let mut writers: HashMap<u32, FastaOutputWriter> = HashMap::new();
     // Pre-open all wanted output files
     for wanted_file in wanted_files {
-        let output_path = dump_output_path(out_dir, &wanted_file.0);
-        let writer = BufWriter::new(
-            File::options()
-                .append(true)
-                .create(true)
-                .open(output_path)
-                .expect("Unable to create file"),
-        );
+        let output_path = dump_output_path(out_dir, &wanted_file.0, output_compression);
+        let writer = FastaOutputWriter::create(&output_path, output_compression)?;
         writers.insert(wanted_file.1, writer);
     }
 
@@ -3056,8 +3492,8 @@ fn decompress_wanted(
             for file_id in file_ids {
                 if wanted_ids.contains(file_id) {
                     if let Some(writer) = writers.get_mut(file_id) {
-                        writeln!(writer, ">").unwrap();
-                        writeln!(writer, "{}", tig).unwrap();
+                        writeln!(writer, ">")?;
+                        writeln!(writer, "{}", tig)?;
                     }
                 }
             }
@@ -3066,11 +3502,12 @@ fn decompress_wanted(
     }
 
     // Flush all writers at the end
-    for (_, mut writer) in writers {
-        writer.flush().unwrap();
+    for (_, writer) in writers {
+        writer.finish()?;
     }
     println!(
         "Decompression complete: {} unitigs written across {} CIDs",
         total_unitigs, total_cids
     );
+    Ok(())
 }
