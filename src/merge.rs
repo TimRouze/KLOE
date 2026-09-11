@@ -59,6 +59,7 @@ pub struct MergeConfig {
     pub use_unitigs: bool,
     pub use_matchtigs: bool,
     pub use_eulertigs: bool,
+    pub use_simplitigs: bool,
     pub structural: bool,
 }
 
@@ -74,6 +75,7 @@ impl Default for MergeConfig {
             use_unitigs: false,
             use_matchtigs: false,
             use_eulertigs: false,
+            use_simplitigs: false,
             structural: false,
         }
     }
@@ -1129,7 +1131,8 @@ pub fn merge_archives_with_config(
     let archive_b_root = Path::new(archive_b_dir);
     let output_root = Path::new(output_dir);
 
-    let requested_tig_rebuild = cfg.use_unitigs || cfg.use_matchtigs || cfg.use_eulertigs;
+    let requested_tig_rebuild =
+        cfg.use_unitigs || cfg.use_matchtigs || cfg.use_eulertigs || cfg.use_simplitigs;
     if cfg.structural {
         if requested_tig_rebuild {
             return Err(io::Error::new(
@@ -1268,6 +1271,8 @@ pub fn merge_archives_with_config(
             memory_gb,
             temp_dir: cfg.temp_dir.clone(),
             abundance_log_base,
+            use_simplitigs: cfg.use_simplitigs,
+            ..compress::GgcatCompressionConfig::default()
         },
     )?;
 
@@ -1981,7 +1986,9 @@ fn merge_mode_name(cfg: &MergeConfig) -> &'static str {
         "matchtigs"
     } else if cfg.use_eulertigs {
         "eulertigs"
-    } else {
+    } else if cfg.use_simplitigs {
         "simplitigs"
+    } else {
+        "unitigs"
     }
 }

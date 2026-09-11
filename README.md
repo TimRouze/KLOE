@@ -96,17 +96,27 @@ K size. Default is 31.
 #### minimizer_size -m
 Minimizer size. Default is 7.
 
-#### unitigs
-If this flag is set, the archive will contain monochromatic unitigs.
+#### archive SPSS mode (default: unitigs)
+By default, KLOE uses the unitig construction mode of its embedded GGCAT
+backend. Select at most one representation flag:
 
-#### matchtigs
-If this flag is set, the archive will contain monochromatic matchtigs.
+- `--unitig`: unitigs (also used when no flag is supplied).
+- `--simplitig`: internal simplitig construction through embedded GGCAT
+  (`FastSimplitigs`); no external executable is needed.
+- `--matchtig`: GGCAT greedy matchtigs.
+- `--eulertig`: GGCAT fast eulertigs.
 
-#### eulertigs
-If this flag is set, the archive will contain monochromatic eulertigs.
+Simplitig, matchtig, and eulertig modes are experimental and have not yet been
+benchmarked in KLOE for construction time, archive size, or decompression time.
+Correctness tests are not performance benchmarks. No performance advantage is
+claimed for these alternatives.
 
-By default, if none of the above flags are set, compression uses ggcat monochromatic unitigs mode.
-There can only be one flag set at once or 0. If several flags are set the tool will not run and raise an error.
+In every mode, KLOE splits the generated sequences at color-set changes before
+placing the resulting monochromatic segments into archive buckets. With
+abundance enabled, these segments also preserve each dataset's abundance code
+or exact value. The stored segments therefore need not remain maximal tigs of
+the selected representation after splitting. Archive construction mode is
+independent of the representation selected during decompression.
 
 #### Embedded ggcat structured-output backend (hard switch)
 KLOE embeds `ggcat` in-process (no external `ggcat` executable required at runtime).
@@ -166,32 +176,91 @@ For targeted decompression, a list of files the user wants to decompress from th
 Directory in which the decompressed files should be written to.
 
 #### output compression (`--output-compression`)
-Decompressed FASTA is zstd-compressed by default. Select one of:
+Decompressed FASTA is zstd-compressed by default. Compression is independent
+of the selected graph representation. Select one of:
 
-- `zstd` (default), producing `Dump_*.fa.zst`
-- `gz`, producing `Dump_*.fa.gz`
-- `xz`, producing `Dump_*.fa.xz`
-- `fasta` (aliases: `uncompressed`, `fa`), producing uncompressed `Dump_*.fa`
+- `zstd` (default), using the suffix `.fa.zst`
+- `gz`, using the suffix `.fa.gz`
+- `xz`, using the suffix `.fa.xz`
+- `fasta` (aliases: `uncompressed`, `fa`), using the suffix `.fa`
 
 #### color-set union and intersection (`--color-set-operation`)
 Use `-Q/--wanted-files` to provide the archived dataset names (one per line),
 then select `--color-set-operation union` or `--color-set-operation intersection`.
-KLOE emits each qualifying color-class sequence once in `Dump_union.*` or
-`Dump_intersection.*`. Every requested color must exist in the archive. This
+KLOE selects the qualifying color classes and rebuilds their combined graph,
+producing one file: `Dump_union.<mode>.fa.zst` or
+`Dump_intersection.<mode>.fa.zst` with the default compression. Every requested
+color must exist in the archive. An empty result produces a valid empty file. This
 operation is available for indexed KLOE archives and cannot be combined with
 `--abundance`.
 
-#### ggcat rebuild after decompression (`--ggcat-rebuild`)
-After writing `Dump_*` files, run embedded ggcat on those dumps and produce a
-rebuilt compacted output in the output directory. Supplying `--unitig`,
-`--matchtig`, or `--eulertig` automatically enables this rebuild; those flags
-therefore describe the actual decompressed output rather than being ignored.
-`--ggcat-rebuild` alone rebuilds simplitigs (implemented via ggcat Pathtigs).
-The rebuilt filename is `rebuilt_unitigs.*`, `rebuilt_matchtigs.*`,
-`rebuilt_eulertigs.*`, or `rebuilt_simplitigs.*`, with the suffix selected by
-`--output-compression`.
+#### abundance quantization (`--abundance`)
+During compression, `--abundance-bits 4|5|6|7|8` selects the quantization
+precision (default: 8). The default logarithm base is
+`50000^(1/(2^bits-2))`, so the highest code decodes to 50,000 in every mode;
+larger input abundances saturate at that level. Fewer bits give coarser
+approximations. `--abundance-log-base` overrides this base and therefore changes
+the representable range. Codes retain the existing byte-based, zstd-compressed
+storage: this option does not pack each code into the selected number of bits.
+The base is saved in the archive, so decompression needs no precision option.
 
-`-r/--memory` controls the rebuild budget (GB) passed to embedded ggcat.
+#### exact integer abundance (`--abundance-exact`)
+During compression, `--abundance-exact` enables lossless integer abundance
+storage instead of logarithmic quantization; `--abundance` is not additionally
+required. Integers through `18446744073709551615` (`u64::MAX`) are supported
+without saturation. Integral decimal/scientific notation (e.g. `17.0`, `5e4`)
+is accepted; fractional, negative, out-of-range, and missing abundances are
+rejected. Parsing does not pass through floating point. This option conflicts
+with `--abundance-bits` and `--abundance-log-base`.
+
+Exact values use zstd-compressed 64-bit base/deviation metadata, retaining
+shared sequence buckets and indexed targeted decompression. Construction makes
+an additional input pass to assign colors to distinct (dataset, abundance)
+pairs and checks the dictionary against a fraction of the memory budget.
+Exact mode can require more construction time, memory, and archive space than
+quantization. Conflicting abundances for the same k-mer within one dataset
+are rejected, as in quantized abundance mode.
+
+Restore exact abundances with `--stored-tigs --abundance`; the archive identifies
+the encoding automatically. Graph-rebuilding output and union/intersection
+queries cannot currently restore abundance annotations. Exact archives require
+this version or newer; existing quantized archives remain readable. For
+abundance-enabled graph merge, both archives must use exact abundance, or both
+must use quantization with the same logarithmic base.
+
+#### decompressed representation (default: unitigs)
+Normal decompression rebuilds **each requested dataset independently**, producing
+one output file per dataset. Select at most one of `--unitig` (default),
+`--simplitig`, `--matchtig`, or `--eulertig`. These options do not combine datasets;
+only an explicit union/intersection query produces a combined result.
+Unitigs are the default; simplitig, matchtig, and eulertig output modes are
+experimental and have not yet been benchmarked in KLOE.
+
+Outputs are named `Dump_<dataset-id>_<source-stem>.<mode><suffix>`, for example
+`Dump_0_sample.unitigs.fa.zst`. Dataset IDs are zero-based and stable within the
+archive, so equal source basenames do not overwrite each other. Raw intermediate
+sequences are held in private temporary directories and removed after rebuilding.
+Existing files in the output directory are never used as rebuild inputs.
+
+KLOE uses the k recorded in a v4 archive. For legacy archives without a manifest,
+provide the original k with `-k`. `-r/--memory` controls the rebuild budget (GB)
+passed to embedded GGCAT. Datasets are rebuilt sequentially using `-t` threads
+for each graph. `--ggcat-rebuild` remains accepted but is now redundant.
+
+To recover stored tigs without graph rebuilding, use `--stored-tigs`; this
+retains the historical `Dump_<source-stem><suffix>` filenames. Abundance
+restoration requires `--stored-tigs --abundance`: rebuilding may join records
+with different abundance values, so KLOE rejects that combination rather than
+silently discarding the annotations.
+
+```sh
+# Each dataset becomes a separate zstd-compressed unitig file
+./target/release/kloe decompress -c archive -o recovered -r 16 -t 8
+# Each selected dataset becomes a separate gzip-compressed simplitig file
+./target/release/kloe decompress -c archive -o recovered -Q selected.txt -r 16 --simplitig --output-compression gz
+# One xz-compressed matchtig file for the intersection
+./target/release/kloe decompress -c archive -o intersection -Q selected.txt -r 16 --color-set-operation intersection --matchtig --output-compression xz
+```
 
 ## Archive merge
 When running kloe in merge mode, add "merge" before any other parameter.
@@ -217,9 +286,10 @@ redundancy shared between the archives. It cannot be combined with a tig output 
 
 #### output tig mode flags
 Merge honors the same output mode flags as compression:
-- default: simplitigs produced by GGCAT recompaction
-- `--unitig`
-- `--matchtig`
-- `--eulertig`
+
+- default / `--unitig`: unitigs.
+- `--simplitig`: embedded GGCAT simplitigs (experimental; not yet benchmarked).
+- `--matchtig`: greedy matchtigs (experimental; not yet benchmarked).
+- `--eulertig`: fast eulertigs (experimental; not yet benchmarked).
 
 Output tig modes apply to the default GGCAT merge.

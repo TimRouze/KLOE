@@ -75,6 +75,7 @@ const CID_TO_DATASET_COLUMNAR_ABUNDANCE_MAGIC: &[u8; 4] = b"KCD5";
 const CID_TO_DATASET_HYBRID_ABUNDANCE_MAGIC: &[u8; 4] = b"KCD6";
 const CID_TO_DATASET_SPLIT_ABUNDANCE_MAGIC: &[u8; 4] = b"KCD7";
 const CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC: &[u8; 4] = b"KCD8";
+const CID_TO_DATASET_EXACT_ABUNDANCE_MAGIC: &[u8; 4] = b"KCD9";
 const ABUNDANCE_CODEC_SHIFT: u32 = 62;
 const ABUNDANCE_LENGTH_MASK: u64 = (1u64 << ABUNDANCE_CODEC_SHIFT) - 1;
 const ABUNDANCE_CODEC_RAW: u8 = 0;
@@ -156,15 +157,19 @@ impl CidDatasetSidecar {
             || &magic == CID_TO_DATASET_HYBRID_ABUNDANCE_MAGIC
             || &magic == CID_TO_DATASET_SPLIT_ABUNDANCE_MAGIC
             || &magic == CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC
+            || &magic == CID_TO_DATASET_EXACT_ABUNDANCE_MAGIC
         {
             let mut base = [0u8; 8];
             file.read_exact(&mut base)?;
             let base = f64::from_le_bytes(base);
-            if !base.is_finite() || base <= 1.0 {
+            let exact = &magic == CID_TO_DATASET_EXACT_ABUNDANCE_MAGIC;
+            if (exact && base != crate::abundance::EXACT_BASE)
+                || (!exact && (!base.is_finite() || base <= 1.0))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid CID abundance sidecar '{}': log base must be finite and > 1",
+                        "invalid CID abundance sidecar '{}': encoding/base mismatch",
                         path.display()
                     ),
                 ));
@@ -173,11 +178,13 @@ impl CidDatasetSidecar {
                 true,
                 &magic != CID_TO_DATASET_ABUNDANCE_MAGIC,
                 &magic == CID_TO_DATASET_HYBRID_ABUNDANCE_MAGIC
+                    || exact
                     || &magic == CID_TO_DATASET_SPLIT_ABUNDANCE_MAGIC
                     || &magic == CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC,
                 &magic == CID_TO_DATASET_SPLIT_ABUNDANCE_MAGIC
+                    || exact
                     || &magic == CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC,
-                &magic == CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC,
+                &magic == CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC || exact,
                 Some(base),
             )
         } else {
@@ -347,7 +354,7 @@ impl CidDatasetSidecar {
 
     pub(crate) fn visit_groups_with_abundance(
         &self,
-        mut visit: impl FnMut(usize, &[u32], Option<&[u8]>) -> io::Result<()>,
+        mut visit: impl FnMut(usize, &[u32], Option<&[u64]>) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut reader = self.reader()?;
         let mut dataset_ids = Vec::new();
@@ -435,6 +442,7 @@ impl CidDatasetSidecar {
                 self.hybrid_abundance,
                 self.split_abundance,
                 self.dataset_count,
+                crate::abundance::width(self.abundance_log_base),
                 ranges,
                 data,
                 abundance_ranges,
@@ -533,7 +541,7 @@ impl CidDatasetSidecarReader<'_> {
         &mut self,
         group: usize,
         target: &mut Vec<u32>,
-        abundance_codes: &mut Vec<u8>,
+        abundance_codes: &mut Vec<u64>,
         dataset_offset: u32,
     ) -> io::Result<()> {
         let block_index = self
@@ -578,6 +586,7 @@ impl CidDatasetSidecarReader<'_> {
                 self.sidecar.hybrid_abundance,
                 self.sidecar.split_abundance,
                 self.sidecar.dataset_count,
+                crate::abundance::width(self.sidecar.abundance_log_base),
                 &mut self.ranges,
                 &mut self.data,
                 &mut self.abundance_ranges,
@@ -591,7 +600,12 @@ impl CidDatasetSidecarReader<'_> {
         abundance_codes.clear();
         if self.sidecar.columnar_abundance {
             let (start, end) = self.abundance_ranges[local];
-            abundance_codes.extend_from_slice(&self.abundance_codes[start..end]);
+            let width = crate::abundance::width(self.sidecar.abundance_log_base);
+            for bytes in self.abundance_codes[start..end].chunks_exact(width) {
+                let mut value = [0u8; 8];
+                value[..width].copy_from_slice(bytes);
+                abundance_codes.push(u64::from_le_bytes(value));
+            }
         }
         let (start, end) = self.ranges[local];
         let encoded = &self.data[start..end];
@@ -662,7 +676,7 @@ impl CidDatasetSidecarReader<'_> {
                         )
                     })?;
                     cursor += 1;
-                    abundance_codes.push(code);
+                    abundance_codes.push(u64::from(code));
                 }
             }
         }
@@ -690,6 +704,7 @@ fn load_cid_sidecar_block(
     hybrid_abundance: bool,
     split_abundance: bool,
     dataset_count: Option<usize>,
+    abundance_width: usize,
     ranges: &mut Vec<(usize, usize)>,
     data: &mut Vec<u8>,
     abundance_ranges: &mut Vec<(usize, usize)>,
@@ -791,6 +806,23 @@ fn load_cid_sidecar_block(
         data.clear();
         data.extend_from_slice(&decoded[ids_start..codes_start]);
         if let Some(decoded_abundance) = decoded_abundance.as_deref() {
+            if abundance_width == 8 {
+                if codes_start != decoded.len()
+                    || total_memberships.checked_mul(8) != Some(decoded_abundance.len())
+                    || block.abundance_codec != ABUNDANCE_CODEC_RAW
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid exact abundance sidecar block",
+                    ));
+                }
+                for (start, end) in abundance_ranges.iter_mut() {
+                    *start *= 8;
+                    *end *= 8;
+                }
+                abundance_codes.extend_from_slice(decoded_abundance);
+                return Ok(());
+            }
             if codes_start != decoded.len() || decoded_abundance.len() != total_memberships {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -924,7 +956,7 @@ impl CidDatasetSidecarWriter {
     ) -> io::Result<Self> {
         let mut file = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(path)?);
         if let Some(base) = abundance_log_base {
-            if !base.is_finite() || base <= 1.0 {
+            if !base.is_finite() || base < 1.0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "abundance log base must be finite and > 1",
@@ -936,7 +968,11 @@ impl CidDatasetSidecarWriter {
                     "abundance sidecar requires a nonzero dataset count",
                 )
             })?;
-            file.write_all(CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC)?;
+            file.write_all(if base == crate::abundance::EXACT_BASE {
+                CID_TO_DATASET_EXACT_ABUNDANCE_MAGIC
+            } else {
+                CID_TO_DATASET_ADAPTIVE_ABUNDANCE_MAGIC
+            })?;
             file.write_all(&base.to_le_bytes())?;
             file.write_all(&(dataset_count as u64).to_le_bytes())?;
         } else {
@@ -962,7 +998,7 @@ impl CidDatasetSidecarWriter {
     pub(crate) fn append_zero_based_with_abundance(
         &mut self,
         dataset_ids: &[usize],
-        abundance_codes: Option<&[u8]>,
+        abundance_codes: Option<&[u64]>,
     ) -> io::Result<()> {
         if dataset_ids.is_empty() {
             return Err(io::Error::new(
@@ -1029,7 +1065,17 @@ impl CidDatasetSidecarWriter {
             }
         }
         if let Some(codes) = abundance_codes {
-            self.block_abundance_codes.extend_from_slice(codes);
+            let width = crate::abundance::width(self.abundance_log_base);
+            for code in codes {
+                if width == 1 && *code > 255 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "quantized abundance code exceeds 255",
+                    ));
+                }
+                self.block_abundance_codes
+                    .extend_from_slice(&code.to_le_bytes()[..width]);
+            }
         }
         self.finish_group(dataset_ids.len())
     }
@@ -1124,7 +1170,14 @@ impl CidDatasetSidecarWriter {
             }
         }
         let compressed = zstd::encode_all(encoded.as_slice(), 1)?;
-        let (abundance_compressed, abundance_codec) = if abundance_enabled {
+        let (abundance_compressed, abundance_codec) = if self.abundance_log_base
+            == Some(crate::abundance::EXACT_BASE)
+        {
+            (
+                Some(zstd::encode_all(self.block_abundance_codes.as_slice(), 1)?),
+                ABUNDANCE_CODEC_RAW,
+            )
+        } else if abundance_enabled {
             let raw = zstd::encode_all(self.block_abundance_codes.as_slice(), 1)?;
             let mut transformed_codes = Vec::with_capacity(self.block_abundance_codes.len());
             let mut cursor = 0usize;
@@ -1247,6 +1300,9 @@ pub struct GgcatCompressionConfig {
     pub memory_gb: usize,
     pub temp_dir: String,
     pub abundance_log_base: Option<f64>,
+    pub abundance_bits: u8,
+    pub abundance_exact: bool,
+    pub use_simplitigs: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1295,6 +1351,9 @@ impl Default for GgcatCompressionConfig {
             memory_gb: 8,
             temp_dir: String::new(),
             abundance_log_base: None,
+            abundance_bits: 8,
+            abundance_exact: false,
+            use_simplitigs: false,
         }
     }
 }
@@ -1420,12 +1479,30 @@ fn parse_header_abundance(header: &[u8]) -> Option<u64> {
     None
 }
 
+// Code 255 represents base^(255 - 1). Choose 50_000^(1/254) so the
+// highest decoded abundance is exactly 50,000 after integer rounding.
+pub(crate) const DEFAULT_ABUNDANCE_LOG_BASE: f64 = 1.0435178489756687;
+
+pub(crate) fn default_abundance_log_base(bits: u8) -> f64 {
+    assert!((4..=8).contains(&bits));
+    if bits == 8 {
+        DEFAULT_ABUNDANCE_LOG_BASE
+    } else {
+        50_000_f64.powf(1.0 / ((1u16 << bits) - 2) as f64)
+    }
+}
+
 pub(crate) fn encode_abundance(value: u64, log_base: f64) -> u8 {
+    encode_abundance_with_bits(value, log_base, 8)
+}
+
+pub(crate) fn encode_abundance_with_bits(value: u64, log_base: f64, bits: u8) -> u8 {
+    assert!((4..=8).contains(&bits));
     if value == 0 {
         return 0;
     }
     let code = 1.0 + (value as f64).ln() / log_base.ln();
-    code.round().clamp(1.0, u8::MAX as f64) as u8
+    code.round().clamp(1.0, ((1u16 << bits) - 1) as f64) as u8
 }
 
 pub(crate) fn decode_abundance(code: u8, log_base: f64) -> u64 {
@@ -1439,10 +1516,11 @@ pub(crate) fn decode_abundance(code: u8, log_base: f64) -> u64 {
 struct AbundanceSequencesStream {
     files: Vec<PathBuf>,
     log_base: f64,
+    bits: u8,
 }
 
 impl AbundanceSequencesStream {
-    fn new(files: &[String], log_base: f64) -> Self {
+    fn new(files: &[String], log_base: f64, bits: u8) -> Self {
         Self {
             files: files
                 .iter()
@@ -1452,6 +1530,7 @@ impl AbundanceSequencesStream {
                 })
                 .collect(),
             log_base,
+            bits,
         }
     }
 }
@@ -1481,7 +1560,7 @@ impl DynamicSequencesStream for AbundanceSequencesStream {
                         path.display()
                     )
                 });
-                let code = encode_abundance(abundance, self.log_base);
+                let code = encode_abundance_with_bits(abundance, self.log_base, self.bits);
                 let color = u32::try_from(color_base + code as usize)
                     .unwrap_or_else(|_| panic!("abundance color index exceeds u32"));
                 callback(sequence, SequenceInfo { color: Some(color) });
@@ -1627,22 +1706,22 @@ pub(crate) fn stable_filename_hash(bytes: &[u8]) -> u64 {
 struct MembershipEdge {
     cid: u64,
     dataset: u32,
-    abundance: u8,
+    abundance: u64,
 }
 
 fn write_membership_edge(writer: &mut impl Write, edge: MembershipEdge) -> Result<()> {
     writer.write_all(&edge.cid.to_le_bytes())?;
     writer.write_all(&edge.dataset.to_le_bytes())?;
-    writer.write_all(&[edge.abundance, 0, 0, 0])
+    writer.write_all(&edge.abundance.to_le_bytes())
 }
 
 fn read_membership_edge(reader: &mut impl Read) -> Result<Option<MembershipEdge>> {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 20];
     match reader.read_exact(&mut bytes) {
         Ok(()) => Ok(Some(MembershipEdge {
             cid: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             dataset: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            abundance: bytes[12],
+            abundance: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
         })),
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
         Err(err) => Err(err),
@@ -1677,7 +1756,7 @@ fn merge_membership_runs(
         .iter()
         .map(|path| BufReader::with_capacity(COLOR_RUN_BUFFER_BYTES, File::open(path).unwrap()))
         .collect::<Vec<_>>();
-    let mut heap = BinaryHeap::<std::cmp::Reverse<(u64, u32, u8, usize)>>::new();
+    let mut heap = BinaryHeap::<std::cmp::Reverse<(u64, u32, u64, usize)>>::new();
     for (index, reader) in readers.iter_mut().enumerate() {
         if let Some(edge) = read_membership_edge(reader)? {
             heap.push(std::cmp::Reverse((
@@ -1759,6 +1838,7 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
     if flags[0]
         & !(DATASET_TO_CID_FLAG_ABUNDANCE
             | DATASET_TO_CID_FLAG_ADAPTIVE
+            | crate::abundance::EXACT_FLAG
             | DATASET_TO_CID_FLAG_MAJORITY)
         != 0
     {
@@ -1767,9 +1847,25 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
             "unsupported dataset-to-CID flags",
         ));
     }
+    let exact = flags[0] & crate::abundance::EXACT_FLAG != 0;
+    if exact && flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact flag requires abundance metadata",
+        ));
+    }
     let abundance_log_base = if flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE != 0 {
         data.read_exact(&mut value)?;
-        Some(f64::from_le_bytes(value))
+        let base = f64::from_le_bytes(value);
+        if (exact && base != crate::abundance::EXACT_BASE)
+            || (!exact && (!base.is_finite() || base <= 1.0))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid abundance log base",
+            ));
+        }
+        Some(base)
     } else {
         None
     };
@@ -1941,12 +2037,12 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
                 ));
             }
             let abundance = if abundance_log_base.is_some() {
-                let mut residual = [0u8; 1];
-                abundance_decoder
-                    .as_mut()
-                    .expect("abundance decoder initialized")
-                    .read_exact(&mut residual)?;
-                residual[0]
+                crate::abundance::read_code(
+                    abundance_decoder
+                        .as_mut()
+                        .expect("abundance decoder initialized"),
+                    crate::abundance::width(abundance_log_base),
+                )?
             } else {
                 0
             };
@@ -1991,7 +2087,7 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
     )?;
     let mut current_cid = 0u64;
     let mut current_ids = Vec::<u32>::new();
-    let mut current_codes = Vec::<u8>::new();
+    let mut current_codes = Vec::<u64>::new();
     let mut saw_edge = false;
     let mut abundance_bases = if abundance_log_base.is_some() {
         let root = data_path.parent().ok_or_else(|| {
@@ -2004,7 +2100,10 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
             root.join(ABUNDANCE_BASE_FILE),
             root.join(ABUNDANCE_BASE_INDEX_FILE),
         )?;
-        if reader.logical_len() != expected_groups as u64 {
+        if reader.logical_len()
+            != (expected_groups as u64)
+                .saturating_mul(crate::abundance::width(abundance_log_base) as u64)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "abundance base stream does not match archive CID count",
@@ -2014,7 +2113,7 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
     } else {
         None
     };
-    let mut current_base = 0u8;
+    let mut current_base = 0u64;
     let mut visit = |edge: MembershipEdge| -> Result<()> {
         if saw_edge && edge.cid != current_cid {
             if edge.cid != current_cid + 1 {
@@ -2034,7 +2133,10 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
             current_codes.clear();
             current_cid = edge.cid;
             if let Some(reader) = abundance_bases.as_mut() {
-                reader.read_exact_at(edge.cid, std::slice::from_mut(&mut current_base))?;
+                let width = crate::abundance::width(abundance_log_base);
+                let mut bytes = [0u8; 8];
+                reader.read_exact_at(edge.cid * width as u64, &mut bytes[..width])?;
+                current_base = u64::from_le_bytes(bytes);
             }
         } else if !saw_edge {
             if edge.cid != 0 {
@@ -2046,7 +2148,10 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
             current_cid = edge.cid;
             saw_edge = true;
             if let Some(reader) = abundance_bases.as_mut() {
-                reader.read_exact_at(edge.cid, std::slice::from_mut(&mut current_base))?;
+                let width = crate::abundance::width(abundance_log_base);
+                let mut bytes = [0u8; 8];
+                reader.read_exact_at(edge.cid * width as u64, &mut bytes[..width])?;
+                current_base = u64::from_le_bytes(bytes);
             }
         }
         if current_ids.last().is_some_and(|last| *last >= edge.dataset) {
@@ -2057,7 +2162,11 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
         }
         current_ids.push(edge.dataset);
         if abundance_log_base.is_some() {
-            current_codes.push(current_base.wrapping_add(edge.abundance));
+            current_codes.push(crate::abundance::restore_code(
+                current_base,
+                edge.abundance,
+                abundance_log_base.unwrap(),
+            ));
         }
         Ok(())
     };
@@ -2241,6 +2350,7 @@ fn ggcat_extra_elaboration(
     use_unitigs: bool,
     use_matchtigs: bool,
     use_eulertigs: bool,
+    use_simplitigs: bool,
 ) -> ExtraElaboration {
     if use_unitigs {
         ExtraElaboration::None
@@ -2248,8 +2358,10 @@ fn ggcat_extra_elaboration(
         ExtraElaboration::GreedyMatchtigs
     } else if use_eulertigs {
         ExtraElaboration::FastEulertigs
+    } else if use_simplitigs {
+        ExtraElaboration::FastSimplitigs
     } else {
-        // For colored-record export we need color-safe output to preserve per-file k-mers.
+        // Unitigs remain the default; other SPSS modes are opt-in.
         ExtraElaboration::None
     }
 }
@@ -2638,6 +2750,7 @@ pub(crate) struct SourceDatasetMap {
     disk_ranges: Vec<DiskSourceDatasetRange>,
     source_count: usize,
     virtual_abundance_datasets: Option<usize>,
+    exact_abundance_sources: Option<crate::abundance::ExactSources>,
     abundance_log_base: Option<f64>,
 }
 
@@ -2672,6 +2785,7 @@ impl SourceDatasetMap {
             disk_ranges: Vec::new(),
             source_count: 0,
             virtual_abundance_datasets: None,
+            exact_abundance_sources: None,
             abundance_log_base: None,
         }
     }
@@ -2701,6 +2815,7 @@ impl SourceDatasetMap {
             disk_ranges: Vec::new(),
             source_count,
             virtual_abundance_datasets: Some(dataset_count),
+            exact_abundance_sources: None,
             abundance_log_base: Some(log_base),
         })
     }
@@ -2909,7 +3024,7 @@ impl SourceDatasetReader<'_> {
         &mut self,
         source: usize,
         target: &mut Vec<u32>,
-        abundance_codes: &mut Vec<u8>,
+        abundance_codes: &mut Vec<u64>,
     ) -> io::Result<()> {
         abundance_codes.clear();
         if let Some(dataset_count) = self.map.virtual_abundance_datasets {
@@ -2930,7 +3045,19 @@ impl SourceDatasetReader<'_> {
             target.push(u32::try_from(dataset + 1).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "dataset ID exceeds u32")
             })?);
-            abundance_codes.push((source % ABUNDANCE_CODES_PER_DATASET) as u8);
+            abundance_codes.push((source % ABUNDANCE_CODES_PER_DATASET) as u64);
+            return Ok(());
+        }
+        if let Some(sources) = self.map.exact_abundance_sources.as_ref() {
+            let &(dataset, value) = sources.get(source).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact abundance source is out of range",
+                )
+            })?;
+            target.clear();
+            target.push(dataset);
+            abundance_codes.push(value);
             return Ok(());
         }
         if let Some(span) = self.map.spans.get(source) {
@@ -3003,15 +3130,15 @@ impl SourceDatasetReader<'_> {
 struct ResolvedSubsets {
     subsets: Vec<ColorIndexType>,
     dataset_ids: Vec<Arc<Vec<u32>>>,
-    abundance_codes: Option<Vec<Arc<Vec<u8>>>>,
+    abundance_codes: Option<Vec<Arc<Vec<u64>>>>,
 }
 
-type AbundanceMemberships = (Vec<Arc<Vec<u32>>>, Vec<Arc<Vec<u8>>>);
+type AbundanceMemberships = (Vec<Arc<Vec<u32>>>, Vec<Arc<Vec<u64>>>);
 
 fn decode_virtual_abundance_sources(
     mut sources: Vec<usize>,
     source_limit: usize,
-) -> Result<(Arc<Vec<u32>>, Arc<Vec<u8>>)> {
+) -> Result<(Arc<Vec<u32>>, Arc<Vec<u64>>)> {
     sources.sort_unstable();
     sources.dedup();
     if sources.is_empty() {
@@ -3042,7 +3169,7 @@ fn decode_virtual_abundance_sources(
                 io::Error::new(io::ErrorKind::InvalidData, "dataset ID exceeds u32")
             })?,
         );
-        abundance_codes.push((source % ABUNDANCE_CODES_PER_DATASET) as u8);
+        abundance_codes.push((source % ABUNDANCE_CODES_PER_DATASET) as u64);
         previous_dataset = Some(dataset);
     }
     Ok((Arc::new(dataset_ids), Arc::new(abundance_codes)))
@@ -3214,7 +3341,7 @@ fn resolve_subsets_to_dataset_ids(
         requests.par_sort_unstable();
         requests.dedup();
         let abundance_enabled = source_dataset_ids.abundance_log_base().is_some();
-        let partial: Vec<FastMutex<Vec<(u32, u8)>>> = (0..chunk.len())
+        let partial: Vec<FastMutex<Vec<(u32, u64)>>> = (0..chunk.len())
             .map(|_| FastMutex::new(Vec::new()))
             .collect();
         let target_tasks = rayon::current_num_threads().max(1).saturating_mul(4);
@@ -3267,7 +3394,7 @@ fn resolve_subsets_to_dataset_ids(
 
         let chunk_memberships = partial
             .into_par_iter()
-            .map(|memberships| -> Result<(Arc<Vec<u32>>, Arc<Vec<u8>>)> {
+            .map(|memberships| -> Result<(Arc<Vec<u32>>, Arc<Vec<u64>>)> {
                 let mut memberships = memberships.into_inner();
                 memberships.sort_unstable();
                 memberships.dedup();
@@ -3585,7 +3712,7 @@ impl DatasetCidSpill {
     fn append_group(
         &mut self,
         dataset_ids: &[usize],
-        abundance_codes: Option<&[u8]>,
+        abundance_codes: Option<&[u64]>,
         cid: usize,
     ) -> Result<()> {
         match (self.abundance_log_base, abundance_codes) {
@@ -3670,7 +3797,10 @@ impl DatasetCidSpill {
                     // The CID's first abundance is stored once in the indexed
                     // base stream. Dataset postings keep only deviations from
                     // that base, which are strongly concentrated around zero.
-                    writer.write_all(&[codes[start + local_index].wrapping_sub(codes[0])])?;
+                    let residual = codes[start + local_index].wrapping_sub(codes[0]);
+                    writer.write_all(
+                        &residual.to_le_bytes()[..crate::abundance::width(self.abundance_log_base)],
+                    )?;
                 }
                 previous_dataset = dataset;
             }
@@ -3754,6 +3884,7 @@ struct StreamFinalize {
 
 struct StreamWriterState {
     tigs_file: PackedTigsWriter,
+    abundance_width: usize,
     abundance_bases: Option<PackedTigsWriter>,
     size_file: BufWriter<File>,
     size_index_path: PathBuf,
@@ -3787,6 +3918,7 @@ impl StreamWriterState {
                 unitigs_file_path,
                 Path::new(output_dir).join(TIGS_INDEX_FILE),
             )?,
+            abundance_width: crate::abundance::width(abundance_log_base),
             abundance_bases: if abundance_log_base.is_some() {
                 Some(PackedTigsWriter::create_indexed(
                     Path::new(output_dir).join(ABUNDANCE_BASE_FILE),
@@ -3904,10 +4036,12 @@ impl StreamWriterState {
     fn append_group_cids(
         &mut self,
         dataset_ids_zero_based: &[usize],
-        abundance_codes: Option<&[u8]>,
+        abundance_codes: Option<&[u64]>,
     ) -> Result<()> {
         match (&mut self.abundance_bases, abundance_codes) {
-            (Some(writer), Some(codes)) if !codes.is_empty() => writer.write_all(&[codes[0]])?,
+            (Some(writer), Some(codes)) if !codes.is_empty() => {
+                writer.write_all(&codes[0].to_le_bytes()[..self.abundance_width])?
+            }
             (Some(_), _) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -3933,7 +4067,7 @@ impl StreamWriterState {
     fn write_group(
         &mut self,
         dataset_ids_zero_based: &[usize],
-        abundance_codes: Option<&[u8]>,
+        abundance_codes: Option<&[u64]>,
         seqs: &mut Vec<Vec<u8>>,
         run_paths: &mut Vec<PathBuf>,
         spill_dir: &Path,
@@ -3978,7 +4112,7 @@ impl StreamWriterState {
     fn write_precomputed_group_files(
         &mut self,
         dataset_ids_zero_based: &[usize],
-        abundance_codes: Option<&[u8]>,
+        abundance_codes: Option<&[u64]>,
         encoded_tigs_path: &Path,
         encoded_tigs_len: u64,
         group_sizes_path: &Path,
@@ -4005,7 +4139,7 @@ impl StreamWriterState {
     fn write_precomputed_group_buffers(
         &mut self,
         dataset_ids_zero_based: &[usize],
-        abundance_codes: Option<&[u8]>,
+        abundance_codes: Option<&[u64]>,
         encoded_tigs: &[u8],
         group_sizes: &[u8],
     ) -> Result<()> {
@@ -4084,7 +4218,7 @@ impl StreamWriterState {
 struct GroupTask {
     cid: usize,
     dataset_ids_zero_based: Vec<usize>,
-    abundance_codes: Option<Vec<u8>>,
+    abundance_codes: Option<Vec<u64>>,
     seqs: Vec<Vec<u8>>,
     run_paths: Vec<PathBuf>,
 }
@@ -4107,7 +4241,7 @@ enum GroupWriteData {
 struct GroupWriteResult {
     cid: usize,
     dataset_ids_zero_based: Vec<usize>,
-    abundance_codes: Option<Vec<u8>>,
+    abundance_codes: Option<Vec<u64>>,
     data: GroupWriteData,
 }
 
@@ -4325,11 +4459,9 @@ fn group_task_resident_bytes(task: &GroupTask) -> usize {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<PathBuf>()),
         )
-        .saturating_add(
-            task.abundance_codes
-                .as_ref()
-                .map_or(0, |codes| codes.capacity()),
-        )
+        .saturating_add(task.abundance_codes.as_ref().map_or(0, |codes| {
+            codes.capacity().saturating_mul(std::mem::size_of::<u64>())
+        }))
 }
 
 fn write_compressed_from_stream(
@@ -4367,7 +4499,7 @@ fn write_compressed_from_stream(
     let mut worker_stats = WorkerStats::default();
     let mut commit_stats = CommitStats::default();
     let mut current_color_ids: Option<Arc<Vec<u32>>> = None;
-    let mut current_abundance_codes: Option<Arc<Vec<u8>>> = None;
+    let mut current_abundance_codes: Option<Arc<Vec<u64>>> = None;
     let mut current_ids_zero_based: Option<Vec<usize>> = None;
     let mut group_seqs: Vec<Vec<u8>> = Vec::new();
     let mut group_run_paths: Vec<PathBuf> = Vec::new();
@@ -4706,9 +4838,10 @@ fn transpose_cid_partition(
             }
             let state = &mut datasets[dataset - dataset_start];
             let abundance = if abundance_enabled {
-                let mut code = [0u8; 1];
-                reader.read_exact(&mut code)?;
-                Some(code[0])
+                Some(crate::abundance::read_code(
+                    &mut reader,
+                    payload_writer.abundance_width,
+                )?)
             } else {
                 None
             };
@@ -4728,7 +4861,9 @@ fn transpose_cid_partition(
             };
             write_varint_u64(delta, &mut state.encoded_deltas);
             if let Some(code) = abundance {
-                state.encoded_deltas.push(code);
+                state
+                    .encoded_deltas
+                    .extend_from_slice(&code.to_le_bytes()[..payload_writer.abundance_width]);
             }
             state.last_cid = cid;
             state.seen = true;
@@ -4776,6 +4911,7 @@ struct DatasetPayloadWriter {
     cid_encoder: Option<Encoder<'static, File>>,
     abundance_encoder: Option<Encoder<'static, File>>,
     abundance_enabled: bool,
+    abundance_width: usize,
     cid_count: u64,
     current_postings: u64,
     bitmap_payload_path: PathBuf,
@@ -4800,6 +4936,8 @@ impl DatasetPayloadWriter {
         output.write_all(DATASET_TO_CID_MAGIC)?;
         let flags = DATASET_TO_CID_FLAG_ADAPTIVE
             | u8::from(abundance_log_base.is_some()) * DATASET_TO_CID_FLAG_ABUNDANCE
+            | u8::from(abundance_log_base == Some(crate::abundance::EXACT_BASE))
+                * crate::abundance::EXACT_FLAG
             | u8::from(abundance_log_base.is_none()) * DATASET_TO_CID_FLAG_MAJORITY;
         output.write_all(&[flags])?;
         if let Some(base) = abundance_log_base {
@@ -4847,6 +4985,7 @@ impl DatasetPayloadWriter {
             cid_encoder: None,
             abundance_encoder: None,
             abundance_enabled: abundance_log_base.is_some(),
+            abundance_width: crate::abundance::width(abundance_log_base),
             cid_count,
             current_postings: 0,
             bitmap_payload_path: spill_dir.join("dataset_bitmap.zst.tmp"),
@@ -5081,12 +5220,12 @@ impl DatasetPayloadWriter {
                         .as_mut()
                         .ok_or_else(|| io::Error::other("missing dataset CID encoder"))?,
                 )?;
-                let mut deviation = [0u8; 1];
-                cursor.read_exact(&mut deviation)?;
+                let mut deviation = [0u8; 8];
+                cursor.read_exact(&mut deviation[..self.abundance_width])?;
                 self.abundance_encoder
                     .as_mut()
                     .ok_or_else(|| io::Error::other("missing dataset abundance encoder"))?
-                    .write_all(&deviation)?;
+                    .write_all(&deviation[..self.abundance_width])?;
             }
             Ok(())
         } else {
@@ -5495,7 +5634,12 @@ fn produce_ggcat_records(
         Some(m),
         true,
         1,
-        ggcat_extra_elaboration(use_unitigs, use_matchtigs, use_eulertigs),
+        ggcat_extra_elaboration(
+            use_unitigs,
+            use_matchtigs,
+            use_eulertigs,
+            ggcat_cfg.use_simplitigs,
+        ),
         None,
     );
     unregister_channel_output(&structured_output_key);
@@ -5678,6 +5822,25 @@ pub(crate) fn compress_ggcat_sources(
         ));
     }
 
+    if [
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
+        ggcat_cfg.use_simplitigs,
+    ]
+    .iter()
+    .filter(|&&enabled| enabled)
+    .count()
+        > 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only one SPSS mode may be selected",
+        ));
+    }
+    if use_matchtigs || use_eulertigs || ggcat_cfg.use_simplitigs {
+        eprintln!("Warning: simplitig, matchtig and eulertig modes are experimental and have not yet been benchmarked in KLOE. Unitigs are the default.");
+    }
     println!("Compression backend: embedded ggcat structured output");
 
     let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigBatch>(2);
@@ -5774,13 +5937,41 @@ pub fn compress_with_ggcat(
     }
 
     let filenames = read_input_fof_filenames(input_fof)?;
-    let (input_streams, source_dataset_ids) = if let Some(log_base) = ggcat_cfg.abundance_log_base {
-        let stream = Arc::new(AbundanceSequencesStream::new(&filenames, log_base));
+    let (input_streams, source_dataset_ids) = if ggcat_cfg.abundance_exact {
+        if ggcat_cfg.abundance_log_base.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exact abundance cannot be combined with logarithmic quantization",
+            ));
+        }
+        let (stream, sources) =
+            crate::abundance::ExactSequencesStream::prepare(&filenames, ggcat_cfg.memory_gb)?;
+        let stream: Arc<dyn DynamicSequencesStream> = Arc::new(stream);
+        let inputs = (0..filenames.len())
+            .map(|block| GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block)))
+            .collect::<Vec<_>>();
+        let mut map = SourceDatasetMap::new();
+        map.source_count = sources.len();
+        map.exact_abundance_sources = Some(sources);
+        map.abundance_log_base = Some(crate::abundance::EXACT_BASE);
+        println!("Abundance preservation enabled: exact u64 integers (no quantization)");
+        (inputs, map)
+    } else if let Some(log_base) = ggcat_cfg.abundance_log_base {
+        if !(4..=8).contains(&ggcat_cfg.abundance_bits) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "abundance bits must be between 4 and 8",
+            ));
+        }
+        // Retain the 256-color namespace and byte-based archive storage. The
+        // stored log base and codes fully determine decoding at every precision.
+        let bits = ggcat_cfg.abundance_bits;
+        let stream = Arc::new(AbundanceSequencesStream::new(&filenames, log_base, bits));
         let stream: Arc<dyn DynamicSequencesStream> = stream;
         let input_streams = (0..filenames.len())
             .map(|block| GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block)))
             .collect::<Vec<_>>();
-        println!("Abundance preservation enabled: 8-bit logarithmic codes, base={log_base}");
+        println!("Abundance preservation enabled: {bits}-bit logarithmic codes, base={log_base}");
         (
             input_streams,
             SourceDatasetMap::from_abundance_datasets(filenames.len(), log_base)?,
@@ -5818,6 +6009,18 @@ pub fn compress_with_ggcat(
 #[cfg(test)]
 mod structured_output_tests {
     use super::*;
+
+    #[test]
+    fn spss_default_is_unitig_and_simplitigs_are_explicit() {
+        assert_eq!(
+            ggcat_extra_elaboration(false, false, false, false),
+            ExtraElaboration::None
+        );
+        assert_eq!(
+            ggcat_extra_elaboration(false, false, false, true),
+            ExtraElaboration::FastSimplitigs
+        );
+    }
     use ggcat_colors::storage::run_length::RunLengthColorsSerializer;
     use ggcat_colors::storage::serializer::ColorsSerializer;
 
@@ -6006,6 +6209,28 @@ mod structured_output_tests {
             })
             .unwrap();
         assert_eq!(groups, vec![(vec![1, 5, 9], vec![7, 19, 31])]);
+    }
+
+    #[test]
+    fn default_abundance_codes_cover_logan_range() {
+        for bits in 4..=8 {
+            let base = default_abundance_log_base(bits);
+            let max_code = ((1u16 << bits) - 1) as u8;
+            assert_eq!(encode_abundance_with_bits(1, base, bits), 1);
+            assert_eq!(decode_abundance(1, base), 1);
+            assert_eq!(encode_abundance_with_bits(50_000, base, bits), max_code);
+            assert_eq!(decode_abundance(max_code, base), 50_000);
+            assert_eq!(encode_abundance_with_bits(u64::MAX, base, bits), max_code);
+
+            let mut previous = 0;
+            for abundance in 1..=50_000 {
+                let code = encode_abundance_with_bits(abundance, base, bits);
+                assert!((1..=max_code).contains(&code));
+                assert!(code >= previous);
+                assert!((1..=50_000).contains(&decode_abundance(code, base)));
+                previous = code;
+            }
+        }
     }
 
     #[test]

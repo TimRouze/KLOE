@@ -229,6 +229,7 @@ impl DatasetPostingIndex {
         if flags[0]
             & !(DATASET_TO_CID_FLAG_ABUNDANCE
                 | DATASET_TO_CID_FLAG_ADAPTIVE
+                | crate::abundance::EXACT_FLAG
                 | DATASET_TO_CID_FLAG_MAJORITY)
             != 0
         {
@@ -237,11 +238,20 @@ impl DatasetPostingIndex {
                 "unsupported dataset-to-CID flags",
             ));
         }
+        let exact = flags[0] & crate::abundance::EXACT_FLAG != 0;
+        if exact && flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact flag requires abundance metadata",
+            ));
+        }
         let abundance_log_base = if flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE != 0 {
             let mut base = [0u8; 8];
             data.read_exact(&mut base)?;
             let base = f64::from_le_bytes(base);
-            if !base.is_finite() || base <= 1.0 {
+            if (exact && base != crate::abundance::EXACT_BASE)
+                || (!exact && (!base.is_finite() || base <= 1.0))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid abundance log base",
@@ -352,6 +362,7 @@ impl DatasetPostingIndex {
                     })?,
                 },
                 abundance_decoder: None,
+                abundance_width: 1,
             });
         }
         if codec != DATASET_POSTING_DELTA {
@@ -391,6 +402,7 @@ impl DatasetPostingIndex {
         Ok(DatasetPostingReader {
             encoding: PostingEncoding::Delta { decoder, cid: 0 },
             abundance_decoder,
+            abundance_width: crate::abundance::width(self.abundance_log_base),
         })
     }
 }
@@ -413,10 +425,11 @@ enum PostingEncoding {
 struct DatasetPostingReader {
     encoding: PostingEncoding,
     abundance_decoder: Option<PostingDecoder>,
+    abundance_width: usize,
 }
 
 impl DatasetPostingReader {
-    fn next(&mut self) -> Result<Option<(u64, Option<u8>)>> {
+    fn next(&mut self) -> Result<Option<(u64, Option<u64>)>> {
         let cid = match &mut self.encoding {
             PostingEncoding::Delta { decoder, cid } => {
                 let Some(delta) = read_varint_u64_from_reader(decoder)? else {
@@ -459,9 +472,7 @@ impl DatasetPostingReader {
             },
         };
         let abundance = if let Some(decoder) = self.abundance_decoder.as_mut() {
-            let mut deviation = [0u8; 1];
-            decoder.read_exact(&mut deviation)?;
-            Some(deviation[0])
+            Some(crate::abundance::read_code(decoder, self.abundance_width)?)
         } else {
             None
         };
@@ -803,6 +814,7 @@ pub struct GgcatRebuildConfig {
     pub use_unitigs: bool,
     pub use_matchtigs: bool,
     pub use_eulertigs: bool,
+    pub use_simplitigs: bool,
     pub restore_abundance: bool,
     pub output_compression: OutputCompression,
     pub color_set_operation: Option<ColorSetOperation>,
@@ -811,7 +823,7 @@ pub struct GgcatRebuildConfig {
 impl Default for GgcatRebuildConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             threads: 1,
             memory_gb: 8,
             k: 31,
@@ -819,6 +831,7 @@ impl Default for GgcatRebuildConfig {
             use_unitigs: false,
             use_matchtigs: false,
             use_eulertigs: false,
+            use_simplitigs: false,
             restore_abundance: false,
             output_compression: OutputCompression::Zstd,
             color_set_operation: None,
@@ -935,6 +948,7 @@ fn resolve_rebuild_mode(
     use_unitigs: bool,
     use_matchtigs: bool,
     use_eulertigs: bool,
+    use_simplitigs: bool,
 ) -> RebuildMode {
     if use_unitigs {
         RebuildMode::Unitig
@@ -942,8 +956,10 @@ fn resolve_rebuild_mode(
         RebuildMode::Matchtig
     } else if use_eulertigs {
         RebuildMode::Eulertig
-    } else {
+    } else if use_simplitigs {
         RebuildMode::Simplitig
+    } else {
+        RebuildMode::Unitig
     }
 }
 
@@ -997,97 +1013,39 @@ fn color_set_output_path(
     normalize_out_dir(out_dir).join(format!("Dump_{}{}", operation, compression.fasta_suffix()))
 }
 
-fn collect_dump_fastas(
-    out_dir: &str,
-    compression: OutputCompression,
-) -> std::io::Result<Vec<PathBuf>> {
-    let out_dir_path = normalize_out_dir(out_dir);
-    let suffix = compression.fasta_suffix();
-    let mut dump_files = Vec::new();
-    for entry_result in fs::read_dir(&out_dir_path)? {
-        let entry = entry_result?;
-        let path = entry.path();
-        let is_dump = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.starts_with("Dump_") && name.ends_with(suffix))
-            .unwrap_or(false);
-        if is_dump {
-            dump_files.push(path);
-        }
+fn run_ggcat_rebuild(input: &Path, output: &Path, cfg: &GgcatRebuildConfig) -> Result<()> {
+    // Empty datasets/intersections are valid: emit an empty, valid compressed
+    // stream without asking GGCAT to build a graph without k-mers.
+    if input.metadata()?.len() == 0 {
+        return FastaOutputWriter::create(output, cfg.output_compression)?.finish();
     }
-    dump_files.sort();
-    Ok(dump_files)
-}
-
-fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result<()> {
-    if cfg.restore_abundance {
-        eprintln!(
-            "Warning: decompressed Dump_* files retain abundance headers; the combined GGCAT rebuild output does not preserve per-dataset abundance."
-        );
-    }
-    let mode = resolve_rebuild_mode(cfg.use_unitigs, cfg.use_matchtigs, cfg.use_eulertigs);
-    let dump_fastas = collect_dump_fastas(out_dir, cfg.output_compression)?;
-    if dump_fastas.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no decompressed Dump_* files found to rebuild with ggcat",
-        ));
-    }
-
-    let out_dir_path = ensure_output_dir(out_dir)?;
-
-    let rebuilt_output = out_dir_path.join(format!(
-        "rebuilt_{}{}",
-        rebuild_mode_name(mode),
-        cfg.output_compression.fasta_suffix()
-    ));
+    let mode = resolve_rebuild_mode(
+        cfg.use_unitigs,
+        cfg.use_matchtigs,
+        cfg.use_eulertigs,
+        cfg.use_simplitigs,
+    );
+    let output_root = output.parent().unwrap_or_else(|| Path::new("."));
+    let scratch = tempfile::Builder::new()
+        .prefix(".kloe-rebuild-")
+        .tempdir_in(output_root)?;
     let temp_dir = if cfg.temp_dir.is_empty() {
-        out_dir_path.join("ggcat_rebuild_tmp")
+        scratch.path().join("ggcat")
     } else {
         PathBuf::from(&cfg.temp_dir)
     };
     fs::create_dir_all(&temp_dir)?;
-
-    // GGCAT supports plain, gzip, and zstd FASTA streams, but not xz. Keep xz
-    // available to users by staging plain FASTA inputs and recompressing the
-    // rebuilt graph. The temporary directory is removed automatically.
-    let xz_bridge = if cfg.output_compression == OutputCompression::Xz {
-        Some(
-            tempfile::Builder::new()
-                .prefix("kloe-xz-rebuild-")
-                .tempdir_in(&temp_dir)?,
-        )
-    } else {
-        None
-    };
-    let rebuild_inputs = if let Some(bridge) = xz_bridge.as_ref() {
-        let mut inputs = Vec::with_capacity(dump_fastas.len());
-        for (index, dump) in dump_fastas.iter().enumerate() {
-            let staged = bridge.path().join(format!("input_{index}.fa"));
-            let mut reader = xz2::read::XzDecoder::new(BufReader::new(File::open(dump)?));
-            let mut writer = BufWriter::new(File::create(&staged)?);
-            io::copy(&mut reader, &mut writer)?;
-            writer.flush()?;
-            inputs.push(staged);
-        }
-        inputs
-    } else {
-        dump_fastas
-    };
-    let ggcat_output = xz_bridge
-        .as_ref()
-        .map(|bridge| {
-            bridge
-                .path()
-                .join(format!("rebuilt_{}.fa", rebuild_mode_name(mode)))
-        })
-        .unwrap_or_else(|| rebuilt_output.clone());
-
-    let ggcat_memory_gb = cfg.memory_gb.max(1);
+    // GGCAT cannot write xz; its input is always our private plain FASTA.
+    let graph_output = scratch
+        .path()
+        .join(if cfg.output_compression == OutputCompression::Xz {
+            "graph.fa".to_string()
+        } else {
+            format!("graph{}", cfg.output_compression.fasta_suffix())
+        });
     let instance = GGCATInstance::create(GGCATConfig {
-        temp_dir: Some(temp_dir.clone()),
-        memory: ggcat_memory_gb as f64,
+        temp_dir: Some(temp_dir),
+        memory: cfg.memory_gb.max(1) as f64,
         prefer_memory: false,
         total_threads_count: cfg.threads.max(1),
         intermediate_compression_level: None,
@@ -1095,27 +1053,19 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
         messages_callback: None,
     })
     .map_err(|err| io::Error::other(format!("create ggcat instance: {err}")))?;
-
-    let streams = rebuild_inputs
-        .iter()
-        .map(|dump| {
-            let resolved = fs::canonicalize(dump).unwrap_or_else(|_| dump.clone());
-            GeneralSequenceBlockData::FASTA((resolved, None))
-        })
-        .collect::<Vec<_>>();
-
     println!(
-        "Running embedded ggcat rebuild: output={}, mode={}, k={}, threads={}, memory={}GB",
-        rebuilt_output.display(),
+        "Rebuilding {} independently: mode={}, k={}",
+        output.display(),
         rebuild_mode_name(mode),
         cfg.k,
-        cfg.threads.max(1),
-        ggcat_memory_gb
     );
     let graph_path = instance
         .build_graph(
-            streams,
-            ggcat_output,
+            vec![GeneralSequenceBlockData::FASTA((
+                fs::canonicalize(input)?,
+                None,
+            ))],
+            graph_output,
             None,
             None,
             cfg.k,
@@ -1128,23 +1078,190 @@ fn run_ggcat_rebuild(out_dir: &str, cfg: &GgcatRebuildConfig) -> std::io::Result
             None,
         )
         .map_err(|err| io::Error::other(format!("run ggcat rebuild: {err}")))?;
-
-    if xz_bridge.is_some() {
+    let ready = if cfg.output_compression == OutputCompression::Xz {
+        let path = scratch.path().join("graph.fa.xz");
         let mut reader = BufReader::new(File::open(&graph_path)?);
-        let mut writer = FastaOutputWriter::create(&rebuilt_output, OutputCompression::Xz)?;
+        let mut writer = FastaOutputWriter::create(&path, OutputCompression::Xz)?;
         io::copy(&mut reader, &mut writer)?;
         writer.finish()?;
-    }
-
-    println!(
-        "ggcat rebuild complete: {} (mode={})",
-        rebuilt_output.display(),
-        rebuild_mode_name(mode)
-    );
+        path
+    } else {
+        graph_path
+    };
+    // Publish only a completed output, on the same filesystem.
+    fs::rename(ready, output)?;
     Ok(())
 }
 
+fn archive_rebuild_k(archive_root: &Path, fallback: usize) -> Result<usize> {
+    let path = archive_root.join(crate::compress::ARCHIVE_MANIFEST_FILE);
+    if !path.exists() {
+        return Ok(fallback);
+    }
+    let mut header = [0u8; 44];
+    File::open(path)?.read_exact(&mut header)?;
+    if &header[..4] != b"KLM4" || u32::from_le_bytes(header[4..8].try_into().unwrap()) != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported archive manifest",
+        ));
+    }
+    let k = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    if k == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive k must be positive",
+        ));
+    }
+    Ok(k)
+}
+
+/// Rebuild each selected dataset separately; only explicit set operations
+/// combine datasets. Stored FASTA exists exclusively in a private scratch dir.
 pub fn decompress_with_options(
+    size_filename: &String,
+    color_id_filename: &String,
+    tigs_filename: &String,
+    positions_filename: &String,
+    filename_id: &String,
+    out_dir: &String,
+    wanted_files_path: &String,
+    input_dir: String,
+    mut cfg: GgcatRebuildConfig,
+) -> Result<()> {
+    let archive_root = Path::new(&input_dir);
+    let input_dir = format!("{}/", archive_root.display());
+    if !cfg.enabled {
+        return decompress_stored_with_options(
+            size_filename,
+            color_id_filename,
+            tigs_filename,
+            positions_filename,
+            filename_id,
+            out_dir,
+            wanted_files_path,
+            input_dir,
+            cfg,
+        );
+    }
+    if cfg.restore_abundance {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rebuilding tigs cannot preserve per-record abundance; use --stored-tigs with --abundance",
+        ));
+    }
+    cfg.k = archive_rebuild_k(archive_root, cfg.k)?;
+    let mode = resolve_rebuild_mode(
+        cfg.use_unitigs,
+        cfg.use_matchtigs,
+        cfg.use_eulertigs,
+        cfg.use_simplitigs,
+    );
+    if mode != RebuildMode::Unitig {
+        eprintln!("Warning: {} mode is experimental and has not yet been benchmarked in KLOE. Unitigs are the default.", rebuild_mode_name(mode));
+    }
+    let output_root = ensure_output_dir(out_dir)?;
+    let scratch_root = if cfg.temp_dir.is_empty() {
+        output_root.clone()
+    } else {
+        PathBuf::from(&cfg.temp_dir)
+    };
+    fs::create_dir_all(&scratch_root)?;
+    // Keep this root alive throughout every call: GGCAT caches its initial
+    // configuration for the process lifetime.
+    let operation_scratch = tempfile::Builder::new()
+        .prefix(".kloe-decompress-")
+        .tempdir_in(scratch_root)?;
+    if cfg.temp_dir.is_empty() {
+        cfg.temp_dir = operation_scratch.path().join("ggcat").display().to_string();
+    }
+
+    let mut stored_cfg = cfg.clone();
+    stored_cfg.enabled = false;
+    stored_cfg.output_compression = OutputCompression::Fasta;
+    if let Some(operation) = cfg.color_set_operation {
+        let stage = operation_scratch.path().join("set");
+        let stage_dir = stage.display().to_string();
+        decompress_stored_with_options(
+            size_filename,
+            color_id_filename,
+            tigs_filename,
+            positions_filename,
+            filename_id,
+            &stage_dir,
+            wanted_files_path,
+            input_dir,
+            stored_cfg,
+        )?;
+        let input = color_set_output_path(&stage_dir, operation, OutputCompression::Fasta);
+        let output = output_root.join(format!(
+            "Dump_{}.{}{}",
+            operation,
+            rebuild_mode_name(mode),
+            cfg.output_compression.fasta_suffix(),
+        ));
+        return run_ggcat_rebuild(&input, &output, &cfg);
+    }
+
+    let names_path = archive_root.join(filename_id);
+    let selected = if wanted_files_path.is_empty() {
+        load_archive_filenames(&names_path.display().to_string())?
+    } else if archive_root.join(FILENAME_INDEX_FILE).is_file() {
+        indexed_required_datasets(
+            &archive_root.join(FILENAME_INDEX_FILE),
+            &names_path,
+            wanted_files_path,
+        )?
+    } else {
+        select_wanted_filenames(
+            &load_archive_filenames(&names_path.display().to_string())?,
+            wanted_files_path,
+        )?
+    };
+    for (name, dataset_id) in selected {
+        let stage = tempfile::Builder::new()
+            .prefix("dataset-")
+            .tempdir_in(operation_scratch.path())?;
+        let stage_dir = stage.path().display().to_string();
+        let wanted_path = stage.path().join("wanted.txt");
+        let mut wanted = File::create(&wanted_path)?;
+        writeln!(wanted, "{name}")?;
+        drop(wanted);
+        decompress_stored_with_options(
+            size_filename,
+            color_id_filename,
+            tigs_filename,
+            positions_filename,
+            filename_id,
+            &stage_dir,
+            &wanted_path.display().to_string(),
+            input_dir.clone(),
+            stored_cfg.clone(),
+        )?;
+        let input = dump_output_path(&stage_dir, &name, OutputCompression::Fasta);
+        // Legacy readers may omit an empty dataset's output.
+        if !input.exists() {
+            File::create(&input)?;
+        }
+        let stem = Path::new(&name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        // Stable archive IDs prevent collisions between equal basenames, even
+        // across separate targeted queries into the same output directory.
+        let output = output_root.join(format!(
+            "Dump_{}_{}.{}{}",
+            dataset_id,
+            stem,
+            rebuild_mode_name(mode),
+            cfg.output_compression.fasta_suffix(),
+        ));
+        run_ggcat_rebuild(&input, &output, &cfg)?;
+    }
+    Ok(())
+}
+
+fn decompress_stored_with_options(
     size_filename: &String,
     color_id_filename: &String,
     tigs_filename: &String,
@@ -1202,9 +1319,6 @@ pub fn decompress_with_options(
                 "color-set union/intersection requires an indexed KLOE archive",
             ));
         }
-        if ggcat_cfg.enabled {
-            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
-        }
         return Ok(());
     }
     if !wanted_files_path.is_empty()
@@ -1226,9 +1340,6 @@ pub fn decompress_with_options(
             ggcat_cfg.restore_abundance,
             ggcat_cfg.output_compression,
         )?;
-        if ggcat_cfg.enabled {
-            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
-        }
         return Ok(());
     }
     if wanted_files_path.is_empty()
@@ -1250,9 +1361,6 @@ pub fn decompress_with_options(
                 ggcat_cfg.restore_abundance,
                 ggcat_cfg.output_compression,
             )?;
-        }
-        if ggcat_cfg.enabled {
-            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
         }
         return Ok(());
     }
@@ -1290,9 +1398,6 @@ pub fn decompress_with_options(
             ggcat_cfg.restore_abundance,
             ggcat_cfg.output_compression,
         )?;
-        if ggcat_cfg.enabled {
-            run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
-        }
         return Ok(());
     }
 
@@ -1365,9 +1470,6 @@ pub fn decompress_with_options(
             cid_to_id_map,
             ggcat_cfg.output_compression,
         )?;
-    }
-    if ggcat_cfg.enabled {
-        run_ggcat_rebuild(out_dir, &ggcat_cfg)?;
     }
     Ok(())
 }
@@ -1454,7 +1556,7 @@ fn decompress_indexed_color_set(
         .iter()
         .map(|(_, dataset_id)| postings.posting_reader(*dataset_id))
         .collect::<Result<Vec<_>>>()?;
-    let mut heap = BinaryHeap::<Reverse<(u64, usize, u8)>>::new();
+    let mut heap = BinaryHeap::<Reverse<(u64, usize, u64)>>::new();
     for (reader_index, reader) in readers.iter_mut().enumerate() {
         if let Some((cid, abundance)) = reader.next()? {
             heap.push(Reverse((cid, reader_index, abundance.unwrap_or(0))));
@@ -1634,7 +1736,7 @@ fn decompress_indexed_selected_batch(
         .iter()
         .map(|(_, dataset_id)| postings.posting_reader(*dataset_id))
         .collect::<Result<Vec<_>>>()?;
-    let mut heap = BinaryHeap::<Reverse<(u64, usize, u8)>>::new();
+    let mut heap = BinaryHeap::<Reverse<(u64, usize, u64)>>::new();
     for (reader_index, reader) in readers.iter_mut().enumerate() {
         if let Some((cid, abundance)) = reader.next()? {
             heap.push(Reverse((cid, reader_index, abundance.unwrap_or(0))));
@@ -1656,7 +1758,12 @@ fn decompress_indexed_selected_batch(
             archive_root.join(ABUNDANCE_BASE_FILE),
             archive_root.join(ABUNDANCE_BASE_INDEX_FILE),
         )?;
-        if reader.logical_len() != positions.entries.saturating_sub(1) {
+        if reader.logical_len()
+            != positions
+                .entries
+                .saturating_sub(1)
+                .saturating_mul(crate::abundance::width(abundance_log_base) as u64)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "abundance base stream does not match archive CID count",
@@ -1704,10 +1811,12 @@ fn decompress_indexed_selected_batch(
         }
 
         if let Some(reader) = abundance_bases.as_mut() {
-            let mut base = [0u8; 1];
-            reader.read_exact_at(cid, &mut base)?;
+            let width = crate::abundance::width(abundance_log_base);
+            let mut bytes = [0u8; 8];
+            reader.read_exact_at(cid * width as u64, &mut bytes[..width])?;
+            let base = u64::from_le_bytes(bytes);
             for (_, code) in &mut targets {
-                *code = base[0].wrapping_add(*code);
+                *code = crate::abundance::restore_code(base, *code, abundance_log_base.unwrap());
             }
         }
 
@@ -1766,12 +1875,12 @@ fn decompress_indexed_selected_batch(
                 abundance_log_base,
             })?;
             if let Some(sequences) = decoded.abundance_sequences.as_ref() {
-                let mut rendered = HashMap::<u8, Vec<u8>>::new();
+                let mut rendered = HashMap::<u64, Vec<u8>>::new();
                 for &(target, code) in &targets {
                     let fasta = if let Some(existing) = rendered.get(&code) {
                         existing
                     } else {
-                        let abundance = crate::compress::decode_abundance(
+                        let abundance = crate::abundance::decode(
                             code,
                             abundance_log_base.expect("abundance checked above"),
                         );
@@ -1869,7 +1978,7 @@ fn decompress_sidecar(
         ));
     }
     if restore_abundance {
-        println!("Restoring logarithmically discretized abundance values in FASTA headers");
+        println!("Restoring archived abundance values in FASTA headers");
     }
     let tig_positions = preload_tig_positions(positions_filename)?;
     if tig_positions.len() != sidecar.len().saturating_add(1) {
@@ -2048,7 +2157,7 @@ struct DecodeJob {
     sizes: Vec<usize>,
     encoded: Vec<u8>,
     dataset_ids: Arc<Vec<u32>>,
-    abundance_codes: Option<Arc<Vec<u8>>>,
+    abundance_codes: Option<Arc<Vec<u64>>>,
     abundance_log_base: Option<f64>,
 }
 
@@ -2058,7 +2167,7 @@ struct DecodedBatch {
     fasta: Arc<Vec<u8>>,
     abundance_sequences: Option<Arc<DecodedSequences>>,
     dataset_ids: Arc<Vec<u32>>,
-    abundance_codes: Option<Arc<Vec<u8>>>,
+    abundance_codes: Option<Arc<Vec<u64>>>,
     abundance_log_base: Option<f64>,
 }
 
@@ -2389,7 +2498,7 @@ fn dispatch_write_batch(
         return Ok(());
     }
     let mut shard_ids = (0..writer_senders.len())
-        .map(|_| Vec::<(u32, Option<u8>)>::new())
+        .map(|_| Vec::<(u32, Option<u64>)>::new())
         .collect::<Vec<_>>();
     for (index, &file_id) in batch.dataset_ids.iter().enumerate() {
         let shard = *writer_routes.get(file_id as usize).ok_or_else(|| {
@@ -2422,7 +2531,7 @@ fn dispatch_write_batch(
         codes.sort_unstable();
         codes.dedup();
         for code in codes {
-            let abundance = crate::compress::decode_abundance(code, log_base);
+            let abundance = crate::abundance::decode(code, log_base);
             let fasta = Arc::new(build_abundance_fasta(sequences, abundance)?);
             for (shard, memberships) in shard_ids.iter().enumerate() {
                 let dataset_ids = memberships
@@ -2577,13 +2686,13 @@ mod parallel_decompression_tests {
             sizes: vec![5, 3],
             encoded: vec![0xe4, 0x00, 0x1b],
             dataset_ids: Arc::new(vec![0]),
-            abundance_codes: Some(Arc::new(vec![code])),
+            abundance_codes: Some(Arc::new(vec![u64::from(code)])),
             abundance_log_base: Some(1.05),
         })
         .unwrap();
         assert!(decoded.fasta.is_empty());
         let sequences = decoded.abundance_sequences.unwrap();
-        let abundance = crate::compress::decode_abundance(code, 1.05);
+        let abundance = crate::abundance::decode(u64::from(code), 1.05);
         let fasta = build_abundance_fasta(&sequences, abundance).unwrap();
         assert_eq!(fasta, b"> ka:f:17\nACGTA\n> ka:f:17\nTGC\n");
     }
