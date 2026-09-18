@@ -1035,14 +1035,17 @@ fn run_ggcat_rebuild(input: &Path, output: &Path, cfg: &GgcatRebuildConfig) -> R
         PathBuf::from(&cfg.temp_dir)
     };
     fs::create_dir_all(&temp_dir)?;
-    // GGCAT cannot write xz; its input is always our private plain FASTA.
-    let graph_output = scratch
-        .path()
-        .join(if cfg.output_compression == OutputCompression::Xz {
-            "graph.fa".to_string()
-        } else {
-            format!("graph{}", cfg.output_compression.fasta_suffix())
-        });
+    // GGCAT writes gzip directly, but does not support zstd or xz output.
+    // Rebuild those formats as plain FASTA, then explicitly compress them.
+    let needs_compression = matches!(
+        cfg.output_compression,
+        OutputCompression::Zstd | OutputCompression::Xz
+    );
+    let graph_output = scratch.path().join(if needs_compression {
+        "graph.fa".to_string()
+    } else {
+        format!("graph{}", cfg.output_compression.fasta_suffix())
+    });
     let instance = GGCATInstance::create(GGCATConfig {
         temp_dir: Some(temp_dir),
         memory: cfg.memory_gb.max(1) as f64,
@@ -1078,10 +1081,12 @@ fn run_ggcat_rebuild(input: &Path, output: &Path, cfg: &GgcatRebuildConfig) -> R
             None,
         )
         .map_err(|err| io::Error::other(format!("run ggcat rebuild: {err}")))?;
-    let ready = if cfg.output_compression == OutputCompression::Xz {
-        let path = scratch.path().join("graph.fa.xz");
+    let ready = if needs_compression {
+        let path = scratch
+            .path()
+            .join(format!("graph{}", cfg.output_compression.fasta_suffix()));
         let mut reader = BufReader::new(File::open(&graph_path)?);
-        let mut writer = FastaOutputWriter::create(&path, OutputCompression::Xz)?;
+        let mut writer = FastaOutputWriter::create(&path, cfg.output_compression)?;
         io::copy(&mut reader, &mut writer)?;
         writer.finish()?;
         path
