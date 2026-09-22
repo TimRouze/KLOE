@@ -81,7 +81,7 @@ struct Args {
         default_value_t = decompress::OutputCompression::Zstd
     )]
     output_compression: decompress::OutputCompression,
-    /// Emit one FASTA containing the union or intersection of colors listed with -Q
+    /// Emit one FASTA for a set operation on colors listed with -Q (difference: first minus rest)
     #[arg(long = "color-set-operation", alias = "colors-operation", value_enum)]
     color_set_operation: Option<decompress::ColorSetOperation>,
     /// Join archive containers without rebuilding the graph or removing shared redundancy
@@ -90,15 +90,21 @@ struct Args {
     /// Compress: preserve abundance fields; decompress: restore them in FASTA headers
     #[arg(long = "abundance", default_value_t = false)]
     abundance: bool,
+    /// Decompress: keep only k-mers with decoded abundance strictly above this integer
+    #[arg(long = "abundance-threshold")]
+    abundance_threshold: Option<u64>,
     /// Compress: preserve integer abundance exactly, without quantization or saturation
-    #[arg(long = "abundance-exact", conflicts_with_all = ["abundance_bits", "abundance_log_base"])]
+    #[arg(long = "abundance-exact", conflicts_with_all = ["abundance_bits", "abundance_max"])]
     abundance_exact: bool,
-    /// Abundance quantization precision, from 4 to 8 bits (not bit-packed storage)
-    #[arg(long = "abundance-bits", default_value_t = 8, value_parser = clap::value_parser!(u8).range(4..=8))]
+    /// Store rounded abundance directly as u16; reject values rounding above 65535
+    #[arg(long = "abundance-u16", conflicts_with_all = ["abundance_exact", "abundance_bits", "abundance_max"])]
+    abundance_u16: bool,
+    /// Abundance bits: exact integers if the maximum fits, otherwise automatic logarithmic encoding
+    #[arg(long = "abundance-bits", default_value_t = 8, requires = "abundance", value_parser = clap::value_parser!(u8).range(2..=32))]
     abundance_bits: u8,
-    /// Override the logarithm base (default: 50000^(1/(2^bits-2)))
-    #[arg(long = "abundance-log-base")]
-    abundance_log_base: Option<f64>,
+    /// Maximum abundance; larger values are capped before storage
+    #[arg(long = "abundance-max", alias = "max-abundance", default_value_t = 50000, requires = "abundance", value_parser = clap::value_parser!(u64).range(1..))]
+    abundance_max: u64,
 }
 fn main() {
     let args = Args::parse();
@@ -127,8 +133,12 @@ fn main() {
         std::process::exit(1);
     }
     if let Some(do_decompress) = args.decompress {
-        if args.abundance_exact && do_decompress != "compress" {
-            eprintln!("Error: --abundance-exact is a compression option; decompress with --stored-tigs --abundance.");
+        if args.abundance_threshold.is_some() && do_decompress != "decompress" {
+            eprintln!("Error: --abundance-threshold is a decompression option.");
+            std::process::exit(2);
+        }
+        if (args.abundance_exact || args.abundance_u16) && do_decompress != "compress" {
+            eprintln!("Error: --abundance-exact and --abundance-u16 are compression options; decompress with --stored-tigs --abundance.");
             std::process::exit(2);
         }
         let Some(memory) = args.memory else {
@@ -165,6 +175,7 @@ fn main() {
                 use_eulertigs,
                 use_simplitigs: args.simplitig,
                 restore_abundance: args.abundance,
+                abundance_threshold: args.abundance_threshold,
                 output_compression: args.output_compression,
                 color_set_operation: args.color_set_operation,
             };
@@ -202,13 +213,12 @@ fn main() {
             let ggcat_cfg = compress::GgcatCompressionConfig {
                 memory_gb: memory,
                 temp_dir,
-                abundance_log_base: (args.abundance && !args.abundance_exact).then(|| {
-                    args.abundance_log_base.unwrap_or_else(|| {
-                        compress::default_abundance_log_base(args.abundance_bits)
-                    })
-                }),
+                abundance_log_base: None,
                 abundance_bits: args.abundance_bits,
+                abundance_max: (args.abundance && !args.abundance_exact && !args.abundance_u16)
+                    .then_some(args.abundance_max),
                 abundance_exact: args.abundance_exact,
+                abundance_u16: args.abundance_u16,
                 use_simplitigs: args.simplitig,
             };
             if let Err(err) = compress::compress_with_ggcat(
@@ -337,6 +347,9 @@ mod tests {
     }
 
     fn parse_fasta_sequences(path: &Path) -> Vec<String> {
+        if fs::metadata(path).expect("stat FASTA").len() == 0 {
+            return Vec::new();
+        }
         let file = File::open(path).expect("open fasta");
         let (mut reader, _) =
             niffler::get_reader(Box::new(file)).expect("detect fasta compression");
@@ -918,6 +931,89 @@ mod tests {
     }
 
     #[test]
+    fn abundance_threshold_requires_metadata_and_nonnegative_integer() {
+        use super::Args;
+        use clap::Parser;
+        assert!(Args::try_parse_from(["kloe", "decompress", "--abundance-threshold", "-1"]).is_err());
+        assert!(Args::try_parse_from(["kloe", "decompress", "--abundance-threshold", "1.5"]).is_err());
+        assert_eq!(Args::try_parse_from(["kloe", "decompress", "--abundance-threshold", "0"])
+            .unwrap().abundance_threshold, Some(0));
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let wanted = fixture.archive_dir.join("wanted_threshold.txt");
+        fs::write(&wanted, format!("{}\n", fixture.file1.display())).unwrap();
+        for operation in [None, Some(decompress::ColorSetOperation::Union)] {
+            let output = fixture._workdir.path().join(format!("no_metadata_{operation:?}"));
+            let result = decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(output.display().to_string() + "/"),
+                &wanted.display().to_string(), fixture.archive_dir.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false, abundance_threshold: Some(0),
+                    color_set_operation: operation,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains("abundance metadata"));
+        }
+    }
+
+    #[test]
+    fn selected_color_differences_match_kmer_set_algebra() {
+        use decompress::{ColorSetOperation as Op, OutputCompression};
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let _ggcat_guard = ggcat_test_lock();
+        let files = [&fixture.file1, &fixture.file2, &fixture.file3];
+        let sets = [&fixture.expected1, &fixture.expected2, &fixture.expected3]
+            .map(|seqs| kmer_set_from_seqs(seqs, K));
+        // Check operand order, duplicate operands, and more than two operands,
+        // both as stored tigs and after rebuilding the selected graph.
+        for (case, operands) in [vec![0, 1], vec![1, 0], vec![0, 0], vec![0, 1, 2]]
+            .into_iter().enumerate()
+        {
+            let wanted = fixture.archive_dir.join(format!("wanted_difference_{case}.txt"));
+            fs::write(&wanted, operands.iter()
+                .map(|&i| format!("{}\n\n", files[i].display())).collect::<String>()).unwrap();
+            for op in [Op::Difference, Op::SymmetricDifference] {
+                let mut expected = sets[operands[0]].clone();
+                for &i in &operands[1..] {
+                    expected = match op {
+                        Op::Difference => expected.difference(&sets[i]).cloned().collect(),
+                        Op::SymmetricDifference => expected.symmetric_difference(&sets[i]).cloned().collect(),
+                        _ => unreachable!(),
+                    };
+                }
+                for rebuilt in [false, true] {
+                    let output = fixture._workdir.path().join(format!("out_{op}_{case}_{rebuilt}"));
+                    fs::create_dir_all(&output).unwrap();
+                    decompress::decompress_with_options(
+                        &"bucket_sizes.txt".to_string(),
+                        &"id_to_color_id.txt.zst".to_string(),
+                        &"tigs_kloe.fa".to_string(),
+                        &"positions_kloe.bin".to_string(),
+                        &"filenames_id.txt".to_string(),
+                        &(output.display().to_string() + "/"),
+                        &wanted.display().to_string(),
+                        fixture.archive_dir.display().to_string() + "/",
+                        decompress::GgcatRebuildConfig {
+                            enabled: rebuilt, threads: 1, memory_gb: 1, k: K,
+                            temp_dir: output.join("tmp").display().to_string(),
+                            use_unitigs: true,
+                            output_compression: OutputCompression::Zstd,
+                            color_set_operation: Some(op),
+                            ..decompress::GgcatRebuildConfig::default()
+                        },
+                    ).unwrap();
+                    let suffix = if rebuilt { ".unitigs.fa.zst" } else { ".fa.zst" };
+                    let observed = parse_fasta_sequences(&output.join(format!("Dump_{op}{suffix}")));
+                    assert_eq!(kmer_set_from_seqs(&observed, K), expected,
+                        "operation={op}, operands={operands:?}, rebuilt={rebuilt}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decompression_unitig_mode_rebuilds_actual_unitigs() {
         let fixture = setup_multi_fixture("simplitigs", multi_case_records());
         let _ggcat_guard = ggcat_test_lock();
@@ -1240,7 +1336,7 @@ mod tests {
 
     #[test]
     fn abundance_precision_modes_roundtrip() {
-        for bits in 4..=8 {
+        for bits in [2, 4, 5, 6, 7, 8, 16, 32] {
             check_abundance_archive_roundtrip(bits, compress::default_abundance_log_base(bits));
         }
     }
@@ -1251,6 +1347,24 @@ mod tests {
     }
 
     #[test]
+    fn u16_abundance_archive_roundtrip() {
+        for simplitig in [false, true] {
+            check_abundance_archive_roundtrip_mode(16, crate::abundance::EXACT_BASE, simplitig);
+        }
+    }
+
+    #[test]
+    fn u16_abundance_cli_rejects_conflicting_encodings() {
+        use clap::Parser;
+        assert!(super::Args::try_parse_from(["kloe", "compress", "--abundance-u16"]).unwrap().abundance_u16);
+        for extra in [vec!["--abundance-exact"], vec!["--abundance-bits", "16"], vec!["--abundance-max", "500"]] {
+            let mut args = vec!["kloe", "compress", "--abundance-u16"];
+            args.extend(extra);
+            assert!(super::Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn exact_abundance_cli_rejects_quantization_options() {
         use clap::Parser;
         assert!(
@@ -1258,7 +1372,7 @@ mod tests {
                 .unwrap()
                 .abundance_exact
         );
-        for option in [["--abundance-bits", "8"], ["--abundance-log-base", "1.1"]] {
+        for option in [["--abundance-bits", "8"], ["--abundance-max", "500"]] {
             assert!(super::Args::try_parse_from([
                 "kloe",
                 "compress",
@@ -1272,15 +1386,27 @@ mod tests {
 
     #[test]
     fn exact_abundance_many_values_and_merge_preserve_targeted_kmers() {
-        check_many_abundances_and_merge(false);
+        check_many_abundances_and_merge(false, false, None);
     }
 
     #[test]
     fn simplitig_exact_abundance_and_merge_preserve_targeted_kmers() {
-        check_many_abundances_and_merge(true);
+        check_many_abundances_and_merge(true, false, None);
     }
 
-    fn check_many_abundances_and_merge(use_simplitigs: bool) {
+    #[test]
+    fn u16_abundance_merge_preserves_targeted_kmers() {
+        check_many_abundances_and_merge(false, true, None);
+    }
+
+    #[test]
+    fn dense_quantized_abundance_merge_preserves_decoded_values() {
+        for bits in [8, 14] {
+            check_many_abundances_and_merge(false, false, Some(bits));
+        }
+    }
+
+    fn check_many_abundances_and_merge(use_simplitigs: bool, u16_mode: bool, log_bits: Option<u8>) {
         use std::collections::BTreeMap;
         let _ggcat_guard = ggcat_test_lock();
         let work = tempfile::tempdir().unwrap();
@@ -1299,11 +1425,19 @@ mod tests {
                 }
                 let value = if dataset == 0 {
                     index as u64 + 1
+                } else if log_bits.is_some() {
+                    50_000 - index as u64
+                } else if u16_mode {
+                    u16::MAX as u64 - index as u64
                 } else {
                     u64::MAX - index as u64
                 };
                 inputs[dataset].push_str(&format!(">r{index} ka:f:{value}\n{sequence}\n"));
-                expected[dataset].insert(canonical_kmer(&sequence), value);
+                let decoded = log_bits.map_or(value, |bits| {
+                    let base = compress::default_abundance_log_base(bits);
+                    compress::decode_abundance(compress::encode_abundance_with_bits(value, base, bits), base)
+                });
+                expected[dataset].insert(canonical_kmer(&sequence), decoded);
             }
         }
         fs::write(&first, &inputs[0]).unwrap();
@@ -1335,7 +1469,10 @@ mod tests {
                 compress::GgcatCompressionConfig {
                     memory_gb: 1,
                     temp_dir: work.path().join("tmp").display().to_string(),
-                    abundance_exact: true,
+                    abundance_exact: !u16_mode && log_bits.is_none(),
+                    abundance_u16: u16_mode,
+                    abundance_bits: log_bits.unwrap_or(8),
+                    abundance_max: log_bits.map(|_| 50_000),
                     use_simplitigs,
                     ..compress::GgcatCompressionConfig::default()
                 },
@@ -1406,26 +1543,79 @@ mod tests {
     }
 
     #[test]
+    fn automatic_abundance_roundtrips_exact_logarithmic_and_capped_values() {
+        let _ggcat_guard = ggcat_test_lock();
+        let work = tempfile::tempdir().unwrap();
+        for (bits, maximum) in [(8, 50_000u64), (10, 50_000), (12, 50_000), (14, 50_000), (4, 500), (8, 255), (8, 256),
+                                (9, 500), (16, 50_000), (32, 1_000_000), (2, 3)] {
+            let dir = work.path().join(format!("{bits}-{maximum}"));
+            let archive = dir.join("archive");
+            fs::create_dir_all(&archive).unwrap();
+            let first = dir.join("first.fa");
+            let second = dir.join("second.fa");
+            let value = (maximum / 3).max(1);
+            fs::write(&first, format!(">a ka:f:{value}.25\nACGTACGTACGTACGT\n")).unwrap();
+            fs::write(&second, format!(">b ka:f:{}\nACGTACGTACGTACGT\n", maximum + 100)).unwrap();
+            let fof = dir.join("input.fof");
+            fs::write(&fof, format!("{}\n{}\n", first.display(), second.display())).unwrap();
+            compress::compress_with_ggcat(
+                &(archive.display().to_string() + "/"), &fof.display().to_string(),
+                1, 7, 5, 10, false, false, false, false, false,
+                compress::GgcatCompressionConfig {
+                    memory_gb: 1, temp_dir: work.path().join("tmp").display().to_string(),
+                    abundance_bits: bits, abundance_max: Some(maximum),
+                    ..compress::GgcatCompressionConfig::default()
+                },
+            ).unwrap();
+            let output = dir.join("out");
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(output.display().to_string() + "/"),
+                &String::new(), archive.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false, restore_abundance: true,
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            ).unwrap();
+            let encoding = crate::abundance::Encoding::automatic(bits, maximum).unwrap();
+            let expected_first = if encoding.base == crate::abundance::EXACT_BASE { value }
+                else { compress::decode_abundance(compress::encode_abundance_with_bits(value, encoding.base, bits), encoding.base) };
+            for (source, expected) in [(&first, expected_first), (&second, maximum)] {
+                let dump = make_dump_path(&output, source);
+                assert_kmer_equivalent(&["ACGTACGTACGTACGT".to_string()], &dump, 7);
+                for header in fs::read_to_string(dump).unwrap().lines().filter(|line| line.starts_with('>')) {
+                    assert_eq!(crate::abundance::parse_header(header.as_bytes()).unwrap(), expected,
+                        "bits={bits}, maximum={maximum}, source={source:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn abundance_precision_cli_accepts_only_supported_bits() {
         use clap::Parser;
         let defaults = super::Args::try_parse_from(["kloe", "compress", "--abundance"]).unwrap();
         assert_eq!(defaults.abundance_bits, 8);
-        assert_eq!(defaults.abundance_log_base, None);
-        for bits in 4..=8 {
+        assert_eq!(defaults.abundance_max, 50_000);
+        assert!(super::Args::try_parse_from(["kloe", "compress", "--abundance", "--abundance-max", "0"]).is_err());
+        assert!(super::Args::try_parse_from(["kloe", "compress", "--abundance-bits", "16"]).is_err());
+        for bits in [2, 4, 5, 6, 7, 8, 16, 32] {
             let args = super::Args::try_parse_from([
                 "kloe",
                 "compress",
                 "--abundance",
                 "--abundance-bits",
                 &bits.to_string(),
-                "--abundance-log-base",
-                "1.1",
+                "--abundance-max",
+                "500",
             ])
             .unwrap();
             assert_eq!(args.abundance_bits, bits);
-            assert_eq!(args.abundance_log_base, Some(1.1));
+            assert_eq!(args.abundance_max, 500);
         }
-        for bits in ["0", "3", "9", "255"] {
+        for bits in ["0", "1", "33", "255"] {
             assert!(super::Args::try_parse_from([
                 "kloe",
                 "compress",
@@ -1443,7 +1633,7 @@ mod tests {
 
     #[test]
     fn simplitig_quantized_abundance_roundtrip() {
-        for bits in 4..=8 {
+        for bits in [2, 4, 5, 6, 7, 8, 16, 32] {
             check_abundance_archive_roundtrip_mode(
                 bits,
                 compress::default_abundance_log_base(bits),
@@ -1454,6 +1644,7 @@ mod tests {
 
     fn check_abundance_archive_roundtrip_mode(bits: u8, base: f64, use_simplitigs: bool) {
         let exact = base == crate::abundance::EXACT_BASE;
+        let u16_mode = exact && bits == 16;
         let _ggcat_guard = ggcat_test_lock();
         let workdir = tempfile::tempdir().expect("create temp workdir");
         let archive = workdir.path().join("archive");
@@ -1462,9 +1653,10 @@ mod tests {
         fs::create_dir_all(&output).unwrap();
         let first = workdir.path().join("abundance_a.fa");
         let second = workdir.path().join("abundance_b.fa");
-        let first_value = if exact { 9_007_199_254_740_993u64 } else { 17 };
-        let second_value = if exact { u64::MAX } else { 50_000 };
-        fs::write(&first, format!(">a ka:f:{first_value}\nACGTACGTACGTACGT\n")).unwrap();
+        let first_value = if u16_mode { 6143 } else if exact { 9_007_199_254_740_993u64 } else { 17 };
+        let second_value = if u16_mode { u16::MAX as u64 } else if exact { u64::MAX } else { 50_000 };
+        let first_header = if u16_mode { "6142.75".to_string() } else { first_value.to_string() };
+        fs::write(&first, format!(">a ka:f:{first_header}\nACGTACGTACGTACGT\n")).unwrap();
         fs::write(
             &second,
             format!(">b ka:f:{second_value}\nACGTACGTACGTACGT\n"),
@@ -1489,7 +1681,9 @@ mod tests {
                 temp_dir: workdir.path().join("tmp").display().to_string(),
                 abundance_log_base: (!exact).then_some(base),
                 abundance_bits: bits,
-                abundance_exact: exact,
+                abundance_max: None,
+                abundance_exact: exact && !u16_mode,
+                abundance_u16: u16_mode,
                 use_simplitigs,
             },
         )
@@ -1545,6 +1739,64 @@ mod tests {
             second_dump.contains(&format!("ka:f:{restored_max}")),
             "{second_dump}"
         );
+        // Both colors share their k-mers but have different abundances. Filtering
+        // must restore each residual with its CID base before comparing values.
+        for (case, (targeted, headers, rebuilt, threshold)) in [
+            (true, true, false, restored_17),
+            (false, false, false, restored_17),
+            (true, false, true, restored_17),
+            (true, false, false, restored_max),
+        ].into_iter().enumerate() {
+            let filtered = workdir.path().join(format!("filtered_{case}"));
+            let wanted_path = if targeted { wanted.display().to_string() } else { String::new() };
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(filtered.display().to_string() + "/"),
+                &wanted_path, archive.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: rebuilt, threads: 1, memory_gb: 1, k: 7,
+                    temp_dir: workdir.path().join("filter_tmp").display().to_string(),
+                    restore_abundance: headers, abundance_threshold: Some(threshold),
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            ).unwrap();
+            for (id, source) in [&first, &second].into_iter().enumerate() {
+                let path = if rebuilt {
+                    filtered.join(format!("Dump_{id}_{}.unitigs.fa", source.file_stem().unwrap().to_str().unwrap()))
+                } else { make_dump_path(&filtered, source) };
+                let sequences = parse_fasta_sequences(&path);
+                let expected = if id == 1 && restored_max > threshold {
+                    vec!["ACGTACGTACGTACGT".to_string()]
+                } else { vec![] };
+                assert_eq!(kmer_set_from_seqs(&sequences, 7), kmer_set_from_seqs(&expected, 7));
+                if !headers { assert!(!fs::read_to_string(path).unwrap().contains("ka:f:")); }
+            }
+        }
+        for op in [decompress::ColorSetOperation::Union, decompress::ColorSetOperation::Intersection,
+                   decompress::ColorSetOperation::Difference, decompress::ColorSetOperation::SymmetricDifference] {
+            let filtered = workdir.path().join(format!("filtered_{op}"));
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(filtered.display().to_string() + "/"),
+                &wanted.display().to_string(), archive.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false, abundance_threshold: Some(restored_17),
+                    color_set_operation: Some(op),
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            ).unwrap();
+            let observed = parse_fasta_sequences(&filtered.join(format!("Dump_{op}.fa")));
+            let expected = match op {
+                decompress::ColorSetOperation::Union | decompress::ColorSetOperation::SymmetricDifference =>
+                    vec!["ACGTACGTACGTACGT".to_string()],
+                _ => vec![],
+            };
+            assert_eq!(kmer_set_from_seqs(&observed, 7), kmer_set_from_seqs(&expected, 7), "filtered {op}");
+        }
     }
 
     #[test]

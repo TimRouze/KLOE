@@ -1270,7 +1270,7 @@ pub fn merge_archives_with_config(
         compress::GgcatCompressionConfig {
             memory_gb,
             temp_dir: cfg.temp_dir.clone(),
-            abundance_log_base,
+            abundance_log_base: abundance_log_base.map(|encoding| encoding.base),
             use_simplitigs: cfg.use_simplitigs,
             ..compress::GgcatCompressionConfig::default()
         },

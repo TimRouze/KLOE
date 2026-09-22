@@ -184,25 +184,93 @@ of the selected graph representation. Select one of:
 - `xz`, using the suffix `.fa.xz`
 - `fasta` (aliases: `uncompressed`, `fa`), using the suffix `.fa`
 
-#### color-set union and intersection (`--color-set-operation`)
+#### color-set operations (`--color-set-operation`)
 Use `-Q/--wanted-files` to provide the archived dataset names (one per line),
-then select `--color-set-operation union` or `--color-set-operation intersection`.
+then select `--color-set-operation union`, `intersection`, `difference`, or
+`symmetric-difference`. Difference keeps k-mers from the **first** listed dataset
+that are absent from all subsequent datasets. With two datasets, symmetric
+difference keeps k-mers present in exactly one; with more datasets it keeps k-mers
+present in an odd number of listed datasets. Repeated names count as repeated
+operands for these two operations, so comparing a dataset with itself yields an
+empty difference or symmetric difference. Blank lines are ignored.
 KLOE selects the qualifying color classes and rebuilds their combined graph,
-producing one file: `Dump_union.<mode>.fa.zst` or
-`Dump_intersection.<mode>.fa.zst` with the default compression. Every requested
+producing one file: `Dump_<operation>.<mode>.fa.zst` with the default compression.
+For example, use `--color-set-operation difference` for first minus second, or
+`--color-set-operation symmetric-difference` for their exclusive union. Every requested
 color must exist in the archive. An empty result produces a valid empty file. This
 operation is available for indexed KLOE archives and cannot be combined with
 `--abundance`.
 
-#### abundance quantization (`--abundance`)
-During compression, `--abundance-bits 4|5|6|7|8` selects the quantization
-precision (default: 8). The default logarithm base is
-`50000^(1/(2^bits-2))`, so the highest code decodes to 50,000 in every mode;
-larger input abundances saturate at that level. Fewer bits give coarser
-approximations. `--abundance-log-base` overrides this base and therefore changes
-the representable range. Codes retain the existing byte-based, zstd-compressed
-storage: this option does not pack each code into the selected number of bits.
-The base is saved in the archive, so decompression needs no precision option.
+#### filtering by abundance (`--abundance-threshold`)
+During decompression, `--abundance-threshold N` keeps only k-mers whose decoded
+per-dataset abundance is **strictly greater than** the nonnegative integer N.
+For example, `--abundance-threshold 10` excludes abundance 10 and below.
+The archive must contain abundance metadata. Filtering works with full or
+targeted output, stored tigs, and rebuilt graphs; it does not require `--abundance`.
+Add `--stored-tigs --abundance` if the retained abundances should appear in FASTA
+headers. For color-set operations, the threshold is applied to each dataset
+**before** union, intersection, difference, or symmetric difference.
+An empty result produces a valid empty output file.
+
+For logarithmic archives the comparison uses the reconstructed integer abundance,
+so quantization can affect membership near the threshold. Direct-u16 and exact
+integer archives compare their stored integers without logarithmic approximation.
+
+```sh
+./target/release/kloe decompress -c archive/ -o filtered/ -r 16 --abundance-threshold 10
+./target/release/kloe decompress -c archive/ -o difference/ -Q selected.txt -r 16 --color-set-operation difference --abundance-threshold 10
+```
+
+#### automatic abundance encoding (`--abundance`)
+During compression, choose `--abundance-bits B` (2–32, default **8**) and
+`--abundance-max M` (positive integer, default **50,000**; alias `--max-abundance`).
+KLOE automatically selects **exact integer storage** when `M <= 2^B - 1`.
+Otherwise it selects logarithmic encoding with base `M^(1/(2^B-2))`, reserving
+code zero for abundance zero and spanning abundances 1 through M with the
+remaining codes. There is no manual logarithm-base option.
+
+For example, `--abundance --abundance-bits 16` stores integers exactly with the
+default maximum; `--abundance --abundance-bits 8 --abundance-max 255` is also
+exact, while maximum 256 at 8 bits selects logarithmic encoding.
+Input abundance fields are rounded to integers, and values above M are capped
+at M in both modes. Exactness refers to rounded integer values within 0..M,
+not original fractional inputs or values above the configured ceiling.
+Codes use zstd-compressed, byte-aligned storage: precisions 2–8 use one byte,
+9–16 use two bytes, and 17–32 use four bytes. This option does not bit-pack
+sub-byte codes. The base and storage width are saved in the archive, so
+decompression needs no precision option. Existing byte-code archives remain
+compatible; wider archives require a reader supporting the new width flags.
+Exact integer modes and logarithmic precisions above 8 bits use an extra input
+pass to assign dense colors to observed (dataset, code) pairs rather than
+allocate all possible codes. Newly written exact 8/32-bit archives require
+this reader version. Older logarithmic and exact archives remain readable.
+
+Logarithmic code labels are densely numbered before compression: duplicate
+rounded representatives in the small-abundance part of the logarithmic grid
+share a label. This preserves every reconstructed abundance and the requested
+precision while avoiding large, mostly unused code values and inflated
+base/deviation metadata. The archive retains the logarithm base and explicitly
+marks the dense representation. Its signed differences use zigzag coding so
+small negative and positive differences both have small stored values.
+Readers predating this change reject the new
+flag; this reader still accepts older sparse-code archives. Merges require
+matching base, representation, and storage width.
+
+#### direct 16-bit abundance (`--abundance-u16`)
+This compression option rounds fractional abundance fields to integers using
+the same rule as quantized mode, then stores those integers directly in
+16-bit base/deviation metadata. It performs no logarithmic quantization and
+rejects any input rounding outside 0–65,535 instead of saturating it.
+`--abundance` is not additionally required. This mode is lossless for the
+rounded integers, not for the original fractional abundance values.
+
+The option conflicts with `--abundance-exact`, `--abundance-bits`, and
+`--abundance-max`. This explicit legacy mode remains available; normally use
+automatic selection with `--abundance --abundance-bits 16` instead.
+Restore with `--stored-tigs --abundance`. New `u16`
+archives require this reader version; old logarithmic and exact `u64`
+archives remain readable. Abundance-enabled graph merge requires matching
+encodings, including integer storage width.
 
 #### exact integer abundance (`--abundance-exact`)
 During compression, `--abundance-exact` enables lossless integer abundance
@@ -211,7 +279,7 @@ required. Integers through `18446744073709551615` (`u64::MAX`) are supported
 without saturation. Integral decimal/scientific notation (e.g. `17.0`, `5e4`)
 is accepted; fractional, negative, out-of-range, and missing abundances are
 rejected. Parsing does not pass through floating point. This option conflicts
-with `--abundance-bits` and `--abundance-log-base`.
+with `--abundance-bits` and `--abundance-max`.
 
 Exact values use zstd-compressed 64-bit base/deviation metadata, retaining
 shared sequence buckets and indexed targeted decompression. Construction makes
@@ -222,7 +290,7 @@ quantization. Conflicting abundances for the same k-mer within one dataset
 are rejected, as in quantized abundance mode.
 
 Restore exact abundances with `--stored-tigs --abundance`; the archive identifies
-the encoding automatically. Graph-rebuilding output and union/intersection
+the encoding automatically. Graph-rebuilding output and color-set
 queries cannot currently restore abundance annotations. Exact archives require
 this version or newer; existing quantized archives remain readable. For
 abundance-enabled graph merge, both archives must use exact abundance, or both
@@ -232,7 +300,7 @@ must use quantization with the same logarithmic base.
 Normal decompression rebuilds **each requested dataset independently**, producing
 one output file per dataset. Select at most one of `--unitig` (default),
 `--simplitig`, `--matchtig`, or `--eulertig`. These options do not combine datasets;
-only an explicit union/intersection query produces a combined result.
+only an explicit color-set query produces a combined result.
 Unitigs are the default; simplitig, matchtig, and eulertig output modes are
 experimental and have not yet been benchmarked in KLOE.
 

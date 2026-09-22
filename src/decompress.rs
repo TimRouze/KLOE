@@ -1,3 +1,4 @@
+use crate::abundance::Encoding;
 use core::panic;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
@@ -180,7 +181,7 @@ struct DatasetPostingIndex {
     index: File,
     data_path: PathBuf,
     dataset_count: u64,
-    abundance_log_base: Option<f64>,
+    abundance_log_base: Option<Encoding>,
     adaptive: bool,
     cid_count: Option<u64>,
     majority_frame: Option<(u64, u64)>,
@@ -230,6 +231,8 @@ impl DatasetPostingIndex {
             & !(DATASET_TO_CID_FLAG_ABUNDANCE
                 | DATASET_TO_CID_FLAG_ADAPTIVE
                 | crate::abundance::EXACT_FLAG
+                | crate::abundance::WIDTH_FLAGS
+                | crate::abundance::DENSE_FLAG
                 | DATASET_TO_CID_FLAG_MAJORITY)
             != 0
         {
@@ -239,7 +242,9 @@ impl DatasetPostingIndex {
             ));
         }
         let exact = flags[0] & crate::abundance::EXACT_FLAG != 0;
-        if exact && flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE == 0 {
+        if flags[0] & (crate::abundance::EXACT_FLAG | crate::abundance::WIDTH_FLAGS | crate::abundance::DENSE_FLAG) != 0
+            && flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "exact flag requires abundance metadata",
@@ -257,7 +262,7 @@ impl DatasetPostingIndex {
                     "invalid abundance log base",
                 ));
             }
-            Some(base)
+            Some(Encoding::from_flags(base, flags[0])?)
         } else {
             None
         };
@@ -816,6 +821,7 @@ pub struct GgcatRebuildConfig {
     pub use_eulertigs: bool,
     pub use_simplitigs: bool,
     pub restore_abundance: bool,
+    pub abundance_threshold: Option<u64>,
     pub output_compression: OutputCompression,
     pub color_set_operation: Option<ColorSetOperation>,
 }
@@ -833,6 +839,7 @@ impl Default for GgcatRebuildConfig {
             use_eulertigs: false,
             use_simplitigs: false,
             restore_abundance: false,
+            abundance_threshold: None,
             output_compression: OutputCompression::Zstd,
             color_set_operation: None,
         }
@@ -877,6 +884,8 @@ impl OutputCompression {
 pub enum ColorSetOperation {
     Union,
     Intersection,
+    Difference,
+    SymmetricDifference,
 }
 
 impl std::fmt::Display for ColorSetOperation {
@@ -884,6 +893,8 @@ impl std::fmt::Display for ColorSetOperation {
         f.write_str(match self {
             Self::Union => "union",
             Self::Intersection => "intersection",
+            Self::Difference => "difference",
+            Self::SymmetricDifference => "symmetric-difference",
         })
     }
 }
@@ -1216,6 +1227,7 @@ pub fn decompress_with_options(
             &archive_root.join(FILENAME_INDEX_FILE),
             &names_path,
             wanted_files_path,
+            true,
         )?
     } else {
         select_wanted_filenames(
@@ -1291,7 +1303,7 @@ fn decompress_stored_with_options(
         if wanted_files_path.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "a color-set union or intersection requires a non-empty wanted-files list",
+                "a color-set operation requires a non-empty wanted-files list",
             ));
         }
         if ggcat_cfg.restore_abundance {
@@ -1317,11 +1329,12 @@ fn decompress_stored_with_options(
                 out_dir,
                 operation,
                 ggcat_cfg.output_compression,
+                ggcat_cfg.abundance_threshold,
             )?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "color-set union/intersection requires an indexed KLOE archive",
+                "color-set operations require an indexed KLOE archive",
             ));
         }
         return Ok(());
@@ -1344,6 +1357,7 @@ fn decompress_stored_with_options(
             out_dir,
             ggcat_cfg.restore_abundance,
             ggcat_cfg.output_compression,
+            ggcat_cfg.abundance_threshold,
         )?;
         return Ok(());
     }
@@ -1365,6 +1379,7 @@ fn decompress_stored_with_options(
                 out_dir,
                 ggcat_cfg.restore_abundance,
                 ggcat_cfg.output_compression,
+                ggcat_cfg.abundance_threshold,
             )?;
         }
         return Ok(());
@@ -1402,14 +1417,15 @@ fn decompress_stored_with_options(
             ggcat_cfg.threads,
             ggcat_cfg.restore_abundance,
             ggcat_cfg.output_compression,
+            ggcat_cfg.abundance_threshold,
         )?;
         return Ok(());
     }
 
-    if ggcat_cfg.restore_abundance {
+    if ggcat_cfg.restore_abundance || ggcat_cfg.abundance_threshold.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--abundance was requested but this legacy archive has no abundance metadata",
+            "abundance output/filtering was requested but this legacy archive has no abundance metadata",
         ));
     }
 
@@ -1506,6 +1522,7 @@ fn indexed_required_datasets(
     filename_index_path: &Path,
     filename_table_path: &Path,
     wanted_files_path: &str,
+    deduplicate: bool,
 ) -> Result<Vec<(String, u32)>> {
     let filename_index = FilenameIndex::open(filename_index_path, filename_table_path)?;
     let wanted_reader = BufReader::new(File::open(wanted_files_path)?);
@@ -1523,7 +1540,7 @@ fn indexed_required_datasets(
                 format!("selected color '{name}' was not found in the archive"),
             )
         })?;
-        if seen.insert(dataset_id) {
+        if !deduplicate || seen.insert(dataset_id) {
             selected.push((name.to_owned(), dataset_id));
         }
     }
@@ -1547,16 +1564,30 @@ fn decompress_indexed_color_set(
     out_dir: &str,
     operation: ColorSetOperation,
     output_compression: OutputCompression,
+    abundance_threshold: Option<u64>,
 ) -> Result<()> {
     let selected = indexed_required_datasets(
         &archive_root.join(FILENAME_INDEX_FILE),
         Path::new(filename_table_path),
         wanted_files_path,
+        matches!(operation, ColorSetOperation::Union | ColorSetOperation::Intersection),
     )?;
     let postings = DatasetPostingIndex::open(
         &archive_root.join(FILENAME_INDEX_FILE),
         &archive_root.join(DATASET_TO_CID_FILE),
     )?;
+    let threshold_encoding = if abundance_threshold.is_some() {
+        Some(postings.abundance_log_base.ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--abundance-threshold requires an archive with abundance metadata",
+        ))?)
+    } else {
+        None
+    };
+    let mut abundance_bases = threshold_encoding.map(|_| PackedTigsReader::open_indexed(
+        archive_root.join(ABUNDANCE_BASE_FILE),
+        archive_root.join(ABUNDANCE_BASE_INDEX_FILE),
+    )).transpose()?;
     let mut readers = selected
         .iter()
         .map(|(_, dataset_id)| postings.posting_reader(*dataset_id))
@@ -1584,8 +1615,23 @@ fn decompress_indexed_color_set(
     let mut selected_cids = 0u64;
     let mut total_tigs = 0u64;
 
-    while let Some(Reverse((cid, reader_index, _))) = heap.pop() {
-        let mut membership_count = 1usize;
+    while let Some(Reverse((cid, reader_index, code))) = heap.pop() {
+        let mut base = 0;
+        if let Some(reader) = abundance_bases.as_mut() {
+            let width = crate::abundance::width(threshold_encoding);
+            let mut bytes = [0u8; 8];
+            reader.read_exact_at(cid * width as u64, &mut bytes[..width])?;
+            base = u64::from_le_bytes(bytes);
+        }
+        let passes = |code| match (abundance_threshold, threshold_encoding) {
+            (Some(threshold), Some(encoding)) => {
+                let restored = crate::abundance::restore_code(base, code, encoding);
+                crate::abundance::decode(restored, encoding) > threshold
+            }
+            _ => true,
+        };
+        let mut membership_count = usize::from(passes(code));
+        let mut contains_first = reader_index == 0 && membership_count > 0;
         if let Some((next_cid, abundance)) = readers[reader_index].next()? {
             heap.push(Reverse((next_cid, reader_index, abundance.unwrap_or(0))));
         }
@@ -1593,15 +1639,20 @@ fn decompress_indexed_color_set(
             .peek()
             .is_some_and(|Reverse((next_cid, _, _))| *next_cid == cid)
         {
-            let Reverse((_, next_reader, _)) = heap.pop().unwrap();
-            membership_count += 1;
+            let Reverse((_, next_reader, code)) = heap.pop().unwrap();
+            if passes(code) {
+                membership_count += 1;
+                contains_first |= next_reader == 0;
+            }
             if let Some((next_cid, abundance)) = readers[next_reader].next()? {
                 heap.push(Reverse((next_cid, next_reader, abundance.unwrap_or(0))));
             }
         }
         let include = match operation {
-            ColorSetOperation::Union => true,
+            ColorSetOperation::Union => membership_count > 0,
             ColorSetOperation::Intersection => membership_count == selected.len(),
+            ColorSetOperation::Difference => contains_first && membership_count == 1,
+            ColorSetOperation::SymmetricDifference => membership_count % 2 == 1,
         };
         if !include {
             continue;
@@ -1686,6 +1737,7 @@ fn decompress_indexed_targeted(
     out_dir: &str,
     restore_abundance: bool,
     output_compression: OutputCompression,
+    abundance_threshold: Option<u64>,
 ) -> Result<()> {
     let selected = indexed_wanted_datasets(
         &archive_root.join(FILENAME_INDEX_FILE),
@@ -1707,6 +1759,7 @@ fn decompress_indexed_targeted(
             out_dir,
             restore_abundance,
             output_compression,
+            abundance_threshold,
         )?;
     }
     Ok(())
@@ -1722,18 +1775,19 @@ fn decompress_indexed_selected_batch(
     out_dir: &str,
     restore_abundance: bool,
     output_compression: OutputCompression,
+    abundance_threshold: Option<u64>,
 ) -> Result<()> {
     let postings = DatasetPostingIndex::open(
         &archive_root.join(FILENAME_INDEX_FILE),
         &archive_root.join(DATASET_TO_CID_FILE),
     )?;
-    if restore_abundance && postings.abundance_log_base.is_none() {
+    if (restore_abundance || abundance_threshold.is_some()) && postings.abundance_log_base.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--abundance was requested but this archive has no abundance metadata",
+            "abundance output/filtering was requested but this archive has no abundance metadata",
         ));
     }
-    let abundance_log_base = restore_abundance
+    let abundance_log_base = (restore_abundance || abundance_threshold.is_some())
         .then_some(postings.abundance_log_base)
         .flatten();
 
@@ -1824,6 +1878,13 @@ fn decompress_indexed_selected_batch(
                 *code = crate::abundance::restore_code(base, *code, abundance_log_base.unwrap());
             }
         }
+        if let Some(threshold) = abundance_threshold {
+            let encoding = abundance_log_base.expect("filter metadata checked above");
+            targets.retain(|(_, code)| crate::abundance::decode(*code, encoding) > threshold);
+            if targets.is_empty() {
+                continue;
+            }
+        }
 
         sizes.group_into(cid, &mut lengths)?;
         let (packed_start, packed_end) = positions.range(cid)?;
@@ -1848,7 +1909,8 @@ fn decompress_indexed_selected_batch(
                 .map(|(target, _)| *target as u32)
                 .collect::<Vec<_>>(),
         );
-        let target_codes = abundance_log_base
+        let output_encoding = if restore_abundance { abundance_log_base } else { None };
+        let target_codes = output_encoding
             .map(|_| Arc::new(targets.iter().map(|(_, code)| *code).collect::<Vec<_>>()));
         let mut packed_position = packed_start;
         let mut first = 0usize;
@@ -1877,7 +1939,7 @@ fn decompress_indexed_selected_batch(
                 encoded,
                 dataset_ids: Arc::clone(&target_ids),
                 abundance_codes: target_codes.as_ref().map(Arc::clone),
-                abundance_log_base,
+                abundance_log_base: output_encoding,
             })?;
             if let Some(sequences) = decoded.abundance_sequences.as_ref() {
                 let mut rendered = HashMap::<u64, Vec<u8>>::new();
@@ -1974,12 +2036,13 @@ fn decompress_sidecar(
     threads: usize,
     restore_abundance: bool,
     output_compression: OutputCompression,
+    abundance_threshold: Option<u64>,
 ) -> Result<()> {
     let sidecar = CidDatasetSidecar::open(sidecar_filename)?;
-    if restore_abundance && sidecar.abundance_log_base().is_none() {
+    if (restore_abundance || abundance_threshold.is_some()) && sidecar.abundance_log_base().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--abundance was requested but this archive has no abundance metadata",
+            "abundance output/filtering was requested but this archive has no abundance metadata",
         ));
     }
     if restore_abundance {
@@ -2015,6 +2078,18 @@ fn decompress_sidecar(
         .as_ref()
         .map_or(filenames.len(), HashSet::len)
         .max(1);
+    if abundance_threshold.is_some() {
+        // A filtered-out dataset still has a valid empty output, including
+        // compressed formats. Writers replace it if any records survive.
+        for (path, id) in filenames {
+            if wanted_ids.as_ref().is_none_or(|wanted| wanted.contains(id)) {
+                FastaOutputWriter::create(
+                    &dump_output_path(out_dir, path, output_compression),
+                    output_compression,
+                )?.finish()?;
+            }
+        }
+    }
     let thread_budget = threads.max(1);
     let writer_count = selected_datasets.min((thread_budget / 2).max(1)).min(32);
     let decoder_count = thread_budget.saturating_sub(writer_count).max(1).min(16);
@@ -2056,6 +2131,7 @@ fn decompress_sidecar(
             producer_filenames,
             wanted_ids,
             restore_abundance,
+            abundance_threshold,
             job_tx,
         )
     });
@@ -2163,7 +2239,7 @@ struct DecodeJob {
     encoded: Vec<u8>,
     dataset_ids: Arc<Vec<u32>>,
     abundance_codes: Option<Arc<Vec<u64>>>,
-    abundance_log_base: Option<f64>,
+    abundance_log_base: Option<Encoding>,
 }
 
 struct DecodedBatch {
@@ -2173,7 +2249,7 @@ struct DecodedBatch {
     abundance_sequences: Option<Arc<DecodedSequences>>,
     dataset_ids: Arc<Vec<u32>>,
     abundance_codes: Option<Arc<Vec<u64>>>,
-    abundance_log_base: Option<f64>,
+    abundance_log_base: Option<Encoding>,
 }
 
 struct DecodedSequences {
@@ -2201,6 +2277,7 @@ fn produce_decode_jobs(
     filename_count: usize,
     wanted_ids: Option<HashSet<u32>>,
     restore_abundance: bool,
+    abundance_threshold: Option<u64>,
     sender: crossbeam::channel::Sender<DecodeJob>,
 ) -> Result<DecompressionStats> {
     let mut sizes_reader = SequentialCompactSizesReader::open(size_filename)?;
@@ -2241,6 +2318,14 @@ fn produce_decode_jobs(
                 .as_ref()
                 .is_none_or(|wanted| wanted.contains(&file_id))
             {
+                if let Some(threshold) = abundance_threshold {
+                    let codes = group_abundance_codes.ok_or_else(|| io::Error::new(
+                        io::ErrorKind::InvalidData, "archive abundance metadata is incomplete"))?;
+                    if crate::abundance::decode(codes[membership_index],
+                        sidecar.abundance_log_base().expect("filter metadata checked above")) <= threshold {
+                        continue;
+                    }
+                }
                 selected_ids.push(file_id);
                 if abundance_log_base.is_some() {
                     let codes = group_abundance_codes.ok_or_else(|| {
@@ -2692,12 +2777,12 @@ mod parallel_decompression_tests {
             encoded: vec![0xe4, 0x00, 0x1b],
             dataset_ids: Arc::new(vec![0]),
             abundance_codes: Some(Arc::new(vec![u64::from(code)])),
-            abundance_log_base: Some(1.05),
+            abundance_log_base: Some(Encoding::quantized(1.05, 8)),
         })
         .unwrap();
         assert!(decoded.fasta.is_empty());
         let sequences = decoded.abundance_sequences.unwrap();
-        let abundance = crate::abundance::decode(u64::from(code), 1.05);
+        let abundance = crate::abundance::decode(code, Encoding::quantized(1.05, 8));
         let fasta = build_abundance_fasta(&sequences, abundance).unwrap();
         assert_eq!(fasta, b"> ka:f:17\nACGTA\n> ka:f:17\nTGC\n");
     }
