@@ -42,6 +42,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 ggcat-api = { path = "vendor/ggcat/crates/api" }
 ggcat_colors = { path = "vendor/ggcat/crates/colors" }
 libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+memchr = "2.7"
+blake3 = "1.8"
 
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }

@@ -1,7 +1,9 @@
 //! Exact integer abundance support. A base of 1 is an internal mode marker,
 //! accepted on disk only together with the exact-abundance format flag.
 use ggcat_api::{DnaSequence, DynamicSequencesStream, SequenceInfo, SequencesReader};
-use std::collections::BTreeMap;
+use hashbrown::HashMap;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -260,11 +262,64 @@ pub(crate) fn parse_header(header: &[u8]) -> io::Result<u64> {
 pub(crate) type ExactSources = Arc<Vec<(u32, u64)>>;
 
 pub(crate) struct ExactSequencesStream {
-    files: Vec<PathBuf>,
-    colors: Vec<BTreeMap<u64, u32>>,
+    files: Vec<SequenceSource>,
+    colors: Vec<AbundanceColors>,
     quantization: Option<(f64, u8)>,
     maximum: Option<u64>,
     storage: Option<Encoding>,
+    value_codes: Option<Arc<Vec<u64>>>,
+}
+
+// Dense dictionaries use one indexed load. Sparse large ranges stay hashed,
+// keeping lookup storage proportional to the number of observed values.
+enum AbundanceColors {
+    Dense(Vec<u32>),
+    Sparse(HashMap<u64, u32>),
+}
+
+impl AbundanceColors {
+    fn from_map(values: HashMap<u64, u32>) -> Self {
+        let extent = values.keys().copied().max().and_then(|n| n.checked_add(1));
+        if let Some(extent) =
+            extent.filter(|&n| n <= 1_000_000 && n <= values.len().saturating_mul(4) as u64)
+        {
+            let mut dense = vec![u32::MAX; extent as usize];
+            for (value, color) in values {
+                dense[value as usize] = color;
+            }
+            Self::Dense(dense)
+        } else {
+            Self::Sparse(values)
+        }
+    }
+
+    fn get(&self, value: u64) -> Option<u32> {
+        match self {
+            Self::Dense(values) => usize::try_from(value)
+                .ok()
+                .and_then(|i| values.get(i))
+                .copied()
+                .filter(|&n| n != u32::MAX),
+            Self::Sparse(values) => values.get(&value).copied(),
+        }
+    }
+}
+
+enum SequenceSource {
+    Local(PathBuf),
+    Logan(crate::logan::LoganSource),
+}
+
+impl SequenceSource {
+    fn read(&self, copyback: Option<usize>, callback: &mut dyn FnMut(DnaSequence)) -> io::Result<()> {
+        match self {
+            Self::Local(path) => {
+                SequencesReader::new().process_file_extended(path, callback, copyback, true, false);
+                Ok(())
+            }
+            Self::Logan(source) => source.read(copyback, true, callback),
+        }
+    }
 }
 
 impl ExactSequencesStream {
@@ -299,6 +354,132 @@ impl ExactSequencesStream {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "representatives do not fit the code container"));
         }
         Self::prepare_impl(files, memory_gb, Some((encoding.base, bits)), Some(maximum))
+    }
+
+    pub(crate) fn prepare_logan(
+        accessions: &[String],
+        memory_gb: usize,
+        quantization: Option<(f64, u8)>,
+        maximum: Option<u64>,
+        config: &crate::logan::LoganConfig,
+    ) -> io::Result<(Self, ExactSources)> {
+        if accessions.len() > u32::MAX as usize {
+            return Err(io::Error::other("too many abundance datasets"));
+        }
+        let storage = quantization
+            .zip(maximum)
+            .map(|((_, bits), maximum)| Encoding::automatic(bits, maximum))
+            .transpose()?;
+        let value_codes = Self::value_codes(quantization, maximum, storage);
+        let paths = accessions
+            .iter()
+            .map(|name| config.source(name))
+            .collect::<io::Result<Vec<_>>>()?;
+        let max_sources =
+            (memory_gb.max(1).saturating_mul(1024 * 1024 * 1024) / 8 / 96).min(u32::MAX as usize);
+        let reserved = AtomicUsize::new(0);
+        let pool = config.parallel_pool(paths.len())?;
+        // Indexed parallel collection preserves accession order, even if requests finish out of order.
+        let dictionaries = pool.install(|| {
+            paths
+                .par_iter()
+                .map(|source| {
+                    let mut values = HashMap::new();
+                    let mut ordered = Vec::new();
+                    let result = source.read_headers(&mut |sequence| {
+                        let value = Self::code_from_header(
+                            sequence.ident_data,
+                            quantization,
+                            maximum,
+                            storage,
+                            value_codes.as_deref().map(Vec::as_slice),
+                        )?;
+                        if let hashbrown::hash_map::Entry::Vacant(entry) = values.entry(value) {
+                            if reserved.fetch_add(1, Ordering::Relaxed) >= max_sources {
+                                return Err(io::Error::other(
+                                    "exact abundance dictionary exceeds its memory/color budget",
+                                ));
+                            }
+                            entry.insert(ordered.len() as u32);
+                            ordered.push(value);
+                        }
+                        Ok(())
+                    });
+                    if let Err(error) = result {
+                        config.record_error(&error);
+                        return Err(error);
+                    }
+                    Ok((values, ordered))
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })?;
+        let mut sources = Vec::with_capacity(reserved.load(Ordering::Relaxed));
+        let mut colors = Vec::with_capacity(paths.len());
+        for (dataset, (mut values, ordered)) in dictionaries.into_iter().enumerate() {
+            let offset = sources.len() as u32;
+            for color in values.values_mut() {
+                *color += offset;
+            }
+            sources.extend(
+                ordered
+                    .into_iter()
+                    .map(|value| ((dataset + 1) as u32, value)),
+            );
+            colors.push(AbundanceColors::from_map(values));
+        }
+        Ok((
+            Self {
+                files: paths.into_iter().map(SequenceSource::Logan).collect(),
+                colors,
+                quantization,
+                maximum,
+                storage,
+                value_codes,
+            },
+            Arc::new(sources),
+        ))
+    }
+
+    fn value_codes(
+        quantization: Option<(f64, u8)>,
+        maximum: Option<u64>,
+        storage: Option<Encoding>,
+    ) -> Option<Arc<Vec<u64>>> {
+        let (base, bits) = quantization?;
+        let maximum = maximum?;
+        if base == EXACT_BASE || maximum > 65_535 {
+            return None;
+        }
+        let encoding = storage?;
+        Some(Arc::new(
+            (0..=maximum)
+                .map(|value| {
+                    encoding.pack_log_code(crate::compress::encode_abundance_with_bits(
+                        value, base, bits,
+                    ))
+                })
+                .collect(),
+        ))
+    }
+
+    fn code_from_header(
+        header: &[u8],
+        quantization: Option<(f64, u8)>,
+        maximum: Option<u64>,
+        storage: Option<Encoding>,
+        table: Option<&[u64]>,
+    ) -> io::Result<u64> {
+        if let Some(table) = table {
+            return crate::compress::parse_header_abundance(header)
+                .map(|value| table[value.min((table.len() - 1) as u64) as usize])
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing supported abundance field",
+                    )
+                });
+        }
+        Self::code_with_max(header, quantization, maximum, storage)
     }
 
     fn code_with_max(header: &[u8], quantization: Option<(f64, u8)>, maximum: Option<u64>, storage: Option<Encoding>) -> io::Result<u64> {
@@ -358,9 +539,10 @@ impl ExactSequencesStream {
                 .map_err(|_| io::Error::other("too many exact-abundance datasets"))?;
             let path = std::fs::canonicalize(file)?;
             std::fs::File::open(&path)?;
-            let mut values = BTreeMap::new();
+            let source = SequenceSource::Local(path);
+            let mut values = HashMap::new();
             let mut error = None;
-            SequencesReader::new().process_file_extended(&path, |sequence| {
+            source.read(None, &mut |sequence| {
                 if error.is_some() { return; }
                 match Self::code_with_max(sequence.ident_data, quantization, maximum, storage) {
                     Ok(value) => {
@@ -373,14 +555,14 @@ impl ExactSequencesStream {
                             sources.push((dataset, value));
                         }
                     }
-                    Err(err) => error = Some(io::Error::new(err.kind(), format!("{}: {err}", path.display()))),
+                    Err(err) => error = Some(io::Error::new(err.kind(), format!("{file}: {err}"))),
                 }
-            }, None, true, false);
+            })?;
             if let Some(err) = error {
                 return Err(err);
             }
-            paths.push(path);
-            colors.push(values);
+            paths.push(source);
+            colors.push(AbundanceColors::from_map(values));
         }
         Ok((
             Self {
@@ -389,6 +571,7 @@ impl ExactSequencesStream {
                 quantization,
                 maximum,
                 storage,
+                value_codes: None,
             },
             Arc::new(sources),
         ))
@@ -397,7 +580,12 @@ impl ExactSequencesStream {
 
 impl DynamicSequencesStream for ExactSequencesStream {
     fn estimated_base_count(&self, block: usize) -> u64 {
-        std::fs::metadata(&self.files[block]).map_or(1, |meta| meta.len().max(1))
+        match &self.files[block] {
+            SequenceSource::Local(path) => {
+                std::fs::metadata(path).map_or(1, |meta| meta.len().max(1))
+            }
+            SequenceSource::Logan(source) => source.estimated_bases(),
+        }
     }
     fn read_block(
         &self,
@@ -406,24 +594,202 @@ impl DynamicSequencesStream for ExactSequencesStream {
         partial_read_copyback: Option<usize>,
         callback: &mut dyn FnMut(DnaSequence, SequenceInfo),
     ) {
-        SequencesReader::new().process_file_extended(
-            &self.files[block],
-            |sequence| {
-                let value = Self::code_with_max(sequence.ident_data, self.quantization, self.maximum, self.storage)
-                    .expect("validated exact abundance input changed");
-                let color = self.colors[block][&value];
-                callback(sequence, SequenceInfo { color: Some(color) });
-            },
-            partial_read_copyback,
-            true,
-            false,
-        );
+        let mut error = None;
+        let result = self.files[block].read(partial_read_copyback, &mut |sequence| {
+            if error.is_some() {
+                return;
+            }
+            match Self::code_from_header(
+                sequence.ident_data,
+                self.quantization,
+                self.maximum,
+                self.storage,
+                self.value_codes.as_deref().map(Vec::as_slice),
+            )
+            .and_then(|value| {
+                self.colors[block].get(value).ok_or_else(|| {
+                    io::Error::other("abundance values changed between input passes")
+                })
+            }) {
+                Ok(color) => callback(sequence, SequenceInfo { color: Some(color) }),
+                Err(err) => error = Some(err),
+            }
+        });
+        if let Some(error) = error.or_else(|| result.err()) {
+            match &self.files[block] {
+                SequenceSource::Logan(source) => source.record_error(error),
+                SequenceSource::Local(_) => panic!("abundance input failed: {error}"),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abundance_dictionaries_preserve_dense_sparse_and_missing_values() {
+        for entries in [
+            vec![(0, 1), (2, 4), (3, 5)],
+            vec![(1, 10), (50_000, 20), (u64::MAX, 30)],
+            vec![],
+        ] {
+            let colors = AbundanceColors::from_map(entries.iter().copied().collect());
+            for &(value, expected) in &entries {
+                assert_eq!(colors.get(value), Some(expected));
+            }
+            assert_eq!(colors.get(42), None);
+        }
+        assert!(matches!(
+            AbundanceColors::from_map([(0, 1), (2, 4)].into_iter().collect()),
+            AbundanceColors::Dense(_)
+        ));
+        assert!(matches!(
+            AbundanceColors::from_map([(u64::MAX, 3)].into_iter().collect()),
+            AbundanceColors::Sparse(_)
+        ));
+    }
+
+    #[test]
+    fn abundance_lookup_tables_match_original_rounding_capping_and_encoding() {
+        for maximum in [500, 5_000, 50_000] {
+            for bits in [4, 8, 14, 16] {
+                let encoding = Encoding::automatic(bits, maximum).unwrap();
+                let quantization = Some((encoding.base, bits));
+                let table =
+                    ExactSequencesStream::value_codes(quantization, Some(maximum), Some(encoding));
+                if encoding.base == EXACT_BASE {
+                    assert!(table.is_none());
+                    continue;
+                }
+                let table = table.unwrap();
+                for value in 0..=maximum {
+                    assert_eq!(
+                        table[value as usize],
+                        encoding.pack_log_code(crate::compress::encode_abundance_with_bits(
+                            value,
+                            encoding.base,
+                            bits
+                        ))
+                    );
+                }
+                for value in [
+                    "0", "0.49", "0.5", "1", "12.49", "12.5", "499.9", "5001", "50000.5", "999999",
+                    "NaN", "-1",
+                ] {
+                    let header = format!(">r ka:f:{value}");
+                    let reference = ExactSequencesStream::code_with_max(
+                        header.as_bytes(),
+                        quantization,
+                        Some(maximum),
+                        Some(encoding),
+                    );
+                    let optimized = ExactSequencesStream::code_from_header(
+                        header.as_bytes(),
+                        quantization,
+                        Some(maximum),
+                        Some(encoding),
+                        Some(&table),
+                    );
+                    match (reference, optimized) {
+                        (Ok(a), Ok(b)) => assert_eq!(a, b),
+                        (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind()),
+                        other => panic!("different encoding outcomes: {other:?}"),
+                    }
+                }
+            }
+        }
+        let encoding = Encoding::automatic(8, 1_000_000).unwrap();
+        assert!(ExactSequencesStream::value_codes(
+            Some((encoding.base, 8)),
+            Some(1_000_000),
+            Some(encoding)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn logan_abundance_scan_is_parallel_and_preserves_accession_order() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let config = crate::logan::LoganConfig::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            2,
+        )
+        .unwrap();
+        assert_eq!(config.parallel_pool(4).unwrap().current_num_threads(), 2);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = Vec::new();
+            // Neither response is released until both requests arrive.
+            // A sequential pre-scan cannot complete this fixture.
+            while requests.len() < 2 {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut request = String::new();
+                        reader.read_line(&mut request).unwrap();
+                        loop {
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                        }
+                        requests.push((request, stream));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "parallel requests did not arrive"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            requests.sort_by_key(|(request, _)| request.contains("SRR1"));
+            for (request, mut stream) in requests {
+                let fasta = if request.contains("SRR1") {
+                    ">a ka:f:7\nACGTACGT\n>b ka:f:11\nTGCATGCA\n>c ka:f:7\nACGTACGT\n"
+                } else {
+                    ">a ka:f:11\nACGTACGT\n>b ka:f:50001\nTGCATGCA\n"
+                };
+                let body = zstd::stream::encode_all(fasta.as_bytes(), 1).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let (stream, sources) = ExactSequencesStream::prepare_logan(
+            &["SRR1".to_owned(), "ERR2".to_owned()],
+            1,
+            Some((EXACT_BASE, 16)),
+            Some(50_000),
+            &config,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(&**sources, &[(1, 7), (1, 11), (2, 11), (2, 50_000)]);
+        assert_eq!(stream.colors[0].get(7), Some(0));
+        assert_eq!(stream.colors[0].get(11), Some(1));
+        assert_eq!(stream.colors[1].get(11), Some(2));
+        assert_eq!(stream.colors[1].get(50_000), Some(3));
+        assert_eq!(stream.estimated_base_count(0), 24);
+        assert_eq!(stream.estimated_base_count(1), 16);
+    }
 
     #[test]
     fn dense_log_codes_preserve_reconstruction_and_bit_budget() {

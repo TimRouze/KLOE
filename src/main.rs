@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod abundance;
+mod logan;
 mod compress;
 mod decompress;
 mod merge;
@@ -19,6 +20,15 @@ struct Args {
     ///Input file list (Compression)
     #[arg(short, long, default_value_t=String::from(""))]
     input_list: String,
+    /// Compress Logan unitigs directly from a list of SRR/ERR/DRR accessions
+    #[arg(long, conflicts_with = "input_list")]
+    logan_accessions: Option<String>,
+    /// Maximum simultaneous Logan downloads
+    #[arg(long, default_value_t = 4, requires = "logan_accessions", value_parser = clap::value_parser!(u16).range(1..))]
+    logan_downloads: u16,
+    /// Logan HTTP(S) bucket or mirror URL
+    #[arg(long, default_value = logan::DEFAULT_BASE_URL, requires = "logan_accessions")]
+    logan_base_url: String,
     /// Number of threads (defaults to 1)
     #[arg(short, long, default_value_t = num_cpus::get())]
     threads: usize,
@@ -113,7 +123,7 @@ fn main() {
     let input_dir = args.compressed_dir;
     let input_dir_b = args.compressed_dir_b;
     //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
-    let input_fof = args.input_list;
+    let input_fof = args.logan_accessions.clone().unwrap_or(args.input_list);
     let threads = args.threads;
     let temp_dir = args.temp_dir;
     let k = args.k_size;
@@ -133,6 +143,10 @@ fn main() {
         std::process::exit(1);
     }
     if let Some(do_decompress) = args.decompress {
+        if args.logan_accessions.is_some() && do_decompress != "compress" {
+            eprintln!("Error: --logan-accessions is a compression option.");
+            std::process::exit(2);
+        }
         if args.abundance_threshold.is_some() && do_decompress != "decompress" {
             eprintln!("Error: --abundance-threshold is a decompression option.");
             std::process::exit(2);
@@ -220,6 +234,10 @@ fn main() {
                 abundance_exact: args.abundance_exact,
                 abundance_u16: args.abundance_u16,
                 use_simplitigs: args.simplitig,
+                logan: args.logan_accessions.as_ref().map(|_| {
+                    logan::LoganConfig::new(&args.logan_base_url, usize::from(args.logan_downloads))
+                        .unwrap_or_else(|err| { eprintln!("Error: {err}"); std::process::exit(2); })
+                }),
             };
             if let Err(err) = compress::compress_with_ggcat(
                 &output_dir,
@@ -528,6 +546,7 @@ mod tests {
             false, // use_eulertigs
             compress::GgcatCompressionConfig {
                 use_simplitigs,
+                logan: None,
                 ..compress::GgcatCompressionConfig::default()
             },
         )?;
@@ -1627,6 +1646,162 @@ mod tests {
         }
     }
 
+    mod logan_streaming_tests {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::thread;
+        use std::time::Duration;
+
+        struct Server {
+            url: String,
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<thread::JoinHandle<()>>,
+        }
+
+        impl Server {
+            fn new(payloads: Vec<(&str, &str)>, failed_get: usize, truncated_get: usize) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                listener.set_nonblocking(true).unwrap();
+                let payloads: BTreeMap<_, _> = payloads.into_iter().map(|(name, fasta)| {
+                    // Logan/f2sz streams can consist of concatenated Zstandard frames.
+                    let split = fasta.len() / 2;
+                    let mut compressed = zstd::stream::encode_all(&fasta.as_bytes()[..split], 1).unwrap();
+                    compressed.extend(zstd::stream::encode_all(&fasta.as_bytes()[split..], 1).unwrap());
+                    (format!("/u/{name}/{name}.unitigs.fa.zst"), compressed)
+                }).collect();
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let seen = Arc::clone(&requests);
+                let stopping = Arc::clone(&stop);
+                let handle = thread::spawn(move || {
+                    let mut gets = 0;
+                    while !stopping.load(Ordering::Relaxed) {
+                        let (mut socket, _) = match listener.accept() {
+                            Ok(connection) => connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5)); continue;
+                            }
+                            Err(error) => panic!("{error}"),
+                        };
+                        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut reader = BufReader::new(socket.try_clone().unwrap());
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let parts: Vec<_> = line.split_whitespace().collect();
+                        if parts.len() < 2 { continue; }
+                        let (method, path) = (parts[0].to_owned(), parts[1].to_owned());
+                        seen.lock().unwrap().push((method.clone(), path.clone()));
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                        }
+                        if method == "GET" { gets += 1; }
+                        let body = payloads.get(&path);
+                        let missing = body.is_none() || (method == "GET" && gets == failed_get);
+                        let body = body.map(Vec::as_slice).unwrap_or(b"missing");
+                        let status = if missing { "404 Not Found" } else { "200 OK" };
+                        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        if method != "HEAD" {
+                            let body = if gets == truncated_get { &body[..body.len()/2] } else { body };
+                            let _ = socket.write_all(body);
+                        }
+                    }
+                });
+                Self { url, requests, stop, thread: Some(handle) }
+            }
+        }
+
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+
+        fn compress_logan(work: &Path, server: &Server, bits: Option<u8>) -> std::io::Result<()> {
+            let archive = work.join("archive");
+            fs::create_dir_all(&archive).unwrap();
+            let accessions = work.join("accessions.txt");
+            fs::write(&accessions, "SRR1\nERR2\n").unwrap();
+            compress::compress_with_ggcat(
+                &(archive.display().to_string() + "/"), &accessions.display().to_string(),
+                2, 7, 5, 10, false, false, true, false, false,
+                compress::GgcatCompressionConfig {
+                    memory_gb: 1, temp_dir: work.join("tmp").display().to_string(),
+                    abundance_bits: bits.unwrap_or(8), abundance_max: bits.map(|_| 50_000),
+                    logan: Some(crate::logan::LoganConfig::new(&server.url, 1).unwrap()),
+                    ..compress::GgcatCompressionConfig::default()
+                },
+            )
+        }
+
+        #[test]
+        fn logan_streaming_roundtrips_and_downloads_once_or_twice() {
+            let _guard = ggcat_test_lock();
+            let fasta_a = ">a ka:f:17.25\nacgtACGT\nACGTACGT\n";
+            let fasta_b = ">b km:f:50100\nTGCATGCATGCATGCA\n";
+            for bits in [None, Some(4), Some(8), Some(16)] {
+                let server = Server::new(vec![("SRR1", fasta_a), ("ERR2", fasta_b)], 0, 0);
+                let work = tempfile::tempdir().unwrap();
+                compress_logan(work.path(), &server, bits).unwrap();
+                let output = work.path().join("out");
+                decompress::decompress_with_options(
+                    &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                    &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                    &"filenames_id.txt".to_string(), &(output.display().to_string() + "/"),
+                    &String::new(), work.path().join("archive").display().to_string() + "/",
+                    decompress::GgcatRebuildConfig {
+                        enabled: false, restore_abundance: bits.is_some(),
+                        output_compression: decompress::OutputCompression::Fasta,
+                        ..decompress::GgcatRebuildConfig::default()
+                    },
+                ).unwrap();
+                for (accession, seq, value) in [("SRR1", "ACGTACGTACGTACGT", 17), ("ERR2", "TGCATGCATGCATGCA", 50_000)] {
+                    let dump = make_dump_path(&output, Path::new(accession));
+                    assert_kmer_equivalent(&[seq.to_owned()], &dump, 7);
+                    if let Some(bits) = bits {
+                        let encoding = crate::abundance::Encoding::automatic(bits, 50_000).unwrap();
+                        let expected = if encoding.base == crate::abundance::EXACT_BASE { value }
+                            else { compress::decode_abundance(compress::encode_abundance_with_bits(value, encoding.base, bits), encoding.base) };
+                        for header in fs::read_to_string(&dump).unwrap().lines().filter(|line| line.starts_with('>')) {
+                            assert_eq!(crate::abundance::parse_header(header.as_bytes()).unwrap(), expected);
+                        }
+                    }
+                    let path = format!("/u/{accession}/{accession}.unitigs.fa.zst");
+                    assert_eq!(server.requests.lock().unwrap().iter().filter(|(method, p)| method == "GET" && p == &path).count(), if bits.is_some() { 2 } else { 1 });
+                }
+                assert!(!work.path().join("SRR1.unitigs.fa.zst").exists());
+                assert!(!work.path().join("ERR2.unitigs.fa").exists());
+            }
+        }
+
+        #[test]
+        fn logan_failed_graph_download_never_creates_a_complete_archive() {
+            let _guard = ggcat_test_lock();
+            for (bits, failed_get, truncated_get) in [(None, 1, 0), (Some(8), 3, 0), (Some(16), 0, 3)] {
+                let server = Server::new(vec![("SRR1", ">a ka:f:10\nACGTACGTACGTACGT\n"), ("ERR2", ">b ka:f:20\nTGCATGCATGCATGCA\n")], failed_get, truncated_get);
+                let work = tempfile::tempdir().unwrap();
+                let error = compress_logan(work.path(), &server, bits).unwrap_err();
+                assert!(error.to_string().contains("Logan download failed"), "{error}");
+                assert!(!work.path().join("archive/manifest.kloe").exists());
+            }
+        }
+
+        #[test]
+        fn logan_cli_requires_an_accession_list_and_rejects_local_input_mix() {
+            use clap::Parser;
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt"]).is_ok());
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt", "-i", "local.fof"]).is_err());
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-downloads", "2"]).is_err());
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt", "--logan-downloads", "0"]).is_err());
+        }
+    }
+
     fn check_abundance_archive_roundtrip(bits: u8, base: f64) {
         check_abundance_archive_roundtrip_mode(bits, base, false);
     }
@@ -1685,6 +1860,7 @@ mod tests {
                 abundance_exact: exact && !u16_mode,
                 abundance_u16: u16_mode,
                 use_simplitigs,
+                logan: None,
             },
         )
         .unwrap();

@@ -1358,6 +1358,7 @@ pub struct GgcatCompressionConfig {
     pub abundance_exact: bool,
     pub abundance_u16: bool,
     pub use_simplitigs: bool,
+    pub(crate) logan: Option<crate::logan::LoganConfig>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1411,6 +1412,7 @@ impl Default for GgcatCompressionConfig {
             abundance_exact: false,
             abundance_u16: false,
             use_simplitigs: false,
+            logan: None,
         }
     }
 }
@@ -5717,6 +5719,9 @@ fn produce_ggcat_records(
     let capture_result = capture_thread
         .join()
         .map_err(|_| io::Error::other("GGCAT structured-output capture thread panicked"))?;
+    if let Some(logan) = &ggcat_cfg.logan {
+        logan.check()?;
+    }
     let records_output = build_result.map_err(|e| to_io_err("ggcat build_graph", e))?;
     let captured = capture_result?;
     log_phase_timing("ggcat.build_graph_api_call", ggcat_build_timer.finish());
@@ -6011,7 +6016,15 @@ pub fn compress_with_ggcat(
         );
     }
 
-    let filenames = read_input_fof_filenames(input_fof)?;
+    let filenames = if ggcat_cfg.logan.is_some() {
+        if Path::new(output_dir).join(ARCHIVE_MANIFEST_FILE).exists() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                "Logan streaming requires an output directory without an existing complete archive"));
+        }
+        crate::logan::read_accessions(Path::new(input_fof))?
+    } else {
+        read_input_fof_filenames(input_fof)?
+    };
     let mut ggcat_cfg = ggcat_cfg;
     let automatic_encoding = if let Some(maximum) = ggcat_cfg.abundance_max {
         if ggcat_cfg.abundance_u16 || ggcat_cfg.abundance_exact || ggcat_cfg.abundance_log_base.is_some() {
@@ -6024,7 +6037,34 @@ pub fn compress_with_ggcat(
         }
         Some(encoding)
     } else { None };
-    let (input_streams, source_dataset_ids) = if let Some(encoding) = automatic_encoding
+    let (input_streams, source_dataset_ids) = if let Some(logan) = &ggcat_cfg.logan {
+        let with_abundance = automatic_encoding.is_some() || ggcat_cfg.abundance_u16
+            || ggcat_cfg.abundance_exact || ggcat_cfg.abundance_log_base.is_some();
+        if with_abundance {
+            let encoding = automatic_encoding.unwrap_or_else(|| {
+                if ggcat_cfg.abundance_u16 { Encoding::U16 }
+                else if ggcat_cfg.abundance_exact { Encoding::EXACT }
+                else { Encoding::quantized(ggcat_cfg.abundance_log_base.unwrap(), ggcat_cfg.abundance_bits) }
+            });
+            let quantization = if ggcat_cfg.abundance_exact { None }
+                else { Some((encoding.base, if ggcat_cfg.abundance_u16 { 16 } else { ggcat_cfg.abundance_bits })) };
+            println!("Logan streaming: abundance dictionary pass followed by graph pass (two downloads per accession)");
+            let (stream, sources) = crate::abundance::ExactSequencesStream::prepare_logan(
+                &filenames, ggcat_cfg.memory_gb, quantization, ggcat_cfg.abundance_max, logan)?;
+            let stream: Arc<dyn DynamicSequencesStream> = Arc::new(stream);
+            let inputs = (0..filenames.len()).map(|block| GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block))).collect();
+            let mut map = SourceDatasetMap::new();
+            map.source_count = sources.len();
+            map.exact_abundance_sources = Some(sources);
+            map.abundance_log_base = Some(encoding);
+            (inputs, map)
+        } else {
+            println!("Logan streaming: one graph pass (one download per accession)");
+            let stream: Arc<dyn DynamicSequencesStream> = Arc::new(crate::logan::LoganSequencesStream::new(&filenames, logan)?);
+            let inputs = (0..filenames.len()).map(|block| GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block))).collect();
+            (inputs, SourceDatasetMap::from_singletons(filenames.len())?)
+        }
+    } else if let Some(encoding) = automatic_encoding
         .filter(|encoding| encoding.base == crate::abundance::EXACT_BASE || encoding.dense) {
         let maximum = ggcat_cfg.abundance_max.unwrap();
         let (stream, sources) = crate::abundance::ExactSequencesStream::prepare_automatic_values(

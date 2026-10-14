@@ -21,6 +21,78 @@ This creates a KLOE v4 archive containing the k-mer content of every file in the
 input file-of-files. New archives use a dataset-major membership index; they do
 not store the inverse CID-to-dataset relation a second time.
 
+### Stream Logan unitigs from accession names
+
+Use `--logan-accessions accessions.txt` instead of `-i/--input-list` to fetch
+Logan unitigs directly from the public bucket. The list contains one SRA run
+accession (`SRR`, `ERR`, or `DRR` followed by digits) per line; blank lines and
+lines starting with `#` are ignored. Duplicate accessions are rejected.
+
+For example, create an accession list and choose whether to retain abundances:
+
+```sh
+cat > accessions.txt <<'EOF'
+ERR10036117
+ERR10036119
+EOF
+
+# Store the k-mer sets without abundance:
+./target/release/kloe compress --logan-accessions accessions.txt \
+  -o archive/ -d temporary/ -t 32 -r 32 --logan-downloads 4
+
+# Store approximate abundance (8 bits, maximum 50000):
+./target/release/kloe compress --logan-accessions accessions.txt \
+  -o archive-abundance/ -d temporary/ -t 32 -r 32 \
+  --abundance --abundance-bits 8 --abundance-max 50000 --logan-downloads 4
+
+# Store rounded integer abundance exactly up to the maximum (16 bits):
+./target/release/kloe compress --logan-accessions accessions.txt \
+  -o archive-exact/ -d temporary/ -t 32 -r 32 \
+  --abundance --abundance-bits 16 --abundance-max 50000 --logan-downloads 4
+```
+
+Downloads use the HTTP(S) client embedded in KLOE; no external downloader is
+required. Downloads are decompressed and parsed in memory: neither downloaded
+`.zst` files nor decoded input FASTA files are
+written to disk. GGCAT intermediates and the final archive still require disk
+space. `--logan-downloads` limits simultaneous downloads (default 4).
+The default endpoint is `https://s3.amazonaws.com/logan-pub`, using the paths
+specified in the [Logan unitig documentation](https://github.com/IndexThePlanet/Logan/blob/main/Unitigs.md).
+Use `--logan-base-url` for a HTTP(S) mirror with the same `/u/ACCESSION/ACCESSION.unitigs.fa.zst` layout.
+
+Without abundance, each accession has one body download, preceded by a small
+HTTP metadata request to estimate its size. Every abundance mode uses two body
+downloads: one to identify observed abundance values, and another for graph
+construction. Both passes process accessions in parallel, bounded by
+`--logan-downloads`; graph-pass concurrency also depends on GGCAT's reader
+threads, controlled by `-t`. The first abundance pass scans headers without
+copying DNA, and keeps only the observed abundance dictionary and base counts.
+Stream fingerprints detect objects that change between abundance passes.
+HTTP failures, truncated downloads, invalid Zstandard data, and invalid FASTA
+cause compression to fail; a failed stream is never marked as a complete
+archive. Interrupted streams are not automatically replayed into the graph.
+
+Dataset names in the archive are the accessions themselves, so a targeted
+decompression list supplied with `-Q` should contain those accession names.
+The output directory must not already contain a complete archive. This option
+is available only for compression; archive decompression remains unchanged.
+
+To restore abundance-annotated FASTA from either abundance archive, use
+`--stored-tigs --abundance`; the precision is read from the archive:
+
+```sh
+./target/release/kloe decompress -c archive-abundance/ -o restored/ -r 16 \
+  --stored-tigs --abundance
+```
+
+Output is Zstandard-compressed FASTA by default; add
+`--output-compression fasta` for plain FASTA. The emitted records are the
+archive's stored tigs, whose boundaries can differ from the original Logan
+unitigs. Abundances are rounded and capped at `--abundance-max` before encoding;
+16-bit exactness applies to those rounded, capped values. See
+[automatic abundance encoding](#automatic-abundance-encoding---abundance)
+for the approximation rule.
+
 ### KLOE v4 archive layout
 
 - `manifest.kloe`: format version, k and minimizer sizes, dataset/CID counts,
