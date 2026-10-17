@@ -261,6 +261,78 @@ pub(crate) fn parse_header(header: &[u8]) -> io::Result<u64> {
 
 pub(crate) type ExactSources = Arc<Vec<(u32, u64)>>;
 
+/// Compare the original header value, before rounding, clipping or quantization.
+pub(crate) fn passes_threshold(header: &[u8], threshold: Option<u64>) -> io::Result<bool> {
+    let Some(threshold) = threshold else {
+        return Ok(true);
+    };
+    let header = std::str::from_utf8(header).map_err(io::Error::other)?;
+    for token in header.split_ascii_whitespace() {
+        for prefix in ["ka:f:", "ka:i:", "km:f:", "km:i:", "abundance="] {
+            if let Some(value) = token.strip_prefix(prefix) {
+                let parsed = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0 && !value.starts_with('-'))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid abundance for filtering",
+                        )
+                    })?;
+                // Rounding to f64 is monotonic. Only ties need exact decimal
+                // comparison; the usual path does not allocate.
+                if parsed > threshold as f64 {
+                    return Ok(true);
+                }
+                if parsed < threshold as f64 {
+                    return Ok(false);
+                }
+                if let Some(integer) = parse_integer(value) {
+                    return Ok(integer > threshold);
+                }
+                // Decimal comparison avoids loss of precision around large u64 thresholds.
+                let value = value.strip_prefix('+').unwrap_or(value);
+                let (mantissa, exponent) = value
+                    .split_once(['e', 'E'])
+                    .map_or((value, 0i64), |(m, e)| {
+                        (m, e.parse::<i64>().unwrap_or(i64::MIN / 2))
+                    });
+                let fraction = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
+                let digits: Vec<_> = mantissa
+                    .bytes()
+                    .filter(|b| b.is_ascii_digit())
+                    .skip_while(|b| *b == b'0')
+                    .collect();
+                if digits.is_empty() {
+                    return Ok(false);
+                }
+                let integer_len = (digits.len() as i64)
+                    .saturating_add(exponent)
+                    .saturating_sub(fraction as i64);
+                if integer_len <= 0 {
+                    return Ok(threshold == 0);
+                }
+                let bound = threshold.to_string();
+                if integer_len != bound.len() as i64 {
+                    return Ok(integer_len > bound.len() as i64);
+                }
+                for (i, b) in bound.bytes().enumerate() {
+                    let digit = digits.get(i).copied().unwrap_or(b'0');
+                    if digit != b {
+                        return Ok(digit > b);
+                    }
+                }
+                return Ok(digits.iter().skip(integer_len as usize).any(|&b| b != b'0'));
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "missing supported abundance field for filtering",
+    ))
+}
+
 pub(crate) struct ExactSequencesStream {
     files: Vec<SequenceSource>,
     colors: Vec<AbundanceColors>,
@@ -268,6 +340,7 @@ pub(crate) struct ExactSequencesStream {
     maximum: Option<u64>,
     storage: Option<Encoding>,
     value_codes: Option<Arc<Vec<u64>>>,
+    threshold: Option<u64>,
 }
 
 // Dense dictionaries use one indexed load. Sparse large ranges stay hashed,
@@ -310,6 +383,71 @@ enum SequenceSource {
     Logan(crate::logan::LoganSource),
 }
 
+/// Abundance filtering without storing abundance metadata in the archive.
+pub(crate) struct FilteredSequencesStream {
+    files: Vec<SequenceSource>,
+    threshold: u64,
+    pub(crate) max_sequence_len: usize,
+}
+
+impl FilteredSequencesStream {
+    pub(crate) fn prepare(files: &[String], threshold: u64) -> io::Result<Self> {
+        let mut sources = Vec::with_capacity(files.len());
+        let mut max_sequence_len = 0;
+        for file in files {
+            let path = std::fs::canonicalize(file)?;
+            std::fs::File::open(&path)?;
+            let source = SequenceSource::Local(path);
+            let mut error = None;
+            source.read(None, &mut |sequence| {
+                if error.is_some() {
+                    return;
+                }
+                match passes_threshold(sequence.ident_data, Some(threshold)) {
+                    Ok(true) => max_sequence_len = max_sequence_len.max(sequence.seq.len()),
+                    Ok(false) => {}
+                    Err(err) => error = Some(err),
+                }
+            })?;
+            if let Some(error) = error {
+                return Err(io::Error::new(error.kind(), format!("{file}: {error}")));
+            }
+            sources.push(source);
+        }
+        Ok(Self {
+            files: sources,
+            threshold,
+            max_sequence_len,
+        })
+    }
+}
+
+impl DynamicSequencesStream for FilteredSequencesStream {
+    fn estimated_base_count(&self, block: usize) -> u64 {
+        match &self.files[block] {
+            SequenceSource::Local(path) => std::fs::metadata(path).map_or(1, |m| m.len().max(1)),
+            SequenceSource::Logan(_) => unreachable!(),
+        }
+    }
+    fn read_block(
+        &self,
+        block: usize,
+        _copy_ident: bool,
+        copyback: Option<usize>,
+        callback: &mut dyn FnMut(DnaSequence, SequenceInfo),
+    ) {
+        self.files[block]
+            .read(copyback, &mut |sequence| {
+                if passes_threshold(sequence.ident_data, Some(self.threshold))
+                    .expect("abundance headers changed after validation")
+                {
+                    callback(sequence, SequenceInfo { color: None });
+                }
+            })
+            .expect("filtered input read failed");
+    }
+}
+
 impl SequenceSource {
     fn read(&self, copyback: Option<usize>, callback: &mut dyn FnMut(DnaSequence)) -> io::Result<()> {
         match self {
@@ -324,7 +462,7 @@ impl SequenceSource {
 
 impl ExactSequencesStream {
     pub(crate) fn prepare(files: &[String], memory_gb: usize) -> io::Result<(Self, ExactSources)> {
-        Self::prepare_impl(files, memory_gb, None, None)
+        Self::prepare_impl(files, memory_gb, None, None, None)
     }
 
     pub(crate) fn prepare_quantized(
@@ -337,13 +475,13 @@ impl ExactSequencesStream {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "logarithmic abundance base must be finite and > 1"));
         }
         Encoding::from_flags(base, Encoding::quantized(base, bits).flags())?;
-        Self::prepare_impl(files, memory_gb, Some((base, bits)), None)
+        Self::prepare_impl(files, memory_gb, Some((base, bits)), None, None)
     }
 
     /// Round fractional input as in quantized mode, then store the integer directly.
     /// Overflow is rejected rather than silently clipped.
     pub(crate) fn prepare_u16(files: &[String], memory_gb: usize) -> io::Result<(Self, ExactSources)> {
-        Self::prepare_impl(files, memory_gb, Some((EXACT_BASE, 16)), None)
+        Self::prepare_impl(files, memory_gb, Some((EXACT_BASE, 16)), None, None)
     }
 
     pub(crate) fn prepare_automatic_values(
@@ -353,7 +491,17 @@ impl ExactSequencesStream {
         if encoding.base != EXACT_BASE && !encoding.dense {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "representatives do not fit the code container"));
         }
-        Self::prepare_impl(files, memory_gb, Some((encoding.base, bits)), Some(maximum))
+        Self::prepare_impl(files, memory_gb, Some((encoding.base, bits)), Some(maximum), None)
+    }
+
+    pub(crate) fn prepare_filtered(
+        files: &[String],
+        memory_gb: usize,
+        quantization: Option<(f64, u8)>,
+        maximum: Option<u64>,
+        threshold: u64,
+    ) -> io::Result<(Self, ExactSources)> {
+        Self::prepare_impl(files, memory_gb, quantization, maximum, Some(threshold))
     }
 
     pub(crate) fn prepare_logan(
@@ -371,6 +519,7 @@ impl ExactSequencesStream {
             .map(|((_, bits), maximum)| Encoding::automatic(bits, maximum))
             .transpose()?;
         let value_codes = Self::value_codes(quantization, maximum, storage);
+        let threshold = config.threshold();
         let paths = accessions
             .iter()
             .map(|name| config.source(name))
@@ -387,6 +536,9 @@ impl ExactSequencesStream {
                     let mut values = HashMap::new();
                     let mut ordered = Vec::new();
                     let result = source.read_headers(&mut |sequence| {
+                        if !passes_threshold(sequence.ident_data, threshold)? {
+                            return Ok(());
+                        }
                         let value = Self::code_from_header(
                             sequence.ident_data,
                             quantization,
@@ -396,6 +548,9 @@ impl ExactSequencesStream {
                         )?;
                         if let hashbrown::hash_map::Entry::Vacant(entry) = values.entry(value) {
                             if reserved.fetch_add(1, Ordering::Relaxed) >= max_sources {
+                                config.record_error(
+                                    "exact abundance dictionary exceeds its memory/color budget",
+                                );
                                 return Err(io::Error::other(
                                     "exact abundance dictionary exceeds its memory/color budget",
                                 ));
@@ -406,8 +561,11 @@ impl ExactSequencesStream {
                         Ok(())
                     });
                     if let Err(error) = result {
-                        config.record_error(&error);
-                        return Err(error);
+                        source.record_error(&error);
+                        config.check()?;
+                        reserved.fetch_sub(values.len(), Ordering::Relaxed);
+                        values.clear();
+                        ordered.clear();
                     }
                     Ok((values, ordered))
                 })
@@ -435,6 +593,7 @@ impl ExactSequencesStream {
                 maximum,
                 storage,
                 value_codes,
+                threshold,
             },
             Arc::new(sources),
         ))
@@ -525,6 +684,7 @@ impl ExactSequencesStream {
         memory_gb: usize,
         quantization: Option<(f64, u8)>,
         maximum: Option<u64>,
+        threshold: Option<u64>,
     ) -> io::Result<(Self, ExactSources)> {
         let storage = quantization.zip(maximum)
             .map(|((_, bits), maximum)| Encoding::automatic(bits, maximum)).transpose()?;
@@ -544,6 +704,11 @@ impl ExactSequencesStream {
             let mut error = None;
             source.read(None, &mut |sequence| {
                 if error.is_some() { return; }
+                match passes_threshold(sequence.ident_data, threshold) {
+                    Ok(true) => {},
+                    Ok(false) => return,
+                    Err(err) => { error = Some(err); return; }
+                }
                 match Self::code_with_max(sequence.ident_data, quantization, maximum, storage) {
                     Ok(value) => {
                         if !values.contains_key(&value) {
@@ -572,6 +737,7 @@ impl ExactSequencesStream {
                 maximum,
                 storage,
                 value_codes: None,
+                threshold,
             },
             Arc::new(sources),
         ))
@@ -598,6 +764,11 @@ impl DynamicSequencesStream for ExactSequencesStream {
         let result = self.files[block].read(partial_read_copyback, &mut |sequence| {
             if error.is_some() {
                 return;
+            }
+            match passes_threshold(sequence.ident_data, self.threshold) {
+                Ok(true) => {},
+                Ok(false) => return,
+                Err(err) => { error = Some(err); return; }
             }
             match Self::code_from_header(
                 sequence.ident_data,
@@ -627,6 +798,44 @@ impl DynamicSequencesStream for ExactSequencesStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_threshold_uses_original_values_and_strict_comparison() {
+        for (value, threshold, expected) in [
+            ("10", 10, false),
+            ("10.000", 10, false),
+            ("10.01", 10, true),
+            ("9.99", 10, false),
+            ("0", 0, false),
+            ("0.001", 0, true),
+            ("1e-999", 0, true),
+            ("1e1", 10, false),
+            ("101e-1", 10, true),
+            ("00010.01", 10, true),
+            ("5e4", 49_999, true),
+            ("9007199254740993", 9_007_199_254_740_992, true),
+            ("9007199254740992.1", 9_007_199_254_740_992, true),
+            ("18446744073709551615", u64::MAX, false),
+            ("18446744073709551615.1", u64::MAX, true),
+        ] {
+            let header = format!(">r ka:f:{value}");
+            assert_eq!(
+                passes_threshold(header.as_bytes(), Some(threshold)).unwrap(),
+                expected,
+                "value={value}, threshold={threshold}"
+            );
+        }
+        for header in [
+            ">r",
+            ">r ka:f:NaN",
+            ">r ka:f:-1",
+            ">r ka:f:-1e-999",
+            ">r ka:f:inf",
+        ] {
+            assert!(passes_threshold(header.as_bytes(), Some(0)).is_err());
+        }
+        assert!(passes_threshold(b">r", None).unwrap());
+    }
 
     #[test]
     fn abundance_dictionaries_preserve_dense_sparse_and_missing_values() {

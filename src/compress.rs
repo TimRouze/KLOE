@@ -1358,6 +1358,8 @@ pub struct GgcatCompressionConfig {
     pub abundance_exact: bool,
     pub abundance_u16: bool,
     pub use_simplitigs: bool,
+    /// Keep input abundance strictly above this threshold, before encoding.
+    pub abundance_threshold: Option<u64>,
     pub(crate) logan: Option<crate::logan::LoganConfig>,
 }
 
@@ -1412,6 +1414,7 @@ impl Default for GgcatCompressionConfig {
             abundance_exact: false,
             abundance_u16: false,
             use_simplitigs: false,
+            abundance_threshold: None,
             logan: None,
         }
     }
@@ -1674,7 +1677,7 @@ pub(crate) fn write_filenames_id_offsets(
         name_len: u32,
     }
 
-    let mut fof_id = BufWriter::new(File::create(output_dir.to_owned() + "filenames_id.txt")?);
+    let mut fof_id = BufWriter::new(File::create(Path::new(output_dir).join("filenames_id.txt"))?);
     let mut file_offset = 0u64;
     let mut records = Vec::with_capacity(filenames.len());
     let indexed_v4 = id_cid_line_sizes.len() == filenames.len().saturating_add(1);
@@ -1737,7 +1740,7 @@ pub(crate) fn write_filenames_id_offsets(
 
     let mut index = BufWriter::with_capacity(
         IO_BUFFER_CAPACITY,
-        File::create(output_dir.to_owned() + FILENAME_INDEX_FILE)?,
+        File::create(Path::new(output_dir).join(FILENAME_INDEX_FILE))?,
     );
     index.write_all(FILENAME_INDEX_MAGIC)?;
     index.write_all(&(filenames.len() as u64).to_le_bytes())?;
@@ -1904,20 +1907,7 @@ pub(crate) fn build_temporary_cid_sidecar_from_dataset_index(
     }
     let mut flags = [0u8; 1];
     data.read_exact(&mut flags)?;
-    if flags[0]
-        & !(DATASET_TO_CID_FLAG_ABUNDANCE
-            | DATASET_TO_CID_FLAG_ADAPTIVE
-            | crate::abundance::EXACT_FLAG
-            | crate::abundance::WIDTH_FLAGS
-            | crate::abundance::DENSE_FLAG
-            | DATASET_TO_CID_FLAG_MAJORITY)
-        != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported dataset-to-CID flags",
-        ));
-    }
+    // All eight bits are assigned. Validate encoding combinations below.
     let exact = flags[0] & crate::abundance::EXACT_FLAG != 0;
     if flags[0] & (crate::abundance::EXACT_FLAG | crate::abundance::WIDTH_FLAGS | crate::abundance::DENSE_FLAG) != 0
         && flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE == 0
@@ -2825,6 +2815,8 @@ pub(crate) struct SourceDatasetMap {
     virtual_abundance_datasets: Option<usize>,
     exact_abundance_sources: Option<crate::abundance::ExactSources>,
     abundance_log_base: Option<Encoding>,
+    dataset_remap: Option<Arc<Vec<u32>>>,
+    empty_input: bool,
 }
 
 #[derive(Debug)]
@@ -2860,6 +2852,8 @@ impl SourceDatasetMap {
             virtual_abundance_datasets: None,
             exact_abundance_sources: None,
             abundance_log_base: None,
+            dataset_remap: None,
+            empty_input: false,
         }
     }
 
@@ -2890,6 +2884,8 @@ impl SourceDatasetMap {
             virtual_abundance_datasets: Some(dataset_count),
             exact_abundance_sources: None,
             abundance_log_base: Some(Encoding::quantized(log_base, 8)),
+            dataset_remap: None,
+            empty_input: false,
         })
     }
 
@@ -3289,7 +3285,8 @@ fn resolve_subsets_to_dataset_ids(
 
     let callback_err = Mutex::new(None::<io::Error>);
 
-    for chunk in subset_list.chunks(subset_list.len().max(1)) {
+    let chunk = subset_list.as_slice();
+    {
         let subset_sources = Mutex::new(Vec::<(ColorIndexType, Vec<usize>)>::with_capacity(
             chunk.len(),
         ));
@@ -3435,6 +3432,20 @@ fn resolve_subsets_to_dataset_ids(
                             &mut current_dataset_ids,
                             &mut current_abundance_codes,
                         )?;
+                        if let Some(remap) = &source_dataset_ids.dataset_remap {
+                            let mut kept = 0;
+                            for i in 0..current_dataset_ids.len() {
+                                let mapped = *remap.get(current_dataset_ids[i] as usize)
+                                    .ok_or_else(|| io::Error::other("invalid Logan dataset remapping"))?;
+                                if mapped != 0 {
+                                    current_dataset_ids[kept] = mapped;
+                                    if abundance_enabled { current_abundance_codes[kept] = current_abundance_codes[i]; }
+                                    kept += 1;
+                                }
+                            }
+                            current_dataset_ids.truncate(kept);
+                            if abundance_enabled { current_abundance_codes.truncate(kept); }
+                        }
                         if abundance_enabled
                             && current_abundance_codes.len() != current_dataset_ids.len()
                         {
@@ -3471,7 +3482,7 @@ fn resolve_subsets_to_dataset_ids(
                 let mut memberships = memberships.into_inner();
                 memberships.sort_unstable();
                 memberships.dedup();
-                if memberships.is_empty() {
+                if memberships.is_empty() && source_dataset_ids.dataset_remap.is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "GGCAT color subset resolved to empty dataset set",
@@ -3518,13 +3529,12 @@ fn resolve_subsets_to_dataset_ids(
                 codes.push(abundance_codes);
             }
         }
-        return Ok(ResolvedSubsets {
+        Ok(ResolvedSubsets {
             subsets: chunk.to_vec(),
             dataset_ids: chunk_dataset_ids,
             abundance_codes: chunk_abundance_codes,
-        });
+        })
     }
-    unreachable!("non-empty subset list is processed as one chunk")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3586,6 +3596,9 @@ fn emit_resolved_record_window(
             .abundance_codes
             .as_ref()
             .map(|codes| Arc::clone(&codes[resolved_index]));
+        // Failed Logan datasets are removed after all readers finish. Drop
+        // sequences belonging only to them, including a partially read body.
+        if color_ids.is_empty() { continue; }
         *output_batch_bytes = output_batch_bytes.saturating_add(record.seq.len());
         output_batch.push(SimplitigRecord {
             color_ids: Arc::clone(color_ids),
@@ -4004,7 +4017,7 @@ impl StreamWriterState {
             size_file: {
                 let mut out = BufWriter::with_capacity(
                     IO_BUFFER_CAPACITY,
-                    File::create(output_dir.to_owned() + "bucket_sizes.txt")?,
+                    File::create(Path::new(output_dir).join("bucket_sizes.txt"))?,
                 );
                 out.write_all(BUCKET_SIZES_COMPACT_MAGIC)?;
                 out
@@ -5413,23 +5426,20 @@ pub(crate) fn sort_by_bucket_streaming(
     memory_gb: usize,
     abundance_log_base: Option<Encoding>,
     record_rx: mpsc::Receiver<SimplitigBatch>,
-) -> (u64, Vec<usize>) {
+) -> Result<(u64, Vec<usize>)> {
     let total_timer = PhaseTimer::start();
     let memory_budget = CompressionMemoryBudget::from_gb(memory_gb);
     println!("Starting writing compressed sequences (streaming).");
     let write_stream_timer = PhaseTimer::start();
-    let triple = match write_compressed_from_stream(
-        output_dir.clone() + "tigs_kloe.fa",
+    let triple = write_compressed_from_stream(
+        Path::new(output_dir).join("tigs_kloe.fa").to_string_lossy().into_owned(),
         output_dir,
         nb_files,
         worker_threads,
         memory_budget,
         abundance_log_base,
         record_rx,
-    ) {
-        Ok(res_pair) => res_pair,
-        Err(e) => panic!("Error writing compressed unitigs: {e:?}"),
-    };
+    )?;
     let write_stream_timing = write_stream_timer.finish();
     println!(
         "Writing compressed sequences wall time: {:.3}s",
@@ -5439,14 +5449,12 @@ pub(crate) fn sort_by_bucket_streaming(
     let position_timer = PhaseTimer::start();
     println!("Starting to write positions");
     let position_entries = triple.position_entries;
-    if let Err(e) = write_positions_from_spill(
+    write_positions_from_spill(
         &triple.position_path,
         triple.position_entries,
-        String::from(output_dir.clone() + "positions_kloe.bin"),
-        String::from(output_dir.clone() + POSITIONS_INDEX_FILE),
-    ) {
-        panic!("Error writting positions: {e:?}");
-    }
+        Path::new(output_dir).join("positions_kloe.bin").to_string_lossy().into_owned(),
+        Path::new(output_dir).join(POSITIONS_INDEX_FILE).to_string_lossy().into_owned(),
+    )?;
     let position_timing = position_timer.finish();
     println!(
         "Write positions wall time: {:.3}s",
@@ -5454,20 +5462,17 @@ pub(crate) fn sort_by_bucket_streaming(
     );
     log_phase_timing("post_ggcat.write_positions", position_timing);
     let transpose_timer = PhaseTimer::start();
-    let dataset_offsets = match write_dataset_to_cid_from_partitions(
-        output_dir.clone() + DATASET_TO_CID_FILE,
+    let dataset_offsets = write_dataset_to_cid_from_partitions(
+        Path::new(output_dir).join(DATASET_TO_CID_FILE).to_string_lossy().into_owned(),
         triple.dataset_cid_spill,
         memory_budget,
-    ) {
-        Ok(offsets) => offsets,
-        Err(e) => panic!("Error writing dataset-to-CID postings: {e:?}"),
-    };
+    )?;
     log_phase_timing("post_ggcat.dataset_to_cid", transpose_timer.finish());
     let _ = fs::remove_dir(&triple.spill_directory);
     let total_timing = total_timer.finish();
     println!("Compression took: {:.3}s", total_timing.wall_sec);
     log_phase_timing("post_ggcat.total", total_timing);
-    (position_entries, dataset_offsets)
+    Ok((position_entries, dataset_offsets))
 }
 
 fn stream_sorted_records_from_chunks(
@@ -5619,10 +5624,41 @@ fn capture_structured_ggcat_output(
     })
 }
 
+fn prepare_output_datasets(
+    filenames: &[String],
+    logan: Option<&crate::logan::LoganConfig>,
+    map: &mut SourceDatasetMap,
+    ready: mpsc::Sender<Vec<usize>>,
+) -> Result<usize> {
+    let active = if let Some(logan) = logan {
+        logan.check()?;
+        logan.active_indices(filenames)
+    } else {
+        (0..filenames.len()).collect()
+    };
+    if active.is_empty() {
+        return Err(io::Error::other(
+            "no Logan accession completed successfully",
+        ));
+    }
+    if active.len() != filenames.len() {
+        let mut remap = vec![0; filenames.len() + 1];
+        for (new, &old) in active.iter().enumerate() {
+            remap[old + 1] = (new + 1) as u32;
+        }
+        map.dataset_remap = Some(Arc::new(remap));
+    }
+    let count = active.len();
+    ready
+        .send(active)
+        .map_err(|_| io::Error::other("archive metadata receiver disconnected"))?;
+    Ok(count)
+}
+
 fn produce_ggcat_records(
     input_streams: Vec<GeneralSequenceBlockData>,
-    source_dataset_ids: SourceDatasetMap,
-    dataset_count: usize,
+    mut source_dataset_ids: SourceDatasetMap,
+    filenames: Vec<String>,
     threads: usize,
     k: usize,
     m: usize,
@@ -5631,15 +5667,27 @@ fn produce_ggcat_records(
     use_eulertigs: bool,
     ggcat_cfg: GgcatCompressionConfig,
     sender: mpsc::SyncSender<SimplitigBatch>,
+    ready: mpsc::Sender<Vec<usize>>,
 ) -> Result<()> {
     let source_count = source_dataset_ids.len();
     let memory_budget = CompressionMemoryBudget::from_gb(ggcat_cfg.memory_gb);
-    if source_count == 0 || input_streams.is_empty() {
+    if input_streams.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "ggcat source list is empty",
         ));
     }
+    if let Some(logan) = &ggcat_cfg.logan {
+        logan.check()?;
+        if logan.active_indices(&filenames).is_empty() {
+            return Err(io::Error::other("no Logan accession completed successfully"));
+        }
+    }
+    if source_count == 0 || source_dataset_ids.empty_input {
+        prepare_output_datasets(&filenames, ggcat_cfg.logan.as_ref(), &mut source_dataset_ids, ready)?;
+        return Ok(());
+    }
+    let dataset_count = filenames.len();
     let ggcat_temp_root = if ggcat_cfg.temp_dir.is_empty() {
         std::env::temp_dir().join(format!("kloe-ggcat-shared-{}", std::process::id()))
     } else {
@@ -5724,9 +5772,20 @@ fn produce_ggcat_records(
     }
     let records_output = build_result.map_err(|e| to_io_err("ggcat build_graph", e))?;
     let captured = capture_result?;
+    let dataset_count = prepare_output_datasets(&filenames, ggcat_cfg.logan.as_ref(), &mut source_dataset_ids, ready)?;
     log_phase_timing("ggcat.build_graph_api_call", ggcat_build_timer.finish());
 
     let colormap_file = GGCATInstance::get_colormap_file(&records_output);
+    // Filtering can legitimately leave no k-mers. The empty GGCAT colormap
+    // has no subset block and must not be opened by ColorsDeserializer.
+    if captured.chunk_files.is_empty() {
+        if std::env::var_os("KLOE_KEEP_GGCAT").is_none() {
+            let _ = fs::remove_file(&records_output);
+            let _ = fs::remove_file(&colormap_file);
+            let _ = fs::remove_dir_all(&chunk_dir);
+        }
+        return Ok(());
+    }
     let colors_deserializer =
         ColorsDeserializer::<DefaultColorsSerializer>::new(&colormap_file, false)
             .map_err(|e| to_io_err("open ggcat colormap", e))?;
@@ -5890,6 +5949,10 @@ pub(crate) fn compress_ggcat_sources(
     use_eulertigs: bool,
     ggcat_cfg: GgcatCompressionConfig,
 ) -> Result<()> {
+    let output_dir = crate::archive::output_root(output_dir).to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "output path is not UTF-8")
+    })?;
+    crate::archive::ensure_new_output(Path::new(output_dir))?;
     let dataset_count = filenames.len();
     if dataset_count == 0 {
         return Err(io::Error::new(
@@ -5920,14 +5983,16 @@ pub(crate) fn compress_ggcat_sources(
     println!("Compression backend: embedded ggcat structured output");
 
     let (record_tx, record_rx) = mpsc::sync_channel::<SimplitigBatch>(2);
+    let (ready_tx, ready_rx) = mpsc::channel();
     let producer_cfg = ggcat_cfg.clone();
     let abundance_log_base = source_dataset_ids.abundance_log_base();
 
+    let producer_filenames = filenames.clone();
     let producer = thread::spawn(move || {
         produce_ggcat_records(
             input_streams,
             source_dataset_ids,
-            dataset_count,
+            producer_filenames,
             threads,
             k,
             m,
@@ -5936,11 +6001,28 @@ pub(crate) fn compress_ggcat_sources(
             use_eulertigs,
             producer_cfg,
             record_tx,
+            ready_tx,
         )
     });
 
+    // No final archive data is written until every Logan reader has finished,
+    // so failed datasets can be omitted and surviving IDs made contiguous.
+    let active = match ready_rx.recv() {
+        Ok(active) => active,
+        Err(_) => {
+            drop(record_rx);
+            return match producer.join() {
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(())) => Err(io::Error::other("producer omitted dataset metadata")),
+                Err(_) => Err(io::Error::other("ggcat producer panicked")),
+            };
+        }
+    };
+    let filenames: Vec<_> = active.into_iter().map(|i| filenames[i].clone()).collect();
+    let dataset_count = filenames.len();
+
     let sort_start = Instant::now();
-    let (position_entries, dataset_offsets) = sort_by_bucket_streaming(
+    let write_result = sort_by_bucket_streaming(
         &output_dir.to_string(),
         dataset_count as u32,
         threads,
@@ -5953,7 +6035,9 @@ pub(crate) fn compress_ggcat_sources(
         sort_start.elapsed().as_secs_f64()
     );
 
-    match producer.join() {
+    let producer_result = producer.join();
+    let (position_entries, dataset_offsets) = write_result?;
+    match producer_result {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             return Err(io::Error::other(format!("ggcat producer failed: {err}")));
@@ -5969,9 +6053,13 @@ pub(crate) fn compress_ggcat_sources(
             "archive positions omit the initial boundary",
         )
     })?;
-    let mut manifest = BufWriter::new(File::create(
-        Path::new(output_dir).join(ARCHIVE_MANIFEST_FILE),
-    )?);
+    // The manifest is the completion marker. Publish it only after every payload,
+    // index and optional download report has been successfully finalized.
+    write_filenames_id_offsets(output_dir, &filenames, &dataset_offsets)?;
+    if let Some(logan) = &ggcat_cfg.logan {
+        logan.write_report(Path::new(output_dir))?;
+    }
+    let mut manifest = tempfile::NamedTempFile::new_in(output_dir)?;
     manifest.write_all(ARCHIVE_MANIFEST_MAGIC)?;
     manifest.write_all(&4u32.to_le_bytes())?;
     manifest.write_all(&(k as u32).to_le_bytes())?;
@@ -5985,14 +6073,52 @@ pub(crate) fn compress_ggcat_sources(
             .to_le_bytes(),
     )?;
     manifest.flush()?;
-
-    // Dataset-to-CID is the sole persistent membership relation in v4.  Merge
-    // reconstructs the inverse as a bounded temporary external transpose.
-    write_filenames_id_offsets(output_dir, &filenames, &dataset_offsets)?;
+    manifest.as_file().sync_all()?;
+    manifest.persist_noclobber(Path::new(output_dir).join(ARCHIVE_MANIFEST_FILE))
+        .map_err(|error| error.error)?;
     Ok(())
 }
 
 pub fn compress_with_ggcat(
+    output_dir: &String,
+    input_fof: &String,
+    threads: usize,
+    k: usize,
+    m: usize,
+    partition_power: u32,
+    verify_kmers: bool,
+    skip_sort: bool,
+    use_unitigs: bool,
+    use_matchtigs: bool,
+    use_eulertigs: bool,
+    ggcat_cfg: GgcatCompressionConfig,
+) -> Result<()> {
+    let output_dir = crate::archive::output_root(output_dir).to_string_lossy().into_owned();
+    let _output_lock = crate::archive::OutputLock::acquire(Path::new(&output_dir))?;
+    let logan = ggcat_cfg.logan.clone();
+    let result = compress_with_ggcat_impl(
+        &output_dir,
+        input_fof,
+        threads,
+        k,
+        m,
+        partition_power,
+        verify_kmers,
+        skip_sort,
+        use_unitigs,
+        use_matchtigs,
+        use_eulertigs,
+        ggcat_cfg,
+    );
+    if let Some(logan) = logan.filter(|_| result.is_err()) {
+        if let Err(error) = logan.write_report(Path::new(&output_dir)) {
+            eprintln!("Warning: cannot write Logan failure report: {error}");
+        }
+    }
+    result
+}
+
+fn compress_with_ggcat_impl(
     output_dir: &String,
     input_fof: &String,
     threads: usize,
@@ -6017,15 +6143,12 @@ pub fn compress_with_ggcat(
     }
 
     let filenames = if ggcat_cfg.logan.is_some() {
-        if Path::new(output_dir).join(ARCHIVE_MANIFEST_FILE).exists() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-                "Logan streaming requires an output directory without an existing complete archive"));
-        }
-        crate::logan::read_accessions(Path::new(input_fof))?
+        ggcat_cfg.logan.as_ref().unwrap().read_accessions(Path::new(input_fof))?
     } else {
         read_input_fof_filenames(input_fof)?
     };
     let mut ggcat_cfg = ggcat_cfg;
+    ggcat_cfg.logan = ggcat_cfg.logan.take().map(|logan| logan.with_threshold(ggcat_cfg.abundance_threshold));
     let automatic_encoding = if let Some(maximum) = ggcat_cfg.abundance_max {
         if ggcat_cfg.abundance_u16 || ggcat_cfg.abundance_exact || ggcat_cfg.abundance_log_base.is_some() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -6037,7 +6160,7 @@ pub fn compress_with_ggcat(
         }
         Some(encoding)
     } else { None };
-    let (input_streams, source_dataset_ids) = if let Some(logan) = &ggcat_cfg.logan {
+    let (input_streams, source_dataset_ids) = if ggcat_cfg.logan.is_some() || ggcat_cfg.abundance_threshold.is_some() {
         let with_abundance = automatic_encoding.is_some() || ggcat_cfg.abundance_u16
             || ggcat_cfg.abundance_exact || ggcat_cfg.abundance_log_base.is_some();
         if with_abundance {
@@ -6048,9 +6171,15 @@ pub fn compress_with_ggcat(
             });
             let quantization = if ggcat_cfg.abundance_exact { None }
                 else { Some((encoding.base, if ggcat_cfg.abundance_u16 { 16 } else { ggcat_cfg.abundance_bits })) };
-            println!("Logan streaming: abundance dictionary pass followed by graph pass (two downloads per accession)");
-            let (stream, sources) = crate::abundance::ExactSequencesStream::prepare_logan(
-                &filenames, ggcat_cfg.memory_gb, quantization, ggcat_cfg.abundance_max, logan)?;
+            let (stream, sources) = if let Some(logan) = &ggcat_cfg.logan {
+                println!("Logan streaming: abundance dictionary pass followed by graph pass (two downloads per accession)");
+                crate::abundance::ExactSequencesStream::prepare_logan(
+                    &filenames, ggcat_cfg.memory_gb, quantization, ggcat_cfg.abundance_max, logan)?
+            } else {
+                crate::abundance::ExactSequencesStream::prepare_filtered(
+                    &filenames, ggcat_cfg.memory_gb, quantization, ggcat_cfg.abundance_max,
+                    ggcat_cfg.abundance_threshold.unwrap())?
+            };
             let stream: Arc<dyn DynamicSequencesStream> = Arc::new(stream);
             let inputs = (0..filenames.len()).map(|block| GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block))).collect();
             let mut map = SourceDatasetMap::new();
@@ -6058,11 +6187,20 @@ pub fn compress_with_ggcat(
             map.exact_abundance_sources = Some(sources);
             map.abundance_log_base = Some(encoding);
             (inputs, map)
-        } else {
+        } else if let Some(logan) = &ggcat_cfg.logan {
             println!("Logan streaming: one graph pass (one download per accession)");
             let stream: Arc<dyn DynamicSequencesStream> = Arc::new(crate::logan::LoganSequencesStream::new(&filenames, logan)?);
             let inputs = (0..filenames.len()).map(|block| GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block))).collect();
             (inputs, SourceDatasetMap::from_singletons(filenames.len())?)
+        } else {
+            let stream = crate::abundance::FilteredSequencesStream::prepare(&filenames,
+                ggcat_cfg.abundance_threshold.unwrap())?;
+            let mut map = SourceDatasetMap::from_singletons(filenames.len())?;
+            map.empty_input = stream.max_sequence_len < k;
+            let stream: Arc<dyn DynamicSequencesStream> = Arc::new(stream);
+            let inputs = (0..filenames.len()).map(|block|
+                GeneralSequenceBlockData::Dynamic((Arc::clone(&stream), block))).collect();
+            (inputs, map)
         }
     } else if let Some(encoding) = automatic_encoding
         .filter(|encoding| encoding.base == crate::abundance::EXACT_BASE || encoding.dense) {

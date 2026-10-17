@@ -227,20 +227,7 @@ impl DatasetPostingIndex {
         }
         let mut flags = [0u8; 1];
         data.read_exact(&mut flags)?;
-        if flags[0]
-            & !(DATASET_TO_CID_FLAG_ABUNDANCE
-                | DATASET_TO_CID_FLAG_ADAPTIVE
-                | crate::abundance::EXACT_FLAG
-                | crate::abundance::WIDTH_FLAGS
-                | crate::abundance::DENSE_FLAG
-                | DATASET_TO_CID_FLAG_MAJORITY)
-            != 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported dataset-to-CID flags",
-            ));
-        }
+        // All eight bits are assigned. Validate encoding combinations below.
         let exact = flags[0] & crate::abundance::EXACT_FLAG != 0;
         if flags[0] & (crate::abundance::EXACT_FLAG | crate::abundance::WIDTH_FLAGS | crate::abundance::DENSE_FLAG) != 0
             && flags[0] & DATASET_TO_CID_FLAG_ABUNDANCE == 0
@@ -1006,11 +993,11 @@ fn ensure_output_dir(out_dir: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn dump_output_path(out_dir: &str, source_path: &str, compression: OutputCompression) -> PathBuf {
+fn dump_output_path(out_dir: &str, source_path: &str, dataset_id: u32, compression: OutputCompression) -> PathBuf {
     let out_dir_path = normalize_out_dir(out_dir);
     let trunc_filename = Path::new(source_path).file_stem().unwrap_or_default();
     out_dir_path.join(format!(
-        "Dump_{}{}",
+        "Dump_{dataset_id}_{}{}",
         trunc_filename.to_str().unwrap_or("unknown"),
         compression.fasta_suffix()
     ))
@@ -1110,26 +1097,7 @@ fn run_ggcat_rebuild(input: &Path, output: &Path, cfg: &GgcatRebuildConfig) -> R
 }
 
 fn archive_rebuild_k(archive_root: &Path, fallback: usize) -> Result<usize> {
-    let path = archive_root.join(crate::compress::ARCHIVE_MANIFEST_FILE);
-    if !path.exists() {
-        return Ok(fallback);
-    }
-    let mut header = [0u8; 44];
-    File::open(path)?.read_exact(&mut header)?;
-    if &header[..4] != b"KLM4" || u32::from_le_bytes(header[4..8].try_into().unwrap()) != 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported archive manifest",
-        ));
-    }
-    let k = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-    if k == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "archive k must be positive",
-        ));
-    }
-    Ok(k)
+    Ok(crate::archive::recorded_k(archive_root)?.unwrap_or(fallback))
 }
 
 /// Rebuild each selected dataset separately; only explicit set operations
@@ -1255,7 +1223,7 @@ pub fn decompress_with_options(
             input_dir.clone(),
             stored_cfg.clone(),
         )?;
-        let input = dump_output_path(&stage_dir, &name, OutputCompression::Fasta);
+        let input = dump_output_path(&stage_dir, &name, dataset_id, OutputCompression::Fasta);
         // Legacy readers may omit an empty dataset's output.
         if !input.exists() {
             File::create(&input)?;
@@ -1834,9 +1802,9 @@ fn decompress_indexed_selected_batch(
     };
     let mut outputs = selected
         .iter()
-        .map(|(name, _)| {
+        .map(|(name, dataset_id)| {
             FastaOutputWriter::create(
-                &dump_output_path(out_dir, name, output_compression),
+                &dump_output_path(out_dir, name, *dataset_id, output_compression),
                 output_compression,
             )
         })
@@ -2067,8 +2035,8 @@ fn decompress_sidecar(
             .collect::<HashSet<_>>()
     });
     if let Some(wanted) = wanted_filenames {
-        for (path, _) in wanted {
-            let output_path = dump_output_path(out_dir, path, output_compression);
+        for (path, dataset_id) in wanted {
+            let output_path = dump_output_path(out_dir, path, *dataset_id, output_compression);
             if output_path.exists() {
                 fs::remove_file(output_path)?;
             }
@@ -2084,7 +2052,7 @@ fn decompress_sidecar(
         for (path, id) in filenames {
             if wanted_ids.as_ref().is_none_or(|wanted| wanted.contains(id)) {
                 FastaOutputWriter::create(
-                    &dump_output_path(out_dir, path, output_compression),
+                    &dump_output_path(out_dir, path, *id, output_compression),
                     output_compression,
                 )?.finish()?;
             }
@@ -2096,7 +2064,7 @@ fn decompress_sidecar(
     let output_paths = Arc::new(
         filenames
             .iter()
-            .map(|(path, _)| dump_output_path(out_dir, path, output_compression))
+            .map(|(path, dataset_id)| dump_output_path(out_dir, path, *dataset_id, output_compression))
             .collect::<Vec<_>>(),
     );
     let mut path_shards = HashMap::<PathBuf, usize>::new();
@@ -3456,7 +3424,7 @@ fn decompress_all(
                 if let std::collections::hash_map::Entry::Vacant(entry) = writers.entry(*file_id) {
                     let curr_filename = &filenames[*file_id as usize];
                     let output_path =
-                        dump_output_path(out_dir, &curr_filename.0, output_compression);
+                        dump_output_path(out_dir, &curr_filename.0, *file_id, output_compression);
                     entry.insert(FastaOutputWriter::create(&output_path, output_compression)?);
                 }
                 let writer = writers.get_mut(file_id).expect("writer inserted above");
@@ -3622,7 +3590,7 @@ fn decompress_wanted(
     let mut writers: HashMap<u32, FastaOutputWriter> = HashMap::new();
     // Pre-open all wanted output files
     for wanted_file in wanted_files {
-        let output_path = dump_output_path(out_dir, &wanted_file.0, output_compression);
+        let output_path = dump_output_path(out_dir, &wanted_file.0, wanted_file.1, output_compression);
         let writer = FastaOutputWriter::create(&output_path, output_compression)?;
         writers.insert(wanted_file.1, writer);
     }

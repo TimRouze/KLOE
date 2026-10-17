@@ -8,11 +8,20 @@ git clone  https://github.com/TimRouze/KLOE
 cd KLOE
 ```
 
+Correctness checks for the main binary:
+
+```sh
+cargo test --bin kloe -- --test-threads=1
+cargo clippy --bin kloe
+```
+
+HTTP tests use small local fixtures rather than downloading Logan datasets.
+
 ## Usage example
 This projects uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers?tab=readme-ov-file) which requires AVX2 or NEON instruction sets, which, on x64, requires either target-cpu=native or target-cpu=x86-64-v3. See [this README](https://github.com/ragnargrootkoerkamp/ensure_simd) for details.
 
 ```sh
-cargo build -r
+cargo build --release --bin kloe
 ./target/release/kloe compress -i path/to/file/of/file -o output/path -d temporary/folder -t 12 -r 32
 ```
 Builds are configured to always use optimized profiles and native CPU flags from `.cargo/config.toml`.
@@ -21,12 +30,23 @@ This creates a KLOE v4 archive containing the k-mer content of every file in the
 input file-of-files. New archives use a dataset-major membership index; they do
 not store the inverse CID-to-dataset relation a second time.
 
+Output paths work with or without a trailing slash. Compression and merge refuse
+to overwrite archive files already present in the destination, including legacy
+archives and incomplete previous runs. Use a fresh directory for each archive.
+The v4 completion marker, `manifest.kloe`, is published atomically only after all
+payloads, indexes and any Logan report have been written successfully. An error
+may leave incomplete files in the destination, but no completion manifest.
+A temporary `.kloe-write.lock` also prevents simultaneous writers from using the
+same destination. It is removed on normal completion or error; after a forced
+termination, use a fresh destination if the lock remains.
+
 ### Stream Logan unitigs from accession names
 
 Use `--logan-accessions accessions.txt` instead of `-i/--input-list` to fetch
 Logan unitigs directly from the public bucket. The list contains one SRA run
 accession (`SRR`, `ERR`, or `DRR` followed by digits) per line; blank lines and
-lines starting with `#` are ignored. Duplicate accessions are rejected.
+lines starting with `#` are ignored. Invalid accessions are skipped with a
+warning by default; duplicate valid accessions are read only once.
 
 For example, create an accession list and choose whether to retain abundances:
 
@@ -55,26 +75,46 @@ Downloads use the HTTP(S) client embedded in KLOE; no external downloader is
 required. Downloads are decompressed and parsed in memory: neither downloaded
 `.zst` files nor decoded input FASTA files are
 written to disk. GGCAT intermediates and the final archive still require disk
-space. `--logan-downloads` limits simultaneous downloads (default 4).
+space. `--logan-downloads` limits simultaneous downloads (default 4), including
+metadata requests, retries and resumed streams. One failed accession does not
+cancel the other downloads in the default tolerant mode.
 The default endpoint is `https://s3.amazonaws.com/logan-pub`, using the paths
 specified in the [Logan unitig documentation](https://github.com/IndexThePlanet/Logan/blob/main/Unitigs.md).
 Use `--logan-base-url` for a HTTP(S) mirror with the same `/u/ACCESSION/ACCESSION.unitigs.fa.zst` layout.
 
 Without abundance, each accession has one body download, preceded by a small
-HTTP metadata request to estimate its size. Every abundance mode uses two body
+HTTP HEAD request to estimate its size. Unsupported or failed metadata requests
+fall back to a size estimate and do not prevent the GET download; a metadata
+404 or 410 excludes the missing accession. Abundance modes normally use two body
 downloads: one to identify observed abundance values, and another for graph
 construction. Both passes process accessions in parallel, bounded by
 `--logan-downloads`; graph-pass concurrency also depends on GGCAT's reader
 threads, controlled by `-t`. The first abundance pass scans headers without
 copying DNA, and keeps only the observed abundance dictionary and base counts.
 Stream fingerprints detect objects that change between abundance passes.
-HTTP failures, truncated downloads, invalid Zstandard data, and invalid FASTA
-cause compression to fail; a failed stream is never marked as a complete
-archive. Interrupted streams are not automatically replayed into the graph.
+Transient connection errors, HTTP 408/429 and server errors are retried with
+backoff. A server's `Retry-After` delay is honored, whether specified as seconds
+or an HTTP date. Retry waits stop promptly when a fatal error cancels the job.
+`--logan-retries N` sets the number of additional attempts (default 2,
+so at most 3 attempts per metadata request or body download). A stalled body
+read times out after 120 seconds. Interrupted bodies can resume at the exact
+compressed byte offset when the server supports HTTP ranges and confirms the
+same strong ETag. Records already streamed into the graph are never replayed.
+If safe recovery is unavailable or attempts are exhausted, the entire accession
+is excluded, including any sequences already read from it. Invalid FASTA,
+invalid Zstandard data and objects that change between abundance passes are
+also excluded. A 404 is not retried.
+
+The output directory contains `logan-skipped.tsv`, listing excluded accessions
+and reasons. Only successful accessions appear in the archive's dataset index;
+their order follows the input list. If none succeed, compression returns an
+error and does not create a complete archive. Use `--logan-strict` to stop on
+the first invalid, duplicate or failed accession instead. Local output, memory
+or graph-construction errors remain fatal in both modes.
 
 Dataset names in the archive are the accessions themselves, so a targeted
 decompression list supplied with `-Q` should contain those accession names.
-The output directory must not already contain a complete archive. This option
+The output directory must not already contain archive files. This option
 is available only for compression; archive decompression remains unchanged.
 
 To restore abundance-annotated FASTA from either abundance archive, use
@@ -152,7 +192,7 @@ When running kloe in compression mode, add "compress" before any other parameter
 
 #### Threads used -t
 This parameter defines the number of threads used by kloe to construct the archive.
-The default value is 1 thread.
+The default is the number of available logical CPUs.
 
 #### out-dir -o
 The output directory where the compressed archive should be written.
@@ -160,13 +200,39 @@ Default is current directory
 
 #### temp_dir -d
 A temporary directory to write temporary files used during compression workflow.
-Default is current directory
+By default, graph construction uses the operating system's temporary directory.
 
 #### k_size -k
 K size. Default is 31.
 
 #### minimizer_size -m
-Minimizer size. Default is 7.
+Minimizer size. Default is 12 and must be smaller than k.
+
+#### abundance filter during compression (`--abundance-threshold`)
+`--abundance-threshold N` keeps only input FASTA records whose header abundance
+is **strictly greater than N**. It works with local file lists and Logan
+streaming, independently of whether abundance is stored in the archive.
+Supported fields are `ka:f:`, `ka:i:`, `km:f:`, `km:i:` and `abundance=`.
+The comparison uses the original value, before rounding, capping or logarithmic
+encoding: a value of 10 is excluded by threshold 10, while 10.01 is retained.
+Missing or invalid annotations are errors; in tolerant Logan mode the affected
+accession is excluded and reported. A valid dataset whose records are all
+filtered out remains an empty dataset in the archive.
+
+```sh
+# Filter local inputs without storing abundance metadata:
+./target/release/kloe compress -i inputs.fof -o filtered/ -d temporary/ \
+  -t 12 -r 32 --abundance-threshold 10
+
+# Filter streamed Logan inputs and preserve abundance:
+./target/release/kloe compress --logan-accessions accessions.txt \
+  -o filtered-abundance/ -d temporary/ -t 12 -r 32 \
+  --abundance-threshold 10 --abundance --abundance-bits 8 --logan-downloads 4
+```
+
+Filtering does not enable abundance storage; add `--abundance` when needed.
+Decompression filtering uses the reconstructed stored abundance instead, so
+rounding and approximation can affect a later comparison near the threshold.
 
 #### archive SPSS mode (default: unitigs)
 By default, KLOE uses the unitig construction mode of its embedded GGCAT
@@ -388,7 +454,9 @@ passed to embedded GGCAT. Datasets are rebuilt sequentially using `-t` threads
 for each graph. `--ggcat-rebuild` remains accepted but is now redundant.
 
 To recover stored tigs without graph rebuilding, use `--stored-tigs`; this
-retains the historical `Dump_<source-stem><suffix>` filenames. Abundance
+produces `Dump_<dataset-id>_<source-stem><suffix>`, for example
+`Dump_0_sample.fa.zst`. The stable dataset ID prevents collisions between inputs
+with identical basenames, for full and targeted decompression alike. Abundance
 restoration requires `--stored-tigs --abundance`: rebuilding may join records
 with different abundance values, so KLOE rejects that combination rather than
 silently discarding the annotations.
@@ -413,6 +481,15 @@ Input directory for archive B.
 
 #### out-dir -o
 Output directory where the merged archive is written.
+It must differ from both input directories, including aliases through symlinks,
+and must not already contain archive files.
+
+#### k_size -k
+Merge infers k from v4 archive manifests and requires both inputs to use the
+same k. An explicit `-k` must match that recorded value. For inputs without a
+manifest, provide their original k explicitly; KLOE cannot infer a legacy
+archive's k from its sequences.
+Graph merge currently supports k values from 1 through 32.
 
 #### memory -r
 The default merge rebuilds the combined colored graph with embedded GGCAT. It removes
@@ -423,6 +500,8 @@ global memory budget for this operation.
 Pass `--structural-merge` only when a container-level concatenation is desired.
 This bounded-memory path preserves the input SPSS records but does not remove
 redundancy shared between the archives. It cannot be combined with a tig output mode.
+It supports older compact archives containing `id_to_color_id.txt.zst`; current
+v4 archives require the default graph merge.
 
 #### output tig mode flags
 Merge honors the same output mode flags as compression:

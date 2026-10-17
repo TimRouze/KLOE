@@ -1114,12 +1114,6 @@ pub fn merge_archives_with_config(
     memory_gb: usize,
     cfg: MergeConfig,
 ) -> io::Result<()> {
-    if k == 0 || k > 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("merge supports k in [1, 32], got {k}"),
-        ));
-    }
     if output_dir.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1130,6 +1124,16 @@ pub fn merge_archives_with_config(
     let archive_a_root = Path::new(archive_a_dir);
     let archive_b_root = Path::new(archive_b_dir);
     let output_root = Path::new(output_dir);
+    // Validate before opening any output or temporary transpose file. A zero k
+    // means infer from metadata; a nonzero value is an explicit override.
+    let k = resolve_merge_k(archive_a_root, archive_b_root, k)?;
+    for input in [archive_a_root, archive_b_root] {
+        if output_root.exists() && fs::canonicalize(input)? == fs::canonicalize(output_root)? {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "merge output must differ from both input archive directories"));
+        }
+    }
+    let _output_lock = crate::archive::OutputLock::acquire(output_root)?;
 
     let requested_tig_rebuild =
         cfg.use_unitigs || cfg.use_matchtigs || cfg.use_eulertigs || cfg.use_simplitigs;
@@ -1282,6 +1286,30 @@ pub fn merge_archives_with_config(
         merge_mode_name(&cfg)
     );
     Ok(())
+}
+
+fn resolve_merge_k(a: &Path, b: &Path, requested: usize) -> io::Result<usize> {
+    let stored = [crate::archive::recorded_k(a)?, crate::archive::recorded_k(b)?];
+    let mut resolved = (requested != 0).then_some(requested);
+    for k in stored {
+        let k = match k {
+            Some(k) => k,
+            None if requested != 0 => requested,
+            None => return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "legacy merge inputs have no recorded k; provide their original k with -k")),
+        };
+        if resolved.is_some_and(|expected| expected != k) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "merge inputs and any explicit -k must use the same k"));
+        }
+        resolved = Some(k);
+    }
+    let k = resolved.unwrap();
+    if !(1..=32).contains(&k) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("merge supports k in [1, 32], got {k}")));
+    }
+    Ok(k)
 }
 
 fn read_varint_u64_from_reader(reader: &mut impl Read) -> io::Result<Option<u64>> {

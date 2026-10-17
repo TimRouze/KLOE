@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod abundance;
+mod archive;
 mod logan;
 mod compress;
 mod decompress;
@@ -8,15 +9,17 @@ mod merge;
 mod packed_tigs;
 mod records;
 mod utils;
+#[cfg(test)]
+mod audit_tests;
 use clap::Parser;
 use std::path::Path;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    ///output: Option<String>,
     /// Command mode: "compress", "decompress", or "merge"
-    decompress: Option<String>,
+    #[arg(value_parser = ["compress", "decompress", "merge"])]
+    mode: String,
     ///Input file list (Compression)
     #[arg(short, long, default_value_t=String::from(""))]
     input_list: String,
@@ -26,10 +29,16 @@ struct Args {
     /// Maximum simultaneous Logan downloads
     #[arg(long, default_value_t = 4, requires = "logan_accessions", value_parser = clap::value_parser!(u16).range(1..))]
     logan_downloads: u16,
+    /// Stop on the first invalid or failed Logan accession instead of skipping it
+    #[arg(long, requires = "logan_accessions")]
+    logan_strict: bool,
+    /// Additional attempts for transient Logan HTTP errors and interrupted downloads
+    #[arg(long, default_value_t = 2, requires = "logan_accessions")]
+    logan_retries: u8,
     /// Logan HTTP(S) bucket or mirror URL
     #[arg(long, default_value = logan::DEFAULT_BASE_URL, requires = "logan_accessions")]
     logan_base_url: String,
-    /// Number of threads (defaults to 1)
+    /// Number of threads (defaults to the available logical CPUs)
     #[arg(short, long, default_value_t = num_cpus::get())]
     threads: usize,
     ///Output directory
@@ -50,19 +59,19 @@ struct Args {
     ///Required memory budget in GB for compression/decompression workflows
     #[arg(short = 'r', long)]
     memory: Option<usize>,
-    ///K value, default = 31
-    #[arg(short, long, default_value_t = 31)]
-    k_size: usize,
+    /// K value: compression defaults to 31; merge uses archive metadata (required for legacy inputs)
+    #[arg(short, long, value_parser = parse_k)]
+    k_size: Option<usize>,
     ///Minimizer size (< k), default = 12
     #[arg(short, long, default_value_t = 12)]
     minimizer_size: usize,
-    /// Optionally verify that all canonical k-mers are preserved with the correct dataset IDs
+    /// Compatibility flag; currently ignored by the GGCAT backend
     #[arg(long = "verify-kmers", default_value_t = false)]
     verify_kmers: bool,
-    /// Number of partitions is 2^partition_power (default 1024 partitions)
+    /// Compatibility option; currently ignored by the GGCAT backend
     #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
     partition_power: u32,
-    /// Skip sorting within partitions and during final merge (output will not be globally sorted)
+    /// Compatibility flag; currently ignored (records are grouped by colors)
     #[arg(long = "skip-sort", default_value_t = false)]
     skip_sort: bool,
     /// Produce unitigs (default for compression, decompression and graph merge)
@@ -100,7 +109,7 @@ struct Args {
     /// Compress: preserve abundance fields; decompress: restore them in FASTA headers
     #[arg(long = "abundance", default_value_t = false)]
     abundance: bool,
-    /// Decompress: keep only k-mers with decoded abundance strictly above this integer
+    /// Keep abundance strictly above N: input values on compression, decoded values on decompression
     #[arg(long = "abundance-threshold")]
     abundance_threshold: Option<u64>,
     /// Compress: preserve integer abundance exactly, without quantization or saturation
@@ -116,6 +125,11 @@ struct Args {
     #[arg(long = "abundance-max", alias = "max-abundance", default_value_t = 50000, requires = "abundance", value_parser = clap::value_parser!(u64).range(1..))]
     abundance_max: u64,
 }
+fn parse_k(value: &str) -> Result<usize, String> {
+    value.parse::<usize>().ok().filter(|&k| k > 0)
+        .ok_or_else(|| "k must be a positive integer".to_owned())
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -126,7 +140,7 @@ fn main() {
     let input_fof = args.logan_accessions.clone().unwrap_or(args.input_list);
     let threads = args.threads;
     let temp_dir = args.temp_dir;
-    let k = args.k_size;
+    let k = args.k_size.unwrap_or(31);
     let m = args.minimizer_size;
     //TODO HANDLE ERRORS FOR COMP AND DECOMP
     let wanted_path = args.wanted_files;
@@ -142,13 +156,14 @@ fn main() {
         eprintln!("Error: only one of --unitig, --simplitig, --matchtig, --eulertig can be set at a time.");
         std::process::exit(1);
     }
-    if let Some(do_decompress) = args.decompress {
+    {
+        let do_decompress = args.mode;
         if args.logan_accessions.is_some() && do_decompress != "compress" {
             eprintln!("Error: --logan-accessions is a compression option.");
             std::process::exit(2);
         }
-        if args.abundance_threshold.is_some() && do_decompress != "decompress" {
-            eprintln!("Error: --abundance-threshold is a decompression option.");
+        if args.abundance_threshold.is_some() && !matches!(do_decompress.as_str(), "compress" | "decompress") {
+            eprintln!("Error: --abundance-threshold is a compression or decompression option.");
             std::process::exit(2);
         }
         if (args.abundance_exact || args.abundance_u16) && do_decompress != "compress" {
@@ -234,8 +249,10 @@ fn main() {
                 abundance_exact: args.abundance_exact,
                 abundance_u16: args.abundance_u16,
                 use_simplitigs: args.simplitig,
+                abundance_threshold: args.abundance_threshold,
                 logan: args.logan_accessions.as_ref().map(|_| {
                     logan::LoganConfig::new(&args.logan_base_url, usize::from(args.logan_downloads))
+                        .map(|config| config.with_policy(args.logan_strict, args.logan_retries))
                         .unwrap_or_else(|err| { eprintln!("Error: {err}"); std::process::exit(2); })
                 }),
             };
@@ -285,7 +302,7 @@ fn main() {
                 &input_dir,
                 &input_dir_b,
                 &output_dir,
-                k,
+                args.k_size.unwrap_or(0),
                 memory,
                 merge_cfg,
             ) {
@@ -293,13 +310,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else {
-        println!(
-            "Wrong positional arguments given. Values are 'compress', 'decompress', or 'merge'"
-        );
-        println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
-        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
-        println!("Ex: if merge: cargo r -r -- merge -c archive_a --compressed-dir-b archive_b -o merged_archive -r 16");
     }
 }
 
@@ -351,7 +361,7 @@ mod tests {
     const SEQ_SHARED_23: &str = "CCGTAACCGTAACCGTAACCGTAACCGTAACCGTAAC";
     const SEQ_ONLY_3: &str = "ATGCTTATGCTTATGCTTATGCTTATGCTTATGCTTA";
 
-    fn ggcat_test_lock() -> MutexGuard<'static, ()> {
+    pub(super) fn ggcat_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
@@ -430,7 +440,7 @@ mod tests {
         kmers
     }
 
-    fn assert_kmer_equivalent(expected: &[String], dumped_fasta: &Path, k: usize) {
+    pub(super) fn assert_kmer_equivalent(expected: &[String], dumped_fasta: &Path, k: usize) {
         let expected_kmers = kmer_set_from_seqs(expected, k);
         let dumped_kmers = kmer_set_from_seqs(&parse_fasta_sequences(dumped_fasta), k);
         assert_eq!(dumped_kmers, expected_kmers, "k-mer content mismatch");
@@ -451,13 +461,13 @@ mod tests {
         archive_dir.join(format!("{mode}.fa.zst"))
     }
 
-    fn make_dump_path(out_dir: &Path, source_path: &Path) -> PathBuf {
+    fn make_dump_path(out_dir: &Path, source_path: &Path, dataset_id: usize) -> PathBuf {
         let stem = source_path
             .file_stem()
             .expect("missing file stem")
             .to_str()
             .expect("invalid utf8 stem");
-        out_dir.join(format!("Dump_{stem}.fa"))
+        out_dir.join(format!("Dump_{dataset_id}_{stem}.fa"))
     }
 
     fn count_dump_files(out_dir: &Path) -> usize {
@@ -547,6 +557,7 @@ mod tests {
             compress::GgcatCompressionConfig {
                 use_simplitigs,
                 logan: None,
+                abundance_threshold: None,
                 ..compress::GgcatCompressionConfig::default()
             },
         )?;
@@ -633,12 +644,12 @@ mod tests {
             file1: file1.clone(),
             file2: file2.clone(),
             file3: file3.clone(),
-            dump1_full: make_dump_path(&full_out_dir, &file1),
-            dump2_full: make_dump_path(&full_out_dir, &file2),
-            dump3_full: make_dump_path(&full_out_dir, &file3),
-            dump1_targeted: make_dump_path(&targeted_out_dir, &file1),
-            dump2_targeted: make_dump_path(&targeted_out_dir, &file2),
-            dump3_targeted: make_dump_path(&targeted_out_dir, &file3),
+            dump1_full: make_dump_path(&full_out_dir, &file1, 0),
+            dump2_full: make_dump_path(&full_out_dir, &file2, 1),
+            dump3_full: make_dump_path(&full_out_dir, &file3, 2),
+            dump1_targeted: make_dump_path(&targeted_out_dir, &file1, 0),
+            dump2_targeted: make_dump_path(&targeted_out_dir, &file2, 1),
+            dump3_targeted: make_dump_path(&targeted_out_dir, &file3, 2),
             expected1,
             expected2,
             expected3,
@@ -703,11 +714,11 @@ mod tests {
 
         let dump_full: Vec<PathBuf> = source_files
             .iter()
-            .map(|p| make_dump_path(&full_out_dir, p))
+            .enumerate().map(|(id, p)| make_dump_path(&full_out_dir, p, id))
             .collect();
         let dump_targeted: Vec<PathBuf> = source_files
             .iter()
-            .map(|p| make_dump_path(&targeted_out_dir, p))
+            .enumerate().map(|(id, p)| make_dump_path(&targeted_out_dir, p, id))
             .collect();
 
         let targeted_indices = vec![0, 1, 17, 23, 50, 79, 99];
@@ -787,10 +798,10 @@ mod tests {
             full_out_dir: full_out_dir.clone(),
             targeted_out_dir: targeted_out_dir.clone(),
             case_file: case_file.clone(),
-            case_dump_full: make_dump_path(&full_out_dir, &case_file),
-            case_dump_targeted: make_dump_path(&targeted_out_dir, &case_file),
-            control_dump_full: make_dump_path(&full_out_dir, &control_file),
-            control_dump_targeted: make_dump_path(&targeted_out_dir, &control_file),
+            case_dump_full: make_dump_path(&full_out_dir, &case_file, 0),
+            case_dump_targeted: make_dump_path(&targeted_out_dir, &case_file, 0),
+            control_dump_full: make_dump_path(&full_out_dir, &control_file, 1),
+            control_dump_targeted: make_dump_path(&targeted_out_dir, &control_file, 1),
         }
     }
 
@@ -894,9 +905,9 @@ mod tests {
         run_full_decompression(&archive, &full);
         run_targeted_decompression(&archive, &targeted, &[inputs[1].clone()]);
         for (dataset, input) in inputs.iter().enumerate() {
-            assert_kmer_equivalent(&expected[dataset], &make_dump_path(&full, input), K);
+            assert_kmer_equivalent(&expected[dataset], &make_dump_path(&full, input, dataset), K);
         }
-        assert_kmer_equivalent(&expected[1], &make_dump_path(&targeted, &inputs[1]), K);
+        assert_kmer_equivalent(&expected[1], &make_dump_path(&targeted, &inputs[1], 1), K);
         assert_eq!(count_dump_files(&targeted), 1);
     }
 
@@ -1540,7 +1551,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-                let text = fs::read_to_string(make_dump_path(&output, source)).unwrap();
+                let text = fs::read_to_string(make_dump_path(&output, source, dataset)).unwrap();
                 let mut actual = BTreeMap::new();
                 let mut value = None;
                 for line in text.lines() {
@@ -1601,8 +1612,8 @@ mod tests {
             let encoding = crate::abundance::Encoding::automatic(bits, maximum).unwrap();
             let expected_first = if encoding.base == crate::abundance::EXACT_BASE { value }
                 else { compress::decode_abundance(compress::encode_abundance_with_bits(value, encoding.base, bits), encoding.base) };
-            for (source, expected) in [(&first, expected_first), (&second, maximum)] {
-                let dump = make_dump_path(&output, source);
+            for (dataset, (source, expected)) in [(&first, expected_first), (&second, maximum)].into_iter().enumerate() {
+                let dump = make_dump_path(&output, source, dataset);
                 assert_kmer_equivalent(&["ACGTACGTACGTACGT".to_string()], &dump, 7);
                 for header in fs::read_to_string(dump).unwrap().lines().filter(|line| line.starts_with('>')) {
                     assert_eq!(crate::abundance::parse_header(header.as_bytes()).unwrap(), expected,
@@ -1707,7 +1718,11 @@ mod tests {
                         let status = if missing { "404 Not Found" } else { "200 OK" };
                         let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                         if method != "HEAD" {
-                            let body = if gets == truncated_get { &body[..body.len()/2] } else { body };
+                            let body = if gets == truncated_get {
+                                let second = body.windows(4).enumerate().skip(1)
+                                    .find_map(|(i, magic)| (magic == [0x28, 0xb5, 0x2f, 0xfd]).then_some(i)).unwrap_or(0);
+                                &body[..second + (body.len() - second)/2]
+                            } else { body };
                             let _ = socket.write_all(body);
                         }
                     }
@@ -1724,17 +1739,59 @@ mod tests {
         }
 
         fn compress_logan(work: &Path, server: &Server, bits: Option<u8>) -> std::io::Result<()> {
+            compress_logan_options(work, server, bits, true, None, 1, "SRR1\nERR2\n")
+        }
+
+        #[test]
+        fn logan_report_failure_never_publishes_a_complete_archive() {
+            let _guard = ggcat_test_lock();
+            let work = tempfile::tempdir().unwrap();
+            fs::create_dir_all(work.path().join("archive/logan-skipped.tsv")).unwrap();
+            let server = Server::new(vec![
+                ("SRR1", ">a\nACGTACGTACGTACGT\n"),
+                ("ERR2", ">b\nTGCATGCATGCATGCA\n"),
+            ], 0, 0);
+            assert!(compress_logan(work.path(), &server, None).is_err());
+            assert!(work.path().join("archive/filenames.idx").is_file());
+            assert!(!work.path().join("archive/manifest.kloe").exists());
+        }
+
+        fn compress_logan_options(
+            work: &Path,
+            server: &Server,
+            bits: Option<u8>,
+            strict: bool,
+            threshold: Option<u64>,
+            downloads: usize,
+            names: &str,
+        ) -> std::io::Result<()> {
             let archive = work.join("archive");
             fs::create_dir_all(&archive).unwrap();
             let accessions = work.join("accessions.txt");
-            fs::write(&accessions, "SRR1\nERR2\n").unwrap();
+            fs::write(&accessions, names).unwrap();
             compress::compress_with_ggcat(
-                &(archive.display().to_string() + "/"), &accessions.display().to_string(),
-                2, 7, 5, 10, false, false, true, false, false,
+                &(archive.display().to_string() + "/"),
+                &accessions.display().to_string(),
+                2,
+                7,
+                5,
+                10,
+                false,
+                false,
+                true,
+                false,
+                false,
                 compress::GgcatCompressionConfig {
-                    memory_gb: 1, temp_dir: work.join("tmp").display().to_string(),
-                    abundance_bits: bits.unwrap_or(8), abundance_max: bits.map(|_| 50_000),
-                    logan: Some(crate::logan::LoganConfig::new(&server.url, 1).unwrap()),
+                    memory_gb: 1,
+                    temp_dir: work.join("tmp").display().to_string(),
+                    abundance_bits: bits.unwrap_or(8),
+                    abundance_max: bits.map(|_| 50_000),
+                    logan: Some(
+                        crate::logan::LoganConfig::new(&server.url, downloads)
+                            .unwrap()
+                            .with_policy(strict, 0),
+                    ),
+                    abundance_threshold: threshold,
                     ..compress::GgcatCompressionConfig::default()
                 },
             )
@@ -1761,8 +1818,8 @@ mod tests {
                         ..decompress::GgcatRebuildConfig::default()
                     },
                 ).unwrap();
-                for (accession, seq, value) in [("SRR1", "ACGTACGTACGTACGT", 17), ("ERR2", "TGCATGCATGCATGCA", 50_000)] {
-                    let dump = make_dump_path(&output, Path::new(accession));
+                for (dataset, (accession, seq, value)) in [("SRR1", "ACGTACGTACGTACGT", 17), ("ERR2", "TGCATGCATGCATGCA", 50_000)].into_iter().enumerate() {
+                    let dump = make_dump_path(&output, Path::new(accession), dataset);
                     assert_kmer_equivalent(&[seq.to_owned()], &dump, 7);
                     if let Some(bits) = bits {
                         let encoding = crate::abundance::Encoding::automatic(bits, 50_000).unwrap();
@@ -1799,6 +1856,248 @@ mod tests {
             assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt", "-i", "local.fof"]).is_err());
             assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-downloads", "2"]).is_err());
             assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt", "--logan-downloads", "0"]).is_err());
+        }
+
+        fn restore(work: &Path, abundance: bool) -> PathBuf {
+            let output = work.join("restored");
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(),
+                &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(),
+                &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(),
+                &(output.display().to_string() + "/"),
+                &String::new(),
+                work.join("archive").display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false,
+                    restore_abundance: abundance,
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            )
+            .unwrap();
+            output
+        }
+
+        #[test]
+        fn logan_tolerant_mode_excludes_failed_and_partial_datasets_completely() {
+            let _guard = ggcat_test_lock();
+            let bad = ">a ka:f:7\nAAAAAAAAACGTACGTACGT\n>b ka:f:7\nCCCCCCCCCTTTTTTTTTT\n>c ka:f:7\nGGGGGGGGGAAAAAAAAA\n";
+            let good = ">a ka:f:17\nACGTACGTACGTACGTTGCATGCATGCATGCA\n";
+            for bits in [None, Some(8), Some(16)] {
+                for partial in [false, true] {
+                    let get = if bits.is_some() { 4 } else { 1 };
+                    let server = Server::new(
+                        vec![("SRR1", bad), ("ERR2", good)],
+                        if partial { 0 } else { get },
+                        if partial { get } else { 0 },
+                    );
+                    let work = tempfile::tempdir().unwrap();
+                    compress_logan_options(
+                        work.path(),
+                        &server,
+                        bits,
+                        false,
+                        None,
+                        1,
+                        "invalid-run\nSRR999\nSRR1\nERR2\nERR2\n",
+                    )
+                    .unwrap();
+                    let names =
+                        fs::read_to_string(work.path().join("archive/filenames_id.txt")).unwrap();
+                    assert_eq!(names.lines().count(), 1);
+                    assert!(names.starts_with("ERR2:"), "{names}");
+                    let report =
+                        fs::read_to_string(work.path().join("archive/logan-skipped.tsv")).unwrap();
+                    for excluded in ["invalid-run", "SRR999", "SRR1"] {
+                        assert!(report.contains(excluded), "{report}");
+                    }
+                    assert!(!report.contains("ERR2"));
+                    let output = restore(work.path(), bits.is_some());
+                    let dump = make_dump_path(&output, Path::new("ERR2"), 0);
+                    assert_kmer_equivalent(
+                        &["ACGTACGTACGTACGTTGCATGCATGCATGCA".to_owned()],
+                        &dump,
+                        7,
+                    );
+                    assert!(!make_dump_path(&output, Path::new("SRR1"), 0).exists());
+                }
+            }
+        }
+
+        #[test]
+        fn logan_all_failed_never_creates_a_complete_archive() {
+            let _guard = ggcat_test_lock();
+            for bits in [None, Some(8)] {
+                let server = Server::new(vec![], 0, 0);
+                let work = tempfile::tempdir().unwrap();
+                assert!(compress_logan_options(
+                    work.path(),
+                    &server,
+                    bits,
+                    false,
+                    None,
+                    2,
+                    "bad\nSRR999\nERR999\n"
+                )
+                .is_err());
+                assert!(!work.path().join("archive/manifest.kloe").exists());
+                let report =
+                    fs::read_to_string(work.path().join("archive/logan-skipped.tsv")).unwrap();
+                assert!(
+                    report.contains("SRR999")
+                        && report.contains("ERR999")
+                        && report.contains("bad")
+                );
+            }
+        }
+
+        #[test]
+        fn compression_filter_local_and_logan_works_with_or_without_stored_abundance() {
+            let _guard = ggcat_test_lock();
+            let input = ">low ka:f:9.99\nAAAAAAAAACCCCCCCCCC\n>equal ka:f:10\nGGGGGGGGGAAAAAAAAA\n>keep ka:f:10.01\nACGTACGTACGTACGT\n>high ka:f:50100\nTGCATGCATGCATGCA\n";
+            for remote in [false, true] {
+                for bits in [None, Some(4), Some(8), Some(16)] {
+                    let work = tempfile::tempdir().unwrap();
+                    if remote {
+                        let server = Server::new(vec![("SRR1", input)], 0, 0);
+                        compress_logan_options(
+                            work.path(),
+                            &server,
+                            bits,
+                            false,
+                            Some(10),
+                            2,
+                            "SRR1\n",
+                        )
+                        .unwrap();
+                    } else {
+                        let file = work.path().join("input.fa");
+                        fs::write(&file, input).unwrap();
+                        let fof = work.path().join("input.fof");
+                        fs::write(&fof, format!("{}\n", file.display())).unwrap();
+                        fs::create_dir_all(work.path().join("archive")).unwrap();
+                        compress::compress_with_ggcat(
+                            &(work.path().join("archive").display().to_string() + "/"),
+                            &fof.display().to_string(),
+                            2,
+                            7,
+                            5,
+                            10,
+                            false,
+                            false,
+                            true,
+                            false,
+                            false,
+                            compress::GgcatCompressionConfig {
+                                memory_gb: 1,
+                                temp_dir: work.path().join("tmp").display().to_string(),
+                                abundance_bits: bits.unwrap_or(8),
+                                abundance_max: bits.map(|_| 50_000),
+                                abundance_threshold: Some(10),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let output = restore(work.path(), bits.is_some());
+                    let name = if remote {
+                        PathBuf::from("SRR1")
+                    } else {
+                        work.path().join("input.fa")
+                    };
+                    let dump = make_dump_path(&output, &name, 0);
+                    assert_kmer_equivalent(
+                        &["ACGTACGTACGTACGT".to_owned(), "TGCATGCATGCATGCA".to_owned()],
+                        &dump,
+                        7,
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn cli_minimizer_default_is_twelve_and_compression_filter_is_independent() {
+            use clap::Parser;
+            let args = super::super::Args::try_parse_from([
+                "kloe",
+                "compress",
+                "--abundance-threshold",
+                "10",
+            ])
+            .unwrap();
+            assert_eq!(args.minimizer_size, 12);
+            assert_eq!(args.abundance_threshold, Some(10));
+            assert!(!args.abundance);
+            assert!(!args.logan_strict);
+            assert_eq!(args.logan_retries, 2);
+            assert!(
+                super::super::Args::try_parse_from(["kloe", "compress", "--logan-strict"]).is_err()
+            );
+        }
+
+        #[test]
+        fn compression_filter_can_produce_a_valid_empty_archive() {
+            let _guard = ggcat_test_lock();
+            for remote in [false, true] {
+                for bits in [None, Some(8)] {
+                    let work = tempfile::tempdir().unwrap();
+                    let input = ">a ka:f:10\nACGTACGTACGTACGT\n";
+                    if remote {
+                        let server = Server::new(vec![("SRR1", input)], 0, 0);
+                        compress_logan_options(
+                            work.path(),
+                            &server,
+                            bits,
+                            false,
+                            Some(10),
+                            2,
+                            "SRR1\n",
+                        )
+                        .unwrap();
+                    } else {
+                        let input_file = work.path().join("input.fa");
+                        fs::write(&input_file, input).unwrap();
+                        let fof = work.path().join("input.fof");
+                        fs::write(&fof, format!("{}\n", input_file.display())).unwrap();
+                        fs::create_dir_all(work.path().join("archive")).unwrap();
+                        compress::compress_with_ggcat(
+                            &(work.path().join("archive").display().to_string() + "/"),
+                            &fof.display().to_string(),
+                            2,
+                            7,
+                            5,
+                            10,
+                            false,
+                            false,
+                            true,
+                            false,
+                            false,
+                            compress::GgcatCompressionConfig {
+                                memory_gb: 1,
+                                temp_dir: work.path().join("tmp").display().to_string(),
+                                abundance_bits: bits.unwrap_or(8),
+                                abundance_max: bits.map(|_| 50_000),
+                                abundance_threshold: Some(10),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let manifest = fs::read(work.path().join("archive/manifest.kloe")).unwrap();
+                    assert_eq!(u64::from_le_bytes(manifest[16..24].try_into().unwrap()), 1);
+                    assert_eq!(u64::from_le_bytes(manifest[24..32].try_into().unwrap()), 0);
+                    assert_eq!(
+                        fs::read_to_string(work.path().join("archive/filenames_id.txt"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        1
+                    );
+                    restore(work.path(), bits.is_some());
+                }
+            }
         }
     }
 
@@ -1861,6 +2160,7 @@ mod tests {
                 abundance_u16: u16_mode,
                 use_simplitigs,
                 logan: None,
+                abundance_threshold: None,
             },
         )
         .unwrap();
@@ -1889,8 +2189,8 @@ mod tests {
             },
         )
         .unwrap();
-        let first_dump = fs::read_to_string(make_dump_path(&output, &first)).unwrap();
-        let second_dump = fs::read_to_string(make_dump_path(&output, &second)).unwrap();
+        let first_dump = fs::read_to_string(make_dump_path(&output, &first, 0)).unwrap();
+        let second_dump = fs::read_to_string(make_dump_path(&output, &second, 1)).unwrap();
         let restored_17 = if exact {
             first_value
         } else {
@@ -1941,7 +2241,7 @@ mod tests {
             for (id, source) in [&first, &second].into_iter().enumerate() {
                 let path = if rebuilt {
                     filtered.join(format!("Dump_{id}_{}.unitigs.fa", source.file_stem().unwrap().to_str().unwrap()))
-                } else { make_dump_path(&filtered, source) };
+                } else { make_dump_path(&filtered, source, id) };
                 let sequences = parse_fasta_sequences(&path);
                 let expected = if id == 1 && restored_max > threshold {
                     vec!["ACGTACGTACGTACGT".to_string()]
@@ -2033,18 +2333,18 @@ mod tests {
 
         assert_kmer_equivalent(
             &[shared.clone(), a1_only.clone()],
-            &make_dump_path(&merged_out, &a_file1),
+            &make_dump_path(&merged_out, &a_file1, 0),
             K,
         );
         assert_kmer_equivalent(
             &[a2_only.clone()],
-            &make_dump_path(&merged_out, &a_file2),
+            &make_dump_path(&merged_out, &a_file2, 1),
             K,
         );
-        assert_kmer_equivalent(&[shared.clone()], &make_dump_path(&merged_out, &b_file1), K);
+        assert_kmer_equivalent(&[shared.clone()], &make_dump_path(&merged_out, &b_file1, 2), K);
         assert_kmer_equivalent(
             &[b2_only.clone()],
-            &make_dump_path(&merged_out, &b_file2),
+            &make_dump_path(&merged_out, &b_file2, 3),
             K,
         );
     }
