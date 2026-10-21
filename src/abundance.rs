@@ -750,7 +750,7 @@ impl DynamicSequencesStream for ExactSequencesStream {
             SequenceSource::Local(path) => {
                 std::fs::metadata(path).map_or(1, |meta| meta.len().max(1))
             }
-            SequenceSource::Logan(source) => source.estimated_bases(),
+            SequenceSource::Logan(source) => source.estimated_annotated_bases(),
         }
     }
     fn read_block(
@@ -996,8 +996,72 @@ mod tests {
         assert_eq!(stream.colors[0].get(11), Some(1));
         assert_eq!(stream.colors[1].get(11), Some(2));
         assert_eq!(stream.colors[1].get(50_000), Some(3));
-        assert_eq!(stream.estimated_base_count(0), 24);
-        assert_eq!(stream.estimated_base_count(1), 16);
+        for (block, fasta) in [
+            ">a ka:f:7\nACGTACGT\n>b ka:f:11\nTGCATGCA\n>c ka:f:7\nACGTACGT\n",
+            ">a ka:f:11\nACGTACGT\n>b ka:f:50001\nTGCATGCA\n",
+        ].iter().enumerate() {
+            let compressed = zstd::stream::encode_all(fasta.as_bytes(), 1).unwrap();
+            assert_eq!(stream.estimated_base_count(block), compressed.len() as u64);
+        }
+    }
+
+    #[test]
+    fn logan_abundance_planning_matches_local_even_without_content_length() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        for bits in [8, 16] {
+            let fasta = format!(">a ka:i:20\n{}\n>b ka:i:700\nACGTACGT\n", "ACGT".repeat(4096));
+            let body = zstd::stream::encode_all(fasta.as_bytes(), 1).unwrap();
+            assert!(fasta.len() > body.len() * 10);
+            let dir = tempfile::tempdir().unwrap();
+            let local_path = dir.path().join("SRR1.unitigs.fa.zst");
+            std::fs::write(&local_path, &body).unwrap();
+            let (local, local_sources) = ExactSequencesStream::prepare_automatic_values(
+                &[local_path.display().to_string()], 1, bits, 50_000,
+            ).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let config = crate::logan::LoganConfig::new(
+                &format!("http://{}", listener.local_addr().unwrap()), 1,
+            ).unwrap();
+            let server = std::thread::spawn(move || {
+                // The abundance scan obtains the compressed size from consumed
+                // bytes even when the HTTP response is delimited by EOF.
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(line.starts_with("GET "));
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() { break; }
+                    }
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            });
+            let encoding = Encoding::automatic(bits, 50_000).unwrap();
+            let (remote, remote_sources) = ExactSequencesStream::prepare_logan(
+                &["SRR1".to_owned()], 1, Some((encoding.base, bits)), Some(50_000), &config,
+            ).unwrap();
+            assert_eq!(remote.estimated_base_count(0), local.estimated_base_count(0));
+            assert_eq!(remote_sources, local_sources);
+            let mut remote_records = Vec::new();
+            remote.read_block(0, false, Some(30), &mut |sequence, info| {
+                remote_records.push((sequence.seq.to_vec(), info.color));
+            });
+            let mut local_records = Vec::new();
+            local.read_block(0, false, Some(30), &mut |sequence, info| {
+                local_records.push((sequence.seq.to_vec(), info.color));
+            });
+            server.join().unwrap();
+            config.check().unwrap();
+            assert!(!config.is_skipped("SRR1"));
+            assert_eq!(remote_records, local_records);
+            assert_eq!(remote.estimated_base_count(0), local.estimated_base_count(0));
+        }
     }
 
     #[test]

@@ -8,25 +8,27 @@ pub struct FastaFileSequencesStream {
     sequences_reader: SequencesReader,
 }
 
+/// Compatibility estimate used to plan buckets for file and remote FASTA inputs.
+/// This is a planning heuristic, not a measured count of decoded bases.
+pub fn estimated_fasta_bases_from_size(length: u64, compressed: bool) -> u64 {
+    if compressed {
+        (length as f64 * 0.5) as u64
+    } else {
+        length
+    }
+}
+
 impl FastaFileSequencesStream {
     pub fn get_estimated_bases_count(file: &PathBuf) -> anyhow::Result<u64> {
-        // TODO: Improve this ratio estimation
-        const COMPRESSED_READS_RATIO: f64 = 0.5;
-
         let length = std::fs::metadata(file)
             .log_unrecoverable_error_with_data("Error while opening file", file.display())?
             .len();
 
-        let file_bases_count = if file
+        let compressed = file
             .extension()
             .map(|x| x == "gz" || x == "lz4" || x == "zst" || x == "zstd")
-            .unwrap_or(false)
-        {
-            (length as f64 * COMPRESSED_READS_RATIO) as u64
-        } else {
-            length
-        };
-        Ok(file_bases_count)
+            .unwrap_or(false);
+        Ok(estimated_fasta_bases_from_size(length, compressed))
     }
 }
 

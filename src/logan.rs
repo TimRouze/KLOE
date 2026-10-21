@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub(crate) const DEFAULT_BASE_URL: &str = "https://s3.amazonaws.com/logan-pub";
 const SEQUENCE_CHUNK: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
+const UNKNOWN_COMPRESSED_BYTES: u64 = u64::MAX;
 
 fn retry_after(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers
@@ -267,7 +268,7 @@ impl LoganConfig {
             accession: accession.to_owned(),
             url: format!("{}/u/{accession}/{accession}.unitigs.fa.zst", self.base_url),
             config: self.clone(),
-            estimated_bases: Arc::new(AtomicU64::new(1)),
+            compressed_bytes: Arc::new(AtomicU64::new(UNKNOWN_COMPRESSED_BYTES)),
             fingerprint: Some(Arc::new(Mutex::new(None))),
         })
     }
@@ -382,7 +383,10 @@ pub(crate) struct LoganSource {
     accession: String,
     url: String,
     config: LoganConfig,
-    estimated_bases: Arc<AtomicU64>,
+    // UNKNOWN_COMPRESSED_BYTES means unknown; zero is a known empty object.
+    // Never replace the file-size hint with decoded bases:
+    // local input planning uses file bytes, including in abundance mode.
+    compressed_bytes: Arc<AtomicU64>,
     fingerprint: Option<Arc<Mutex<Option<blake3::Hash>>>>,
 }
 
@@ -561,7 +565,22 @@ impl<R: Read> Read for FingerprintReader<R> {
 
 impl LoganSource {
     pub(crate) fn estimated_bases(&self) -> u64 {
-        self.estimated_bases.load(Ordering::Relaxed)
+        self.planning_estimate(false)
+    }
+
+    pub(crate) fn estimated_annotated_bases(&self) -> u64 {
+        self.planning_estimate(true)
+    }
+
+    fn planning_estimate(&self, annotated: bool) -> u64 {
+        if self.is_skipped() {
+            return 0;
+        }
+        match self.compressed_bytes.load(Ordering::Relaxed) {
+            UNKNOWN_COMPRESSED_BYTES => 1_000_000_000, // HEAD unavailable; still attempt GET.
+            bytes if annotated => bytes.max(1), // Same as local abundance/filter readers.
+            bytes => ggcat_api::estimated_fasta_bases_from_size(bytes, true),
+        }
     }
 
     fn inspect_size(&self) -> io::Result<()> {
@@ -582,7 +601,6 @@ impl LoganSource {
                     "Warning: {}: metadata unavailable ({error}); trying the download",
                     self.accession
                 );
-                self.estimated_bases.store(1_000_000_000, Ordering::Relaxed);
                 return Ok(());
             }
         };
@@ -592,10 +610,7 @@ impl LoganSource {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
         // A scheduling/bucketing estimate only; no body download in this request.
-        self.estimated_bases.store(
-            bytes.map_or(1_000_000_000, |n| n.saturating_mul(4).max(1)),
-            Ordering::Relaxed,
-        );
+        self.compressed_bytes.store(bytes.unwrap_or(UNKNOWN_COMPRESSED_BYTES), Ordering::Relaxed);
         Ok(())
     }
 
@@ -653,7 +668,7 @@ impl LoganSource {
             };
             let decoder = zstd::stream::read::Decoder::new(input)?;
             let mut reader = BufReader::with_capacity(64 * 1024, decoder);
-            let bases = process_fasta_stream(
+            process_fasta_stream(
                 &mut reader,
                 copyback,
                 copy_ident || self.config.threshold.is_some(),
@@ -670,18 +685,13 @@ impl LoganSource {
                     Ok(())
                 },
             )?;
+            let input = reader.get_ref().get_ref().get_ref();
             Ok::<_, io::Error>((
-                bases,
-                reader
-                    .get_ref()
-                    .get_ref()
-                    .get_ref()
-                    .hash
-                    .as_ref()
-                    .map(blake3::Hasher::finalize),
+                input.inner.offset,
+                input.hash.as_ref().map(blake3::Hasher::finalize),
             ))
         })();
-        let (bases, fingerprint) = parsed.map_err(|error| {
+        let (compressed_bytes, fingerprint) = parsed.map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("{}: Logan download failed: {error}", self.accession),
@@ -698,7 +708,7 @@ impl LoganSource {
             }
             *previous = Some(fingerprint);
         }
-        self.estimated_bases.store(bases.max(1), Ordering::Relaxed);
+        self.compressed_bytes.store(compressed_bytes, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -887,7 +897,11 @@ impl LoganSequencesStream {
 
 impl DynamicSequencesStream for LoganSequencesStream {
     fn estimated_base_count(&self, block: usize) -> u64 {
-        self.sources[block].estimated_bases()
+        if self.config.threshold.is_some() {
+            self.sources[block].estimated_annotated_bases()
+        } else {
+            self.sources[block].estimated_bases()
+        }
     }
     fn read_block(
         &self,
@@ -907,6 +921,69 @@ impl DynamicSequencesStream for LoganSequencesStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logan_planning_matches_local_input_before_and_after_download() {
+        use ggcat_api::GeneralSequenceBlockData;
+        use std::net::TcpListener;
+
+        for threshold in [None, Some(10)] {
+            let fasta = format!(">a ka:i:20\n{}\n", "ACGT".repeat(4096));
+            let body = zstd::stream::encode_all(fasta.as_bytes(), 1).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let local_path = dir.path().join("SRR1.unitigs.fa.zst");
+            fs::write(&local_path, &body).unwrap();
+            let expected = if let Some(threshold) = threshold {
+                crate::abundance::FilteredSequencesStream::prepare(
+                    &[local_path.display().to_string()], threshold,
+                ).unwrap().estimated_base_count(0)
+            } else {
+                GeneralSequenceBlockData::FASTA((local_path, None))
+                    .estimated_bases_count().unwrap()
+            };
+            // A highly compressible fixture exposes decoded-size substitutions.
+            assert!(fasta.len() > body.len() * 10);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let config = LoganConfig::new(
+                &format!("http://{}", listener.local_addr().unwrap()), 1,
+            ).unwrap().with_threshold(threshold);
+            let server = std::thread::spawn(move || {
+                for method in ["HEAD", "GET"] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    assert!(http_request(&stream).starts_with(method));
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                    if method == "GET" { stream.write_all(&body).unwrap(); }
+                }
+            });
+            let input = LoganSequencesStream::new(&["SRR1".to_owned()], &config).unwrap();
+            assert_eq!(input.estimated_base_count(0), expected);
+            let mut bases = 0;
+            input.read_block(0, false, Some(30), &mut |sequence, _| {
+                bases += sequence.seq.len();
+            });
+            server.join().unwrap();
+            config.check().unwrap();
+            assert!(!input.sources[0].is_skipped());
+            assert_eq!(bases, 4 * 4096);
+            assert_eq!(input.estimated_base_count(0), expected);
+        }
+    }
+
+    #[test]
+    fn logan_planning_excludes_failed_inputs_and_handles_unknown_sizes() {
+        let config = LoganConfig::new("http://127.0.0.1:1", 1).unwrap();
+        let source = config.source("SRR1").unwrap();
+        assert_eq!(source.estimated_bases(), 1_000_000_000);
+        assert_eq!(source.estimated_annotated_bases(), 1_000_000_000);
+        for bytes in [0, 1, 101, 1024 * 1024 * 1024 * 1024] {
+            source.compressed_bytes.store(bytes, Ordering::Relaxed);
+            assert_eq!(source.estimated_bases(), (bytes as f64 * 0.5) as u64);
+            assert_eq!(source.estimated_annotated_bases(), bytes.max(1));
+        }
+        source.record_error("fixture excludes an accession after a partial read");
+        assert_eq!(source.estimated_bases(), 0);
+        assert_eq!(source.estimated_annotated_bases(), 0);
+    }
 
     #[test]
     fn retry_after_accepts_seconds_and_http_dates() {

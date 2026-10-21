@@ -90,7 +90,13 @@ downloads: one to identify observed abundance values, and another for graph
 construction. Both passes process accessions in parallel, bounded by
 `--logan-downloads`; graph-pass concurrency also depends on GGCAT's reader
 threads, controlled by `-t`. The first abundance pass scans headers without
-copying DNA, and keeps only the observed abundance dictionary and base counts.
+copying DNA, and keeps the observed abundance dictionaries and compressed byte counts.
+Bucket planning uses the same file-size heuristic as the corresponding local
+input mode: half the compressed size for ordinary FASTA input, or the compressed
+size for abundance/filter input. The abundance scan does not replace this hint
+with decoded sequence length. Missing size metadata uses an advisory estimate;
+accessions known to have failed before planning contribute zero. These estimates
+control GGCAT's bucket plan, not the amount of input retained in memory.
 Stream fingerprints detect objects that change between abundance passes.
 Transient connection errors, HTTP 408/429 and server errors are retried with
 backoff. A server's `Retry-After` delay is honored, whether specified as seconds
@@ -269,10 +275,11 @@ above. Legacy archives remain readable.
 The vendored ggcat fork is pinned to commit:
 `fe6a633e64f60cd7266951d73c1def5cc023fa96`
 
-`-r/--memory` is the total compression memory budget in GB. KLOE derives bounded
-post-processing windows, graph-record chunks, group batches, and transpose blocks
-from this value. Embedded ggcat receives 75% of the budget and uses
-disk-backed intermediate storage; the remainder is reserved for KLOE and I/O.
+`-r/--memory` is a compression memory target in GB, not a hard limit on process
+RAM. KLOE derives post-processing windows, graph-record chunks and group batches
+from this value and passes 75% to embedded ggcat. GGCAT uses disk-backed
+intermediates, but its active, uncompacted input buckets still prefer RAM;
+worker buffers and other allocations also contribute to peak memory.
 
 Dataset-to-color indexes use a bounded external transpose into dataset-major,
 CID-monotonic posting lists. Graph positions are also generated as
