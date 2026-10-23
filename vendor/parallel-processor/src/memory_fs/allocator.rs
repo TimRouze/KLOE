@@ -465,7 +465,13 @@ impl ChunksAllocator {
                 },
             }) {
                 None => {
-                    if !MemoryFs::reduce_pressure() {
+                    if MemoryFs::reduce_pressure() {
+                        // Progress may be pending on a slow disk even if no
+                        // chunk has been returned yet. Exhaustion retries must
+                        // be consecutive, not accumulated across successful
+                        // flush scheduling during a long streaming build.
+                        tries_count = 0;
+                    } else {
                         tries_count += 1;
                     }
 
@@ -612,7 +618,7 @@ mod tests {
 
     #[test]
     fn allocate_memory() {
-        CHUNKS_ALLOCATOR.initialize(MemoryDataSize::from_gibioctets(8), 22, 0);
+        CHUNKS_ALLOCATOR.initialize(MemoryDataSize::from_gibioctets(8), 22, 0, None);
         for _ in 0..5 {
             let mut allocated_chunks: Vec<_> = std::iter::from_fn(move || {
                 Some(CHUNKS_ALLOCATOR.request_chunk(chunk_usage!(TemporarySpace)))

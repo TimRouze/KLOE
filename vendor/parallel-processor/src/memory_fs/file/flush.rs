@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use std::cmp::max;
 use std::io::{Seek, SeekFrom, Write};
 use std::ops::DerefMut;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,6 +21,10 @@ static FLUSH_THREADS: Mutex<Vec<JoinHandle<()>>> =
 
 static TAKE_FROM_QUEUE_MUTEX: Mutex<()> = Mutex::const_new(parking_lot::RawMutex::INIT, ());
 static WRITING_CHECK: RwLock<()> = RwLock::const_new(parking_lot::RawRwLock::INIT, ());
+
+// Includes queued items, senders blocked on the bounded queue, and items already
+// taken by a writer. An empty queue alone does not mean memory cannot be freed.
+static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
 static COUNTER_WRITING_APPEND: AtomicCounter<SumMode> =
     declare_counter_i64!("threads_file_append_count", SumMode, false);
@@ -58,7 +62,12 @@ impl GlobalFlush {
         unsafe { GLOBAL_FLUSH_QUEUE.as_ref().unwrap().len() == 0 }
     }
 
+    pub fn has_pending_writes() -> bool {
+        PENDING_WRITES.load(Ordering::Acquire) != 0
+    }
+
     pub fn add_item_to_flush_queue(item: FlushableItem) {
+        PENDING_WRITES.fetch_add(1, Ordering::AcqRel);
         unsafe { GLOBAL_FLUSH_QUEUE.as_ref().unwrap().send(item).unwrap() }
     }
 
@@ -115,6 +124,7 @@ impl GlobalFlush {
             drop(_writing_check);
             drop(file);
             drop(file_lock);
+            PENDING_WRITES.fetch_sub(1, Ordering::AcqRel);
             // Try lock the queue again
             queue_take_lock = TAKE_FROM_QUEUE_MUTEX.lock();
         }
@@ -150,7 +160,7 @@ impl GlobalFlush {
     }
 
     pub fn flush_to_disk() {
-        while !unsafe { GLOBAL_FLUSH_QUEUE.as_ref().unwrap().is_empty() } {
+        while Self::has_pending_writes() {
             std::thread::sleep(Duration::from_millis(50));
         }
         // Ensure that no writers are still writing!
@@ -166,5 +176,104 @@ impl GlobalFlush {
         for thread in threads.drain(..) {
             thread.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_data_size::MemoryDataSize;
+    use crate::memory_fs::{MemoryFs, RemoveFileMode};
+    use crate::memory_fs::allocator::CHUNKS_ALLOCATOR;
+    use crate::memory_fs::file::{internal::MemoryFileMode, writer::FileWriter};
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn scratch_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("kloe-{label}-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()))
+    }
+
+    #[test]
+    fn memory_pressure_waits_for_dequeued_writer() {
+        let path = scratch_path("slow-flush");
+        MemoryFs::init(MemoryDataSize::from_mebioctets(8), 2, 1, 32, None);
+        let reserved = CHUNKS_ALLOCATOR.get_total_memory().as_bytes();
+        let mut chunks: Vec<_> = (0..32)
+            .map(|_| CHUNKS_ALLOCATOR.request_chunk(chunk_usage!(TemporarySpace)))
+            .collect();
+        let writing = chunks.pop().unwrap();
+        writing.write_bytes_noextend(b"slow writer").unwrap();
+        let handle = Arc::new(Mutex::new(FileHandle::new(path.clone())));
+        let held_file = handle.lock();
+        // Exhaust the pool, then stop the writer on its file lock after it
+        // dequeues the final item. Releasing this write can free a buffer.
+        GlobalFlush::add_item_to_flush_queue(FlushableItem {
+            underlying_file: handle.clone(),
+            mode: FileFlushMode::WriteAt { buffer: writing, offset: 0 },
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !GlobalFlush::is_queue_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(GlobalFlush::is_queue_empty());
+        assert!(GlobalFlush::has_pending_writes());
+        assert!(MemoryFs::reduce_pressure(), "active writes must prevent emergency growth");
+
+        let (allocated, allocation) = mpsc::channel();
+        let requester = std::thread::spawn(move || {
+            allocated.send(CHUNKS_ALLOCATOR.request_chunk(chunk_usage!(TemporarySpace))).unwrap();
+        });
+        // The former allocator started an extra 256 MiB allocation after
+        // eleven 25 ms waits, despite the outstanding disk write.
+        assert!(allocation.recv_timeout(Duration::from_millis(400)).is_err(),
+            "allocator expanded instead of waiting for the outstanding write");
+        assert_eq!(CHUNKS_ALLOCATOR.get_total_memory().as_bytes(), reserved);
+
+        let (done, completion) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            GlobalFlush::flush_to_disk();
+            done.send(()).unwrap();
+        });
+        assert!(completion.recv_timeout(Duration::from_millis(100)).is_err(),
+            "flush returned while a dequeued writer still held its data");
+        drop(held_file);
+        drop(allocation.recv_timeout(Duration::from_secs(5)).unwrap());
+        requester.join().unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+        assert!(!GlobalFlush::has_pending_writes());
+        drop(chunks);
+        MemoryFs::terminate();
+        drop(handle);
+        assert_eq!(std::fs::read(&path).unwrap(), b"slow writer");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memory_pressure_disk_stream_reuses_fixed_pool() {
+        let path = scratch_path("bounded-disk-stream");
+        MemoryFs::init(MemoryDataSize::from_mebioctets(8), 2, 1, 32, None);
+        let reserved = CHUNKS_ALLOCATOR.get_total_memory().as_bytes();
+        let block: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut writer = FileWriter::create(&path, MemoryFileMode::DiskOnly);
+        // Stream 64 MiB through an 8 MiB pool and a two-item disk queue.
+        for _ in 0..1024 {
+            writer.write_all(&block).unwrap();
+        }
+        drop(writer);
+        MemoryFs::flush_to_disk(false);
+        assert_eq!(CHUNKS_ALLOCATOR.get_total_memory().as_bytes(), reserved);
+        let mut input = std::fs::File::open(&path).unwrap();
+        let mut restored = vec![0; block.len()];
+        for _ in 0..1024 {
+            input.read_exact(&mut restored).unwrap();
+            assert_eq!(restored, block);
+        }
+        assert_eq!(input.read(&mut [0]).unwrap(), 0);
+        drop(input);
+        MemoryFs::remove_file(&path, RemoveFileMode::Remove { remove_fs: true }).unwrap();
+        MemoryFs::terminate();
     }
 }

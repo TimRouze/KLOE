@@ -97,6 +97,12 @@ size for abundance/filter input. The abundance scan does not replace this hint
 with decoded sequence length. Missing size metadata uses an advisory estimate;
 accessions known to have failed before planning contribute zero. These estimates
 control GGCAT's bucket plan, not the amount of input retained in memory.
+Construction writes the first-stage temporary buckets to disk as well as later
+intermediates. A slow temporary disk applies backpressure through the bounded
+write queue; in-flight writes are counted while waiting for their buffers to be
+released. Put `-d` on a disk-backed filesystem with enough temporary space, not
+on a RAM-backed filesystem such as `tmpfs`. The `-r` value remains a working
+memory budget, not a hard limit on every graph-library allocation.
 Stream fingerprints detect objects that change between abundance passes.
 Transient connection errors, HTTP 408/429 and server errors are retried with
 backoff. A server's `Retry-After` delay is honored, whether specified as seconds

@@ -14,6 +14,7 @@ use bincode::{Decode, Encode};
 use config::{
     BucketIndexType, DEFAULT_BUCKETS_CHUNK_SIZE, DEFAULT_PER_CPU_BUFFER_SIZE,
     MINIMIZER_BUCKETS_COMPACTED_CHECKPOINT_SIZE, READ_INTERMEDIATE_CHUNKS_SIZE, SwapPriority,
+    get_memory_mode,
 };
 use ggcat_logging::stats;
 use hashes::HashableSequence;
@@ -41,7 +42,6 @@ use parallel_processor::execution_manager::executor::{
 use parallel_processor::execution_manager::packet::PacketsPool;
 use parallel_processor::execution_manager::scheduler::Scheduler;
 use parallel_processor::execution_manager::thread_pool::ExecThreadPool;
-use parallel_processor::memory_fs::file::internal::MemoryFileMode;
 use parallel_processor::phase_times_monitor::PHASES_TIMES_MONITOR;
 use parking_lot::{Mutex, RwLock};
 use resplit_bucket::RewriteBucketCompute;
@@ -609,10 +609,9 @@ impl GenericMinimizerBucketing {
             output_path.join("bucket"),
             chunking_size_threshold,
             &(
-                // Always prefer memory for the uncompacted temp files
-                MemoryFileMode::PreferMemory {
-                    swap_priority: SwapPriority::MinimizerUncompressedTempBuckets,
-                },
+                // Honor disk-backed construction for input buckets too. Keeping
+                // these in RAM defeats the caller's policy during long streams.
+                get_memory_mode(SwapPriority::MinimizerUncompressedTempBuckets),
                 MINIMIZER_BUCKETS_COMPACTED_CHECKPOINT_SIZE,
                 // Avoid compressing too much the temporary reads
                 CompressionLevelInfo {

@@ -133,7 +133,10 @@ impl MemoryFs {
             }
         }
 
-        return !GlobalFlush::is_queue_empty();
+        // A worker may have removed the last queued item but still be writing
+        // (or waiting for its file lock). Wait for that memory to be returned
+        // instead of treating slow I/O as exhaustion and growing the allocator.
+        return GlobalFlush::has_pending_writes();
     }
 }
 
@@ -151,7 +154,7 @@ mod tests {
     #[test]
     #[ignore]
     pub fn memory_fs_test() {
-        MemoryFs::init(MemoryDataSize::from_mebioctets(100 * 1024), 1024, 3, 0);
+        MemoryFs::init(MemoryDataSize::from_mebioctets(100 * 1024), 1024, 3, 0, None);
         let data = (0..3337).map(|x| (x % 256) as u8).collect::<Vec<u8>>();
 
         (0..400).into_par_iter().for_each(|i: u32| {
