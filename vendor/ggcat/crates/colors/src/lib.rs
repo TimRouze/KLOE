@@ -1,6 +1,7 @@
 use crate::storage::run_length::RunLengthColorsSerializer;
 
 pub mod bundles;
+mod color_lookup;
 pub mod colors_manager;
 pub mod colors_memmap_writer;
 pub mod managers;

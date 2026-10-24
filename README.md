@@ -284,8 +284,16 @@ The vendored ggcat fork is pinned to commit:
 `-r/--memory` is a compression memory target in GB, not a hard limit on process
 RAM. KLOE derives post-processing windows, graph-record chunks and group batches
 from this value and passes 75% to embedded ggcat. GGCAT uses disk-backed
-intermediates, but its active, uncompacted input buckets still prefer RAM;
-worker buffers and other allocations also contribute to peak memory.
+intermediates; its global color lookup, worker buffers and other allocations
+also contribute to peak memory.
+
+The construction-time color lookup packs a 96-bit fingerprint and a 32-bit CID
+into a 16-byte entry, halving entry storage relative to the previous padded
+32-byte layout. Hash-table control bytes and unused capacity remain additional
+costs. Lookup compares all 96 fingerprint bits but does not verify the original
+dataset lists, so color identification remains probabilistic. The lookup still
+grows with the number of distinct colors and is not bounded by `-r`. Construction
+logs report its entry count, allocated slots and entry-storage bytes.
 
 Dataset-to-color indexes use a bounded external transpose into dataset-major,
 CID-monotonic posting lists. Graph positions are also generated as
