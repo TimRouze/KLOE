@@ -103,6 +103,12 @@ write queue; in-flight writes are counted while waiting for their buffers to be
 released. Put `-d` on a disk-backed filesystem with enough temporary space, not
 on a RAM-backed filesystem such as `tmpfs`. The `-r` value remains a working
 memory budget, not a hard limit on every graph-library allocation.
+Input-bucket LZ4 compressors are created on demand and retained in a bounded
+cache sized from the temporary-memory budget, rather than creating one for
+every bucket before the first download. Eviction closes an indexed compression
+frame; checkpoints with metadata and explicitly indivisible frames are preserved.
+Idle disk buckets also flush their partial output buffer and return it to the
+allocator; the next write acquires a buffer again.
 Stream fingerprints detect objects that change between abundance passes.
 Transient connection errors, HTTP 408/429 and server errors are retried with
 backoff. A server's `Retry-After` delay is honored, whether specified as seconds
@@ -281,9 +287,19 @@ above. Legacy archives remain readable.
 The vendored ggcat fork is pinned to commit:
 `fe6a633e64f60cd7266951d73c1def5cc023fa96`
 
-`-r/--memory` is a compression memory target in GB, not a hard limit on process
-RAM. KLOE derives post-processing windows, graph-record chunks and group batches
-from this value and passes 75% to embedded ggcat. GGCAT uses disk-backed
+`-r/--memory` is a compression memory target in GiB, not a hard limit on process
+RAM. The effective budget is capped at 80% of available host/job memory when
+that information is available, including Linux cgroup v1/v2 ancestor limits
+and Slurm memory allocations. Cgroup usage includes other processes and file
+cache; startup logs report requested and effective budgets separately. This
+does not reserve memory in Slurm: the batch job still needs an appropriate
+memory allocation. KLOE derives post-processing windows, graph-record chunks
+and group batches from the effective budget and passes 75% to embedded ggcat.
+Logan graph construction also reduces worker concurrency when necessary,
+allowing 256 MiB of effective budget per worker for decoder windows and working
+buffers; the selected thread count is reported. `--logan-downloads` remains an
+upper bound, rather than a requirement to keep that many downloads active.
+GGCAT uses disk-backed
 intermediates; its global color lookup, worker buffers and other allocations
 also contribute to peak memory.
 

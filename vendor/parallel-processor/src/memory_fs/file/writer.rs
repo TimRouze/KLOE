@@ -23,9 +23,7 @@ impl FileWriter {
     pub fn create(path: impl AsRef<Path>, mode: MemoryFileMode) -> Self {
         Self {
             path: PathBuf::from(path.as_ref()),
-            current_buffer: RwLock::new(
-                CHUNKS_ALLOCATOR.request_chunk(chunk_usage!(TemporarySpace)),
-            ),
+            current_buffer: RwLock::new(AllocatedChunk::INVALID),
             file_length: AtomicU64::new(0),
             file: {
                 let file = MemoryFileInternal::create_new(path, mode);
@@ -37,7 +35,8 @@ impl FileWriter {
 
     /// Returns the total length of the file
     pub fn len(&self) -> u64 {
-        self.file_length.load(Ordering::Relaxed) + self.current_buffer.read().len() as u64
+        let buffer = self.current_buffer.read();
+        self.file_length.load(Ordering::Relaxed) + buffer.len() as u64
     }
 
     /// Overwrites bytes at the start of the file, the data field should not be longer than 128 bytes
@@ -79,6 +78,9 @@ impl FileWriter {
                     }
                 }
             } else {
+                if !current_buffer_lock.is_valid() {
+                    return Err(());
+                }
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr(),
                     current_buffer_lock.get_mut_ptr(),
@@ -91,15 +93,22 @@ impl FileWriter {
 
     /// Appends atomically all the data to the file, returning the start position of the written data in the file
     pub fn write_all_parallel(&self, data: &[u8], el_size: usize) -> u64 {
+        if data.is_empty() {
+            return self.len();
+        }
         // Update stats
         stats::add_files_usage(data.len() as u64);
 
         let buffer = self.current_buffer.read();
-        if let Some(chunk_position) = buffer.write_bytes_noextend(data) {
+        if let Some(chunk_position) = buffer.is_valid().then(|| buffer.write_bytes_noextend(data)).flatten() {
             self.file_length.load(Ordering::Relaxed) + chunk_position
         } else {
             drop(buffer);
             let mut buffer = self.current_buffer.write();
+
+            if !buffer.is_valid() {
+                *buffer = CHUNKS_ALLOCATOR.request_chunk(chunk_usage!(TemporarySpace));
+            }
 
             // Check if now the buffer can be written
             if let Some(chunk_position) = buffer.write_bytes_noextend(data) {
@@ -147,7 +156,18 @@ impl FileWriter {
         self.path.clone()
     }
 
-    pub fn flush_async(&self) {}
+    pub fn flush_async(&self) {
+        let mut buffer = self.current_buffer.write();
+        if buffer.len() == 0 || !self.file.read().is_on_disk() {
+            return;
+        }
+        // Idle disk writers must not pin one allocator chunk per bucket.
+        // Publish the partial chunk and reacquire a buffer on the next write.
+        let chunk = std::mem::replace(&mut *buffer, AllocatedChunk::INVALID);
+        self.file_length.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+        MemoryFileInternal::add_chunk(&self.file, chunk);
+        self.file.write().flush_chunks(usize::MAX);
+    }
 }
 
 impl Writer for FileWriter {

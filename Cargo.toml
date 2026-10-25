@@ -49,6 +49,9 @@ blake3 = "1.8"
 [build-dependencies]
 miette = { version = "5", features = ["fancy"] }
 
+[dev-dependencies]
+parallel-processor = { path = "vendor/parallel-processor" }
+
 [profile.dev]
 opt-level = 3
 

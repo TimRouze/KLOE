@@ -32,6 +32,7 @@ use std::time::Duration;
 
 pub use crate::utils::HashType;
 pub use config::ColorIndexType;
+pub use parallel_processor::memory_budget::{effective_memory_budget, streaming_threads};
 pub use io::sequences_reader::{DnaSequence, DnaSequencesFileType, SequencesReader};
 pub use io::sequences_stream::fasta::estimated_fasta_bases_from_size;
 pub use io::sequences_stream::{
@@ -145,11 +146,21 @@ fn remove_tempdir(temp_dir: Option<PathBuf>) {
 /// Successive calls to create will return the same instance, ignoring the new configuration.
 impl GGCATInstance {
     /// Creates a new GGCATInstance. If an instance already exists, it will be returned, ignoring the new config.
-    pub fn create(config: GGCATConfig) -> anyhow::Result<&'static Self> {
+    pub fn create(mut config: GGCATConfig) -> anyhow::Result<&'static Self> {
         let mut instance = INSTANCE.lock();
 
         if let Some(instance) = instance.deref() {
             return Ok(instance);
+        }
+
+        let requested = (config.memory * (1u64 << 30) as f64) as usize;
+        let effective = effective_memory_budget(requested);
+        anyhow::ensure!(effective >= 64 * 1024 * 1024,
+            "Less than 64 MiB available for graph construction after accounting for the job memory limit");
+        if effective < requested {
+            eprintln!("Graph memory budget reduced from {:.2} to {:.2} GiB to fit available job/host memory",
+                config.memory, effective as f64 / (1u64 << 30) as f64);
+            config.memory = effective as f64 / (1u64 << 30) as f64;
         }
 
         parallel_processor::set_logger_function(|level, message| {

@@ -1371,10 +1371,10 @@ struct CompressionMemoryBudget {
 impl CompressionMemoryBudget {
     fn from_gb(memory_gb: usize) -> Self {
         Self {
-            total_bytes: memory_gb
+            total_bytes: ggcat_api::effective_memory_budget(memory_gb
                 .max(1)
                 .saturating_mul(1024 * 1024 * 1024)
-                .max(MIN_MEMORY_BUDGET_BYTES),
+                .max(MIN_MEMORY_BUDGET_BYTES)),
         }
     }
 
@@ -1399,7 +1399,7 @@ impl CompressionMemoryBudget {
     }
 
     fn ggcat_memory_gb(self) -> f64 {
-        ((self.total_bytes as f64) / (1024.0 * 1024.0 * 1024.0) * 0.75).max(0.25)
+        (self.total_bytes as f64) / (1024.0 * 1024.0 * 1024.0) * 0.75
     }
 }
 
@@ -5671,6 +5671,19 @@ fn produce_ggcat_records(
 ) -> Result<()> {
     let source_count = source_dataset_ids.len();
     let memory_budget = CompressionMemoryBudget::from_gb(ggcat_cfg.memory_gb);
+    if memory_budget.total_bytes < ggcat_cfg.memory_gb.saturating_mul(1024 * 1024 * 1024) {
+        eprintln!("Compression memory budget reduced from {} to {:.2} GiB to fit available job/host memory (including cgroup/Slurm limits)",
+            ggcat_cfg.memory_gb, memory_budget.total_bytes as f64 / (1u64 << 30) as f64);
+    }
+    let threads = if ggcat_cfg.logan.is_some() {
+        let effective = ggcat_api::streaming_threads(threads, memory_budget.total_bytes);
+        if effective < threads {
+            eprintln!("Logan graph construction: using {effective}/{threads} threads to leave memory for decoder windows and worker buffers");
+        }
+        effective
+    } else {
+        threads
+    };
     if input_streams.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -5718,13 +5731,14 @@ fn produce_ggcat_records(
     .map_err(|e| to_io_err("create ggcat instance", e))?;
 
     println!(
-        "Running embedded ggcat structured-output path (k={}, m={}, threads={}, sources={}, datasets={}, total_memory={}GB, ggcat_memory={:.2}GB, disk_backed=true)",
+        "Running embedded ggcat structured-output path (k={}, m={}, threads={}, sources={}, datasets={}, requested_memory={}GiB, effective_memory={:.2}GiB, ggcat_memory={:.2}GiB, disk_backed=true)",
         k,
         m,
         threads.max(1),
         source_count,
         dataset_count,
         ggcat_cfg.memory_gb.max(1),
+        memory_budget.total_bytes as f64 / (1u64 << 30) as f64,
         memory_budget.ggcat_memory_gb()
     );
 

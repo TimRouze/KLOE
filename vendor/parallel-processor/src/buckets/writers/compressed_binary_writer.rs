@@ -11,9 +11,10 @@ use bincode::Encode;
 use lz4::{BlockMode, BlockSize, ContentChecksum};
 use mt_debug_counters::counter::AtomicCounterGuardSum;
 use parking_lot::Mutex;
-use replace_with::replace_with_or_abort;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
 
 use super::BucketHeader;
 
@@ -49,7 +50,8 @@ fn create_lz4_stream<W: Write>(writer: W, level: CompressionLevelInfo) -> lz4::E
 }
 
 struct CompressedBinaryWriterInternal {
-    writer: lz4::Encoder<FileWriter>,
+    writer: Option<lz4::Encoder<FileWriter>>,
+    idle_file: Option<FileWriter>,
     checkpoint_max_size: u64,
     checkpoints: Vec<CheckpointData>,
     current_chunk_size: u64,
@@ -60,41 +62,92 @@ struct CompressedBinaryWriterInternal {
 }
 
 pub struct CompressedBinaryWriter {
-    inner: Mutex<CompressedBinaryWriterInternal>,
+    inner: Arc<Mutex<CompressedBinaryWriterInternal>>,
     path: PathBuf,
 }
 unsafe impl Send for CompressedBinaryWriter {}
 
+// A large collection can have 8192 buckets. Keeping an LZ4 context for
+// every bucket costs memory even before any sequence is downloaded. Retain
+// only a bounded working set; eviction finishes an ordinary indexed frame.
+static COMPRESSORS: LazyLock<Mutex<VecDeque<Weak<Mutex<CompressedBinaryWriterInternal>>>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+fn compressor_cache_capacity() -> usize {
+    // Reserve at most 1/16 of the configured temporary-memory budget for
+    // retained LZ4 contexts (conservative 512 KiB per context). Large-memory
+    // builds can keep all 8192 contexts and avoid unnecessary frame restarts.
+    (crate::memory_fs::allocator::CHUNKS_ALLOCATOR
+        .get_total_memory()
+        .as_bytes()
+        / 16
+        / (512 * 1024))
+        .clamp(16, 8192)
+}
+
 impl CompressedBinaryWriterInternal {
-    fn create_new_block(&mut self, passtrough_range: Option<FileRangeReference>) {
-        replace_with_or_abort(&mut self.writer, |writer| {
-            let (file_buf, res) = writer.finish();
-            res.unwrap();
+    fn file(&self) -> &FileWriter {
+        match &self.writer {
+            Some(writer) => writer.writer(),
+            None => self.idle_file.as_ref().unwrap(),
+        }
+    }
 
-            let checkpoint_pos = if let Some(passtrough_range) = passtrough_range {
-                // Add an optional passtrough block
-                self.checkpoints.push(CheckpointData {
-                    offset: file_buf.len() as u64,
-                    data: self.checkpoint_data.clone(),
-                });
+    fn finish_block(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            let (file, result) = writer.finish();
+            result.unwrap();
+            file.flush_async();
+            self.idle_file = Some(file);
+        }
+        self.current_chunk_size = 0;
+    }
 
-                unsafe {
-                    passtrough_range.copy_to_unsync(&file_buf);
+    fn activate(owner: &Arc<Mutex<Self>>, inner: &mut Self) {
+        if inner.writer.is_some() {
+            return;
+        }
+        let mut cache = COMPRESSORS.lock();
+        // Never wait on another bucket lock while holding our own. Busy
+        // writers may temporarily add at most one context per active caller.
+        let mut remaining = cache.len();
+        while cache.len() >= compressor_cache_capacity() && remaining > 0 {
+            remaining -= 1;
+            if let Some(candidate) = cache.pop_front().unwrap().upgrade() {
+                if let Some(mut old) = candidate.try_lock() {
+                    // Metadata can describe an entire checkpoint (e.g. its
+                    // sequence count); never split such a logical block.
+                    if old.checkpoint_data.is_none() && old.checkpoint_max_size < (1 << 62) {
+                        old.finish_block();
+                    }
+                } else {
+                    cache.push_back(Arc::downgrade(&candidate));
                 }
+            }
+        }
+        let file = inner.idle_file.take().unwrap();
+        inner.checkpoints.push(CheckpointData {
+            offset: file.len(),
+            data: inner.checkpoint_data.clone(),
+        });
+        inner.writer = Some(create_lz4_stream(file, inner.level));
+        if inner.checkpoint_data.is_none() && inner.checkpoint_max_size < (1 << 62) {
+            cache.push_back(Arc::downgrade(owner));
+        }
+    }
 
-                file_buf.len()
-            } else {
-                file_buf.len()
-            };
-
+    fn create_new_block(&mut self, passtrough_range: Option<FileRangeReference>) {
+        self.finish_block();
+        if let Some(range) = passtrough_range {
+            let file = self.idle_file.as_ref().unwrap();
             self.checkpoints.push(CheckpointData {
-                offset: checkpoint_pos as u64,
+                offset: file.len(),
                 data: self.checkpoint_data.clone(),
             });
-
-            create_lz4_stream(file_buf, self.level)
-        });
-        self.current_chunk_size = 0;
+            unsafe {
+                range.copy_to_unsync(file);
+            }
+        }
     }
 }
 
@@ -139,23 +192,20 @@ impl LockFreeBucket for CompressedBinaryWriter {
 
         let mut file = FileWriter::create(&path, *file_mode);
 
-        let first_checkpoint = initialize_bucket_file(&mut file);
-
-        let writer = create_lz4_stream(file, *compression_level);
+        initialize_bucket_file(&mut file);
+        file.flush_async();
 
         Self {
-            inner: Mutex::new(CompressedBinaryWriterInternal {
-                writer,
+            inner: Arc::new(Mutex::new(CompressedBinaryWriterInternal {
+                writer: None,
+                idle_file: Some(file),
                 checkpoint_max_size: (1 << checkpoint_max_size.0),
-                checkpoints: vec![CheckpointData {
-                    offset: first_checkpoint,
-                    data: None,
-                }],
+                checkpoints: Vec::new(),
                 current_chunk_size: 0,
                 level: *compression_level,
                 data_format_info: data_format_info.to_vec(),
                 checkpoint_data: None,
-            }),
+            })),
             path,
         }
     }
@@ -173,7 +223,7 @@ impl LockFreeBucket for CompressedBinaryWriter {
     }
 
     fn get_bucket_size(&self) -> u64 {
-        self.inner.lock().writer.writer().len()
+        self.inner.lock().file().len()
     }
 
     fn write_data(&self, bytes: &[u8]) -> u64 {
@@ -181,30 +231,33 @@ impl LockFreeBucket for CompressedBinaryWriter {
         //
         let mut inner = self.inner.lock();
 
-        inner.writer.write_all(bytes).unwrap();
+        CompressedBinaryWriterInternal::activate(&self.inner, &mut inner);
+        inner.writer.as_mut().unwrap().write_all(bytes).unwrap();
         inner.current_chunk_size += bytes.len() as u64;
         if inner.current_chunk_size > inner.checkpoint_max_size {
             inner.create_new_block(None);
         }
 
         drop(stat_raii);
-        inner.writer.writer().len()
+        inner.file().len()
     }
 
     fn get_path(&self) -> PathBuf {
         self.path.clone()
     }
     fn finalize(self) {
-        let mut inner = self.inner.into_inner();
-
-        inner.writer.flush().unwrap();
-        let (file, res) = inner.writer.finish();
-        res.unwrap();
-
+        let mut inner = self.inner.lock();
+        // Keep an empty frame for empty buckets, as in the original format.
+        if inner.checkpoints.is_empty() {
+            CompressedBinaryWriterInternal::activate(&self.inner, &mut inner);
+        }
+        inner.finish_block();
+        let file = inner.idle_file.take().unwrap();
+        let checkpoints = std::mem::take(&mut inner.checkpoints);
         finalize_bucket_file(
             file,
             COMPRESSED_BUCKET_MAGIC,
-            inner.checkpoints,
+            checkpoints,
             &inner.data_format_info,
         );
     }

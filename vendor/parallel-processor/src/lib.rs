@@ -16,6 +16,7 @@ pub mod fast_smart_bucket_sort;
 #[macro_use]
 mod logging;
 pub mod memory_data_size;
+pub mod memory_budget;
 pub mod phase_times_monitor;
 pub mod utils;
 

@@ -58,6 +58,10 @@ impl Clone for AllocatedChunk {
 }
 
 impl AllocatedChunk {
+    pub fn is_valid(&self) -> bool {
+        self.memory != 0
+    }
+
     pub const INVALID: Self = Self {
         memory: 0,
         len: AtomicUsize::new(0),
