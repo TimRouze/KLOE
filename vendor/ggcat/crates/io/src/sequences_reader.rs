@@ -1,7 +1,6 @@
 use crate::lines_reader::LinesReader;
 use config::DEFAULT_OUTPUT_BUFFER_SIZE;
 use nightly_quirks::branch_pred::unlikely;
-use std::cmp::max;
 use std::path::Path;
 
 const IDENT_STATE: usize = 0;
@@ -111,71 +110,26 @@ impl SequencesReader {
         copy_ident: bool,
         remove_file: bool,
     ) {
-        let mut intermediate = [Vec::new(), Vec::new()];
-        let mut on_comment = false;
-        let mut state = SEQ_STATE;
-        let mut new_line = true;
-
-        let flush_size = max(
+        let path = source.as_ref();
+        let file = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("Cannot open {}: {e}", path.display()));
+        let reader: Box<dyn std::io::Read> = match path.extension().and_then(|s| s.to_str()) {
+            Some("gz") => Box::new(flate2::read::MultiGzDecoder::new(file)),
+            Some("zst" | "zstd") => Box::new(zstd::stream::read::Decoder::new(file).unwrap()),
+            Some("lz4") => Box::new(lz4::Decoder::new(file).unwrap()),
+            _ => Box::new(file),
+        };
+        crate::fasta_reader::read_fasta_with_helicase(
+            std::io::BufReader::with_capacity(64 * 1024, reader),
+            line_split_copyback,
+            copy_ident,
+            false,
             DEFAULT_OUTPUT_BUFFER_SIZE,
-            line_split_copyback.unwrap_or(0) * 2,
-        );
-
-        self.lines_reader.process_lines(
-            source,
-            |line: &[u8], partial, finished| {
-                if on_comment {
-                    on_comment = !partial;
-                }
-                // If a new ident line is found (or it's the last line)
-                else if finished || (new_line && line.len() > 0 && line[0] == b'>') {
-                    if intermediate[SEQ_STATE].len() > 0 {
-                        Self::normalize_sequence(&mut intermediate[SEQ_STATE]);
-                        func(DnaSequence {
-                            ident_data: &intermediate[IDENT_STATE],
-                            seq: &intermediate[SEQ_STATE],
-                            format: DnaSequencesFileType::FASTA,
-                        });
-                    }
-
-                    if copy_ident {
-                        intermediate[IDENT_STATE].clear();
-                        intermediate[IDENT_STATE].extend_from_slice(line);
-                    }
-                    intermediate[SEQ_STATE].clear();
-
-                    state = if partial { IDENT_STATE } else { SEQ_STATE };
-                } else if new_line && line.len() > 0 && line[0] == b';' {
-                    on_comment = true;
-                } else if state == IDENT_STATE {
-                    if copy_ident {
-                        intermediate[IDENT_STATE].extend_from_slice(line);
-                    }
-
-                    if !partial {
-                        state = SEQ_STATE;
-                    }
-                } else {
-                    intermediate[SEQ_STATE].extend_from_slice(line);
-                }
-
-                if let Some(copyback) = line_split_copyback {
-                    if intermediate[SEQ_STATE].len() >= flush_size {
-                        Self::normalize_sequence(&mut intermediate[SEQ_STATE]);
-                        func(DnaSequence {
-                            ident_data: &intermediate[IDENT_STATE],
-                            seq: &intermediate[SEQ_STATE],
-                            format: DnaSequencesFileType::FASTQ,
-                        });
-                        let copy_start = intermediate[SEQ_STATE].len() - copyback;
-                        intermediate[SEQ_STATE].copy_within(copy_start.., 0);
-                        intermediate[SEQ_STATE].truncate(copyback);
-                    }
-                }
-                new_line = !partial;
-            },
-            remove_file,
-        );
+            &mut |sequence| { func(sequence); Ok(()) },
+        ).unwrap_or_else(|e| panic!("Cannot parse {}: {e}", path.display()));
+        if remove_file {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     fn process_fastq(

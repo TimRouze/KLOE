@@ -1,6 +1,6 @@
 //! Logan HTTP inputs: embedded HTTP client -> Zstandard decoder -> bounded FASTA parser.
 //! Neither the compressed input nor its decoded FASTA is written to disk.
-use ggcat_api::{DnaSequence, DnaSequencesFileType, DynamicSequencesStream, SequenceInfo};
+use ggcat_api::{DnaSequence, DynamicSequencesStream, SequenceInfo};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://s3.amazonaws.com/logan-pub";
 const SEQUENCE_CHUNK: usize = 1024 * 1024;
-const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const UNKNOWN_COMPRESSED_BYTES: u64 = u64::MAX;
 
 fn retry_after(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<Duration> {
@@ -728,136 +727,19 @@ fn read_fasta_stream(
     })
 }
 
-const DNA_MAPPING: [u8; 256] = {
-    let mut map = [b'N'; 256];
-    map[b'A' as usize] = b'A';
-    map[b'a' as usize] = b'A';
-    map[b'C' as usize] = b'C';
-    map[b'c' as usize] = b'C';
-    map[b'G' as usize] = b'G';
-    map[b'g' as usize] = b'G';
-    map[b'T' as usize] = b'T';
-    map[b't' as usize] = b'T';
-    map
-};
-
 fn process_fasta_stream(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     copyback: Option<usize>,
     copy_ident: bool,
     headers_only: bool,
     callback: &mut dyn FnMut(DnaSequence) -> io::Result<()>,
 ) -> io::Result<u64> {
-    let overlap = copyback.unwrap_or(0);
-    let chunk_size = SEQUENCE_CHUNK.max(overlap.saturating_mul(2));
-    let mut header = Vec::with_capacity(if copy_ident { 256 } else { 0 });
-    let mut sequence = Vec::with_capacity(if headers_only { 0 } else { chunk_size });
-    let mut line_start = true;
-    let mut in_header = false;
-    let mut comment = false;
-    let mut have_header = false;
-    let mut record_bases = 0u64;
-    let mut bases = 0u64;
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            break;
-        }
-        let newline = memchr::memchr(b'\n', buffer);
-        let end = newline.unwrap_or(buffer.len());
-        let mut fragment = &buffer[..end];
-        // Remove the usual CRLF terminator without allocating. Embedded CRs are rare.
-        if fragment.last() == Some(&b'\r') {
-            fragment = &fragment[..fragment.len() - 1];
-        }
-        let cleaned;
-        if memchr::memchr(b'\r', fragment).is_some() {
-            cleaned = fragment
-                .iter()
-                .copied()
-                .filter(|&b| b != b'\r')
-                .collect::<Vec<_>>();
-            fragment = &cleaned;
-        }
-        if !fragment.is_empty() {
-            if line_start && fragment[0] == b'>' {
-                if (headers_only && record_bases > 0) || !sequence.is_empty() {
-                    callback(DnaSequence {
-                        ident_data: &header,
-                        seq: &sequence,
-                        format: DnaSequencesFileType::FASTA,
-                    })?;
-                }
-                sequence.clear();
-                header.clear();
-                record_bases = 0;
-                have_header = true;
-                in_header = true;
-            } else if line_start && fragment[0] == b';' {
-                comment = true;
-            }
-            line_start = false;
-            if !comment {
-                if in_header {
-                    if copy_ident {
-                        if header.len().saturating_add(fragment.len()) > MAX_HEADER_BYTES {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "FASTA header exceeds 1 MiB",
-                            ));
-                        }
-                        header.extend_from_slice(fragment);
-                    }
-                } else {
-                    if !have_header {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "sequence data before first FASTA header",
-                        ));
-                    }
-                    bases += fragment.len() as u64;
-                    record_bases += fragment.len() as u64;
-                    if !headers_only {
-                        while !fragment.is_empty() {
-                            let count = fragment.len().min(chunk_size - sequence.len());
-                            sequence
-                                .extend(fragment[..count].iter().map(|&b| DNA_MAPPING[b as usize]));
-                            fragment = &fragment[count..];
-                            if sequence.len() == chunk_size {
-                                callback(DnaSequence {
-                                    ident_data: &header,
-                                    seq: &sequence,
-                                    format: DnaSequencesFileType::FASTA,
-                                })?;
-                                let start = sequence.len() - overlap;
-                                sequence.copy_within(start.., 0);
-                                sequence.truncate(overlap);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let consumed = end + usize::from(newline.is_some());
-        reader.consume(consumed);
-        if newline.is_some() {
-            line_start = true;
-            in_header = false;
-            comment = false;
-        }
-    }
-    if (headers_only && record_bases > 0) || !sequence.is_empty() {
-        callback(DnaSequence {
-            ident_data: &header,
-            seq: &sequence,
-            format: DnaSequencesFileType::FASTA,
-        })?;
-    }
+    let bases = ggcat_api::read_fasta_with_helicase(
+        reader, Some(copyback.unwrap_or(0)), copy_ident, headers_only,
+        SEQUENCE_CHUNK, callback,
+    )?;
     if bases == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Logan stream contains no FASTA sequences",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Logan stream contains no FASTA sequences"));
     }
     Ok(bases)
 }

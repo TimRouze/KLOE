@@ -16,6 +16,8 @@ utils = { package = "ggcat_utils", path = "../utils" }
 
 
 # Common libraries
+helicase = { version = "1.2.0", default-features = false }
+memchr = "2.7"
 parallel-processor = "0.2.3"
 streaming-libdeflate-rs = "0.2.3"
 nightly-quirks = "0.1.4"

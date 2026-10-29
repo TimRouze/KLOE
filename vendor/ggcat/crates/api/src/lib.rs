@@ -33,6 +33,7 @@ use std::time::Duration;
 pub use crate::utils::HashType;
 pub use config::ColorIndexType;
 pub use parallel_processor::memory_budget::{effective_memory_budget, streaming_threads};
+pub use io::fasta_reader::read_fasta_with_helicase;
 pub use io::sequences_reader::{DnaSequence, DnaSequencesFileType, SequencesReader};
 pub use io::sequences_stream::fasta::estimated_fasta_bases_from_size;
 pub use io::sequences_stream::{

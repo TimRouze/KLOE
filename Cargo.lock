@@ -1428,7 +1428,9 @@ dependencies = [
  "ggcat_config",
  "ggcat_hashes",
  "ggcat_utils",
+ "helicase",
  "lz4",
+ "memchr",
  "nightly-quirks",
  "parallel-processor",
  "parking_lot",
@@ -1580,6 +1582,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "helicase"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f23062b06b07d5005222e3aef763dc4f1bdb6b621bc2be3d40871e91007ba664"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "hermit-abi"

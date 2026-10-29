@@ -277,6 +277,13 @@ independent of the representation selected during decompression.
 #### Embedded ggcat structured-output backend (hard switch)
 KLOE embeds `ggcat` in-process (no external `ggcat` executable required at runtime).
 
+FASTA input parsing uses [Helicase](https://github.com/imartayan/helicase) 1.2.0
+for both local files and Logan streams. Record-aligned batches keep parser
+memory bounded, with the existing overlapping-chunk reader retained for
+oversized sequences and FASTA compatibility cases such as comment lines.
+Abundance headers, ambiguous-base handling, and download retry behavior are
+preserved. No additional executable or command-line option is required.
+
 Compression is driven by a forked ggcat structured-sequence backend. Sequence and
 color-run data are streamed directly into bounded KLOE binary chunks; no intermediate
 graph FASTA is formatted, stored, or parsed.
