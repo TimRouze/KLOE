@@ -20,7 +20,7 @@ struct Args {
     /// Command mode: "compress", "decompress", or "merge"
     #[arg(value_parser = ["compress", "decompress", "merge"])]
     mode: String,
-    ///Input file list (Compression)
+    /// Input file list for compression (missing files are skipped with a warning)
     #[arg(short, long, default_value_t=String::from(""))]
     input_list: String,
     /// Compress Logan unitigs directly from a list of SRR/ERR/DRR accessions

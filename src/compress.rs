@@ -1514,14 +1514,37 @@ impl SeqRunReader {
 }
 
 fn read_input_fof_filenames(input_fof: &str) -> Result<Vec<String>> {
-    let input_fof_reader = BufReader::new(File::open(input_fof)?);
+    let input_fof_reader = BufReader::new(File::open(input_fof).map_err(|error| {
+        io::Error::new(error.kind(), format!("cannot open input list '{input_fof}': {error}"))
+    })?);
     let mut filenames = Vec::new();
-    for line_result in input_fof_reader.lines() {
+    for (line_index, line_result) in input_fof_reader.lines().enumerate() {
         let line = line_result?;
         let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            filenames.push(trimmed.to_string());
+        if trimmed.is_empty() {
+            continue;
         }
+        // Exclude missing inputs before assigning dataset IDs or scanning
+        // abundance annotations, so every construction mode uses the same list.
+        match File::open(trimmed) {
+            Ok(_) => filenames.push(trimmed.to_string()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                eprintln!(
+                    "Warning: skipping missing input file '{trimmed}' (input list '{input_fof}', line {}): {error}",
+                    line_index + 1
+                );
+            }
+            Err(error) => {
+                return Err(io::Error::new(error.kind(), format!(
+                    "cannot open input file '{trimmed}' (input list '{input_fof}', line {}): {error}",
+                    line_index + 1
+                )));
+            }
+        }
+    }
+    if filenames.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("no available input files in '{input_fof}' after skipping missing files")));
     }
     Ok(filenames)
 }

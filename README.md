@@ -26,8 +26,16 @@ cargo build --release --bin kloe
 ```
 Builds are configured to always use optimized profiles and native CPU flags from `.cargo/config.toml`.
 
-This creates a KLOE v4 archive containing the k-mer content of every file in the
-input file-of-files. New archives use a dataset-major membership index; they do
+This creates a KLOE v4 archive containing the k-mer content of the available files
+in the input file-of-files. Missing local files are skipped with a warning naming
+the path and its line in the list, before dataset IDs are assigned. This applies
+with or without abundance storage and abundance filtering. Only retained inputs
+appear in the archive, in their original order. If none remain, compression
+returns an error without creating a complete archive. The input list itself must
+exist, and other input errors (such as permission errors or corrupt data) still
+stop construction.
+
+New archives use a dataset-major membership index; they do
 not store the inverse CID-to-dataset relation a second time.
 
 Output paths work with or without a trailing slash. Compression and merge refuse
