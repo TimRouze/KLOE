@@ -1,0 +1,3 @@
+test-tiny/sample1.fa
+test-tiny/sample2.fa
+test-tiny/sample3.fa

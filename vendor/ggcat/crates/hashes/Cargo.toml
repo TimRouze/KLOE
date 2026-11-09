@@ -1,0 +1,32 @@
+[package]
+name = "ggcat_hashes"
+version = "2.0.0"
+edition = "2024"
+[lib]
+name = "ggcat_hashes"
+
+[dependencies]
+ahash = "0.8.11"
+
+# Config
+config = { package = "ggcat_config", path = "../config" }
+
+# Utils
+utils = { package = "ggcat_utils", path = "../utils" }
+
+# Static dispatch
+dynamic-dispatch = "0.5.4"
+bincode = "2.0.1"
+
+[[bench]]
+name = "hashes-bench"
+harness = false
+
+[dev-dependencies]
+pcg_rand = "0.13.0"
+rand = "0.8.5"
+utils = { package = "ggcat_utils", path = "../utils" }
+io = { package = "ggcat_io", path = "../io" }
+criterion = "0.5.1"
+
+

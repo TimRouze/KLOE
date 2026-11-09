@@ -1,745 +1,2351 @@
 #![allow(dead_code)]
-// WHILE NEEDLETAIL DOES NOT HANDLE ZST.
-extern crate needletail;
 
-mod utils;
-mod kmer;
+mod abundance;
+mod archive;
+mod logan;
+mod compress;
 mod decompress;
-mod stats;
+mod merge;
+mod packed_tigs;
+mod records;
+mod utils;
+#[cfg(test)]
+mod audit_tests;
 use clap::Parser;
-use num_traits::ToPrimitive;
-use stats::compute_stats;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::fs::{remove_file, File};
-use std::ffi::OsStr;
-use std::path::{PathBuf, Path};
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Stdin, Write, BufReader, BufWriter};
-use std::env;
-use std::time::Instant;
-use::rayon::prelude::*;
-use bitvec::prelude::*;
-use kmer::{Kmer, RawKmer, Base};
-use std::cell::Cell;
-use seq_io::fasta::Reader;
-use indexmap::IndexMap;
-use zstd::stream::write::Encoder;
-use zstd::stream::read::Decoder;
-
-use crate::utils::{num2str, str2num, find_min};
+use std::path::Path;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    ///output: Option<String>,
-    /// Decompression "compress" to compress input, "decompress" to decompress input, "stats" to get kmer stats
-    decompress: Option<String>,
-    ///multicolor file (only for decompression)
-    #[arg(long, default_value_t=String::from(""))]
-    multicolor_file: String,
-    /// Omnicolor file (only for decompression)
-    #[arg(long, default_value_t=String::from(""))]
-    omnicolor_file: String,
-    /// Number of threads (defaults to all available threads)
-    #[arg(short, long, default_value_t = 1)]
+    /// Command mode: "compress", "decompress", or "merge"
+    #[arg(value_parser = ["compress", "decompress", "merge"])]
+    mode: String,
+    /// Input file list for compression (missing files are skipped with a warning)
+    #[arg(short, long, default_value_t=String::from(""))]
+    input_list: String,
+    /// Compress Logan unitigs directly from a list of SRR/ERR/DRR accessions
+    #[arg(long, conflicts_with = "input_list")]
+    logan_accessions: Option<String>,
+    /// Maximum simultaneous Logan downloads
+    #[arg(long, default_value_t = 4, requires = "logan_accessions", value_parser = clap::value_parser!(u16).range(1..))]
+    logan_downloads: u16,
+    /// Stop on the first invalid or failed Logan accession instead of skipping it
+    #[arg(long, requires = "logan_accessions")]
+    logan_strict: bool,
+    /// Additional attempts for transient Logan HTTP errors and interrupted downloads
+    #[arg(long, default_value_t = 2, requires = "logan_accessions")]
+    logan_retries: u8,
+    /// Logan HTTP(S) bucket or mirror URL
+    #[arg(long, default_value = logan::DEFAULT_BASE_URL, requires = "logan_accessions")]
+    logan_base_url: String,
+    /// Number of threads (defaults to the available logical CPUs)
+    #[arg(short, long, default_value_t = num_cpus::get())]
     threads: usize,
     ///Output directory
     #[arg(short, long, default_value_t = String::from(""))]
     out_dir: String,
     ///input directory for decompression
     #[arg(short, long, default_value_t = String::from(""))]
-    input_dir: String,
-    ///Number of expected k-mers
-    #[arg(short = 'N', long, default_value_t = 1_000_000)]
-    nb_elem: usize,
+    compressed_dir: String,
+    ///second input archive directory for merge mode
+    #[arg(long, default_value_t = String::from(""))]
+    compressed_dir_b: String,
     ///List of files to decompress
     #[arg(short = 'Q', long, default_value_t = String::from(""))]
     wanted_files: String,
-    ///Input file of file
-    #[arg(short, long)]
-    file_of_file: Option<String>,
+    ///Temporary directory for unitigs parsing
+    #[arg(short = 'd', long, default_value_t = String::from(""))]
+    temp_dir: String,
+    ///Required memory budget in GB for compression/decompression workflows
+    #[arg(short = 'r', long)]
+    memory: Option<usize>,
+    /// K value: compression defaults to 31; merge uses archive metadata (required for legacy inputs)
+    #[arg(short, long, value_parser = parse_k)]
+    k_size: Option<usize>,
+    ///Minimizer size (< k), default = 12
+    #[arg(short, long, default_value_t = 12)]
+    minimizer_size: usize,
+    /// Compatibility flag; currently ignored by the GGCAT backend
+    #[arg(long = "verify-kmers", default_value_t = false)]
+    verify_kmers: bool,
+    /// Compatibility option; currently ignored by the GGCAT backend
+    #[arg(short = 'P', long = "partition-power", default_value_t = 10)]
+    partition_power: u32,
+    /// Compatibility flag; currently ignored (records are grouped by colors)
+    #[arg(long = "skip-sort", default_value_t = false)]
+    skip_sort: bool,
+    /// Produce unitigs (default for compression, decompression and graph merge)
+    #[arg(long = "unitig", default_value_t = false)]
+    unitig: bool,
+    /// Produce matchtigs (experimental; not yet benchmarked)
+    #[arg(long = "matchtig", default_value_t = false)]
+    matchtig: bool,
+    /// Produce eulertigs (experimental; not yet benchmarked)
+    #[arg(long = "eulertig", default_value_t = false)]
+    eulertig: bool,
+    /// Produce simplitigs using embedded GGCAT (experimental; not yet benchmarked)
+    #[arg(long = "simplitig", default_value_t = false)]
+    simplitig: bool,
+    /// Output stored tigs without rebuilding (required to restore abundance)
+    #[arg(long = "stored-tigs", default_value_t = false)]
+    stored_tigs: bool,
+    /// Compatibility option: decompression already rebuilds each result by default
+    #[arg(long = "ggcat-rebuild", default_value_t = false)]
+    ggcat_rebuild: bool,
+    /// Compression used for decompressed FASTA output
+    #[arg(
+        long = "output-compression",
+        alias = "compression",
+        value_enum,
+        default_value_t = decompress::OutputCompression::Zstd
+    )]
+    output_compression: decompress::OutputCompression,
+    /// Emit one FASTA for a set operation on colors listed with -Q (difference: first minus rest)
+    #[arg(long = "color-set-operation", alias = "colors-operation", value_enum)]
+    color_set_operation: Option<decompress::ColorSetOperation>,
+    /// Join archive containers without rebuilding the graph or removing shared redundancy
+    #[arg(long = "structural-merge", default_value_t = false)]
+    structural_merge: bool,
+    /// Compress: preserve abundance fields; decompress: restore them in FASTA headers
+    #[arg(long = "abundance", default_value_t = false)]
+    abundance: bool,
+    /// Keep abundance strictly above N: input values on compression, decoded values on decompression
+    #[arg(long = "abundance-threshold")]
+    abundance_threshold: Option<u64>,
+    /// Compress: preserve integer abundance exactly, without quantization or saturation
+    #[arg(long = "abundance-exact", conflicts_with_all = ["abundance_bits", "abundance_max"])]
+    abundance_exact: bool,
+    /// Store rounded abundance directly as u16; reject values rounding above 65535
+    #[arg(long = "abundance-u16", conflicts_with_all = ["abundance_exact", "abundance_bits", "abundance_max"])]
+    abundance_u16: bool,
+    /// Abundance bits: exact integers if the maximum fits, otherwise automatic logarithmic encoding
+    #[arg(long = "abundance-bits", default_value_t = 8, requires = "abundance", value_parser = clap::value_parser!(u8).range(2..=32))]
+    abundance_bits: u8,
+    /// Maximum abundance; larger values are capped before storage
+    #[arg(long = "abundance-max", alias = "max-abundance", default_value_t = 50000, requires = "abundance", value_parser = clap::value_parser!(u64).range(1..))]
+    abundance_max: u64,
 }
-pub mod constants {
-    include!("constants.rs");
+fn parse_k(value: &str) -> Result<usize, String> {
+    value.parse::<usize>().ok().filter(|&k| k > 0)
+        .ok_or_else(|| "k must be a positive integer".to_owned())
 }
-use constants::{ARRAY_SIZE, NB_FILES, INPUT_FOF, K, KT};
-pub type COLORPAIR = (bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, Cell<bool>);
-const BLOCK_SIZE: usize = 1 << (12 - 3);
-const SHARD_AMOUNT: usize = 1024;
-const M: u8 = 7;
 
 fn main() {
     let args = Args::parse();
-    let nb_elem = args.nb_elem;
-    
+
     let output_dir = args.out_dir;
-    let input_dir = args.input_dir;
-    env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
-    let file = File::open(INPUT_FOF).unwrap();
-    let reader = io::BufReader::new(file);
-    //let mut omni_kmer_map: Arc<Mutex<HashMap<KT, Cell<bool>>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/2)));
-    //let mut multi_kmer_map: Arc<Mutex<HashMap<KT, COLORPAIR>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/2)));
-    let mut omni_vec_o_maps: Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>> = Vec::new();
-    let mut multi_vec_o_maps: Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>> = Vec::new();
-    for _i in 0..SHARD_AMOUNT{
-        omni_vec_o_maps.push(Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/SHARD_AMOUNT))));
-        multi_vec_o_maps.push(Arc::new(Mutex::new(HashMap::with_capacity(nb_elem/SHARD_AMOUNT))));
-    }
-    let filenames: Vec<_> = reader.lines().collect::<Result<_, _>>().unwrap();
+    let input_dir = args.compressed_dir;
+    let input_dir_b = args.compressed_dir_b;
+    //env::set_var("RAYON_NUM_THREADS", args.threads.to_string());
+    let input_fof = args.logan_accessions.clone().unwrap_or(args.input_list);
+    let threads = args.threads;
+    let temp_dir = args.temp_dir;
+    let k = args.k_size.unwrap_or(31);
+    let m = args.minimizer_size;
+    //TODO HANDLE ERRORS FOR COMP AND DECOMP
     let wanted_path = args.wanted_files;
-    if let Some(do_decompress) = args.decompress{
-        if do_decompress == "decompress"{
-            let multi_file = args.multicolor_file;
-            let omni_file = args.omnicolor_file;
-            if multi_file != "" && omni_file != ""{
-                decompress::decompress(&omni_file, &multi_file, INPUT_FOF, PathBuf::from(output_dir), &wanted_path);
-            }else{
-                println!("Error, multicolor and/or omnicolor file(s) are mandatory");
-            }
-        }else if do_decompress == "compress"{
-            let mut filename_color = File::create("filename_to_color.txt").unwrap();
-            
-            for i in 0..NB_FILES{
-                writeln!(filename_color, "{}:{}", filenames.get(i).unwrap(), i).unwrap();
-            }
-            let now = Instant::now();
-            let mut tot_nb_kmer: u64 = 0;
-            (0..NB_FILES).for_each(|file_number|{
-                println!("{}", filenames.get(file_number).unwrap());
-                let nb_kmer = read_fasta(&filenames.get(file_number).unwrap(), &mut multi_vec_o_maps, &mut omni_vec_o_maps, file_number, &nb_elem);
-                tot_nb_kmer += Arc::try_unwrap(nb_kmer).unwrap().into_inner().unwrap();
-            });
-            let elapsed = now.elapsed();
-            let mut filled_omni_vec = Vec::new();
-            let mut filled_multi_vec = Vec::new();
-            for _i in 0..SHARD_AMOUNT{
-                let omni_elem = omni_vec_o_maps.remove(0);
-                filled_omni_vec.push(Arc::try_unwrap(omni_elem).expect("Failed to get multi map mutex").into_inner().expect("Failed to access inside multi map mutex"));
-                let multi_elem = multi_vec_o_maps.remove(0);
-                filled_multi_vec.push(Arc::try_unwrap(multi_elem).expect("Failed to get multi map mutex").into_inner().expect("Failed to access inside multi map mutex"));
-            }
-            //let mut filled_omni_kmer_map = Arc::try_unwrap(omni_kmer_map).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
-            //let mut filled_multi_kmer_map = Arc::try_unwrap(multi_kmer_map).expect("Failed to unwrap Arc").into_inner().expect("Failed to get Mutex");
-            println!("Filling map took: {:.2?} seconds.", elapsed);
-            println!("COMPUTED NB KMER: {}", tot_nb_kmer);
-            //println!("NB KMER = {}", filled_omni_kmer_map.len()+filled_multi_kmer_map.len());
-            let now = Instant::now();
-            //let mut color_simplitig = HashMap::new();
-            /*rayon::scope(|s| {
-                s.spawn(|_| compute_omnicolored_simplitigs(&mut filled_omni_vec, &output_dir));
-
-                s.spawn(|_| {
-                    //let color_simplitig_mutex = compute_multicolored_simplitigs(&mut filled_multi_kmer_map, &output_dir);
-                    //color_simplitig = Arc::try_unwrap(color_simplitig_mutex).unwrap().into_inner().unwrap();
-                    color_simplitig = compute_multicolored_simplitigs(&mut filled_multi_vec, &output_dir);
-                });
-            });*/
-            compute_omnicolored_simplitigs(&mut filled_omni_vec, &output_dir);
-            let mut color_simplitig = compute_multicolored_simplitigs(&mut filled_multi_vec, &output_dir);
-            let elapsed = now.elapsed();
-            println!("Construction of simplitigs took: {:.2?} seconds.", elapsed);
-            let now = Instant::now();
-            sort_simplitigs(&mut color_simplitig, &output_dir);
-            let elapsed = now.elapsed();
-            println!("Sorting Simplitigs took: {:.2?} seconds.", elapsed);
-        }else if do_decompress == "stats"{
-            let multi_file = args.multicolor_file;
-            let omni_file = args.omnicolor_file;
-            let k = K;
-            if multi_file != "" && omni_file != ""{
-                compute_stats(&omni_file, &multi_file, &output_dir, &k);
-            }else{
-                println!("Error, multicolor and/or omnicolor file(s) are mandatory");
-            }
-        }/*else if do_decompress == "test"{
-            let kmer_map_test_mutex: Arc<Mutex<HashMap<KT, u32>>> = Arc::new(Mutex::new(HashMap::with_capacity(nb_elem)));
-            let now = Instant::now();
-            (0..NB_FILES).into_par_iter().for_each(|file_number|{
-                let mut kmer_map_mutex = Arc::clone(&kmer_map_test_mutex);
-                println!("{}", filenames.get(file_number).unwrap());
-                test_fill_map(&filenames.get(file_number).unwrap(), &mut kmer_map_mutex, file_number, &nb_elem);
-            });
-            let elapsed = now.elapsed();
-            println!("Filling map took: {:.2?} seconds.", elapsed);
-        }*/
-    }else {
-        println!("Wrong positional arguments given. Values are 'compress' or 'decompress'");
-        println!("Ex: if compression: I=my/fof.txt cargo r -r -- compress -f my_file_of_file.txt -o out_dir/ -t 12");
-        println!("Ex: if decompression: I=my/fof.txt cargo r -r -- decompress -f my_file_of_file.txt --omnicolor-file out_dir/omnicolor.fa.zstd --multicolor-file out_dir/multicolor.fa.zstd -t 12");
-    }
-}
-
-/*fn test_fill_map(filename: &str, kmer_map_mutex: &Arc<Mutex<HashMap<KT, u32>>>, file_number: usize, nb_elem: &usize){
-    let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
-    let mut counter : u64 = 0;
-    let mut counter_insert : u64 = 0;
-    let mut counter_modify : u64 = 0;
-    //let mut to_add = HashSet::new();
-    while let Some(record) = fa_reader.next(){
-        let seqrec = record.expect("Error reading record");
-        let norm_seq = seqrec.normalize(false);
-        let norm_rc = norm_seq.reverse_complement();
-        let canon_kmers = norm_seq.canonical_kmers(K as u8, &norm_rc);
-        canon_kmers.for_each(|kmer|{
-            //println!("{}", std::str::from_utf8(&kmer.1).unwrap());
-            
-            let curr_kmer: RawKmer<K, KT> = RawKmer::from_nucs(kmer.1);
-            counter += 1;
-            let mut kmer_map = kmer_map_mutex.lock().unwrap();
-            //let file_nb = *file_number.read();
-            kmer_map.entry(curr_kmer.to_int()).and_modify(|cpt|{
-                counter_modify += 1;
-                *cpt = *cpt+1;
-            }).or_insert_with(|| {
-                counter_insert += 1;
-                let mut cpt : u32 = 0;
-                cpt
-            });
-            //TODO FIND A WAY TO RESIZE WITH DASHMAP
-            /*if kmer_map.capacity() <= (20/100)*nb_elem{
-                kmer_map.try_reserve((30/100)*nb_elem);
-            }*/
-        });
-    }
-    println!("I have inserted {} k-mers", counter_insert);
-    println!("I have seen {} already inserted k-mers", counter_modify);
-    println!("I have seen {} k-mers", counter);
-}*/
-
-
-fn get_extension_from_filename(filename: &str) -> Option<&str> {
-    Path::new(filename)
-        .extension()
-        .and_then(OsStr::to_str)
-}
-
-/*
-READS FASTA FILES.
-CREATES K-MER -> COLOR MAP.
-*/
-fn read_fasta(filename: &str, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>>, omni_kmer_map: &mut 
-    Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, file_number: usize, nb_elem: &usize) -> Arc<Mutex<u64>>{
-    //let mut fa_reader = parse_fastx_file(filename).expect("Error while opening file");
-    //let mut kmer_buffer = Vec::new();
-
-    let extension = get_extension_from_filename(filename).unwrap();
-
-    let file = File::open(filename).unwrap();
-    let mut reader = BufReader::new(file);
-    let records: Vec<_>;
-    println!("{}", extension);
-    if extension == "zst"{
-        let decoder = Decoder::new(reader).unwrap();
-        let decompressed_reader = BufReader::new(decoder);
-        let mut fa_reader = Reader::new(decompressed_reader);
-        records = fa_reader.records().collect::<Result<Vec<_>, _>>().expect("Failed to access to record.");
-    }else if extension == "fa" || extension == "fna" || extension == "fasta" {
-        let mut fa_reader = Reader::new(reader);
-        records = fa_reader.records().collect::<Result<Vec<_>, _>>().expect("Failed to access to record.");
-    }else{
-        println!("Error, file extension not handled.");
+    let use_unitigs = args.unitig;
+    let use_matchtigs = args.matchtig;
+    let use_eulertigs = args.eulertig;
+    let ggcat_rebuild = args.ggcat_rebuild;
+    let tig_flags_set = [use_unitigs, use_matchtigs, use_eulertigs, args.simplitig]
+        .iter()
+        .filter(|&&f| f)
+        .count();
+    if tig_flags_set > 1 {
+        eprintln!("Error: only one of --unitig, --simplitig, --matchtig, --eulertig can be set at a time.");
         std::process::exit(1);
     }
-    let kmer_counter_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-    println!("FILE NUMBER: {}", file_number);
-    // Process each record in parallel
-    records.par_iter().for_each(|record| {
-        let mut counter : u64 = 1;
-        let mut curr_kmer= RawKmer::<K, KT>::from_nucs(&record.seq[..K]);
-        let mut canon = curr_kmer.canonical().to_int();
-        handle_kmer(omni_kmer_map, multi_kmer_map, file_number, canon);
-        for (_i, nuc) in record.seq[K..].iter().filter_map(KT::from_nuc).enumerate() {
-            curr_kmer = curr_kmer.append(nuc);
-            canon = curr_kmer.canonical().to_int();
-            counter +=1;
-            handle_kmer(omni_kmer_map, multi_kmer_map, file_number, canon);
+    {
+        let do_decompress = args.mode;
+        if args.logan_accessions.is_some() && do_decompress != "compress" {
+            eprintln!("Error: --logan-accessions is a compression option.");
+            std::process::exit(2);
         }
-
-        *kmer_counter_mutex.lock().unwrap() += counter;
-    });
-    if file_number != 0{
-        check_omni(omni_kmer_map, multi_kmer_map, file_number);
-    }
-    println!("I have seen {} total k-mers", kmer_counter_mutex.lock().unwrap());
-    kmer_counter_mutex
-}
-
-fn handle_kmer(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_kmer_map: &Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>>, file_number: usize, canon: KT){
-    let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
-    //counter += 1;
-    let mut omni_kmer_map_lock = omni_kmer_map.get(pos).unwrap().lock().unwrap();
-    if file_number == 0{
-        omni_kmer_map_lock.insert(canon, Cell::new(false));
-    }else if let Some(elem) = omni_kmer_map_lock.get_mut(&canon) {
-        elem.set(true);
-    }else{
-        let mut multi_kmer_map_lock = multi_kmer_map.get(pos).unwrap().lock().unwrap();
-        multi_kmer_map_lock.entry(canon).and_modify(|pair|{
-            pair.0.set(file_number, true);
-        }).or_insert_with(|| {
-            let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-            bv.set(file_number, true);
-            (bv, Cell::new(false))
-        });
-        drop(multi_kmer_map_lock);
-    }
-    drop(omni_kmer_map_lock);
-}
-
-fn check_omni(omni_kmer_map: &Vec<Arc<Mutex<HashMap<KT, Cell<bool>>>>>, multi_kmer_map: &mut Vec<Arc<Mutex<HashMap<KT, COLORPAIR>>>>, file_number: usize){
-    let kmer_to_remove_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-    let kmer_counter_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-    (0..SHARD_AMOUNT).into_par_iter().for_each(|i|{
-        let mut counter: u64 = 0;
-        let mut to_remove: u64 = 0;
-        let mut omni_kmer_map_lock = omni_kmer_map.get(i).unwrap().lock().unwrap();
-        let mut omni_iterator = omni_kmer_map_lock.iter();
-        while let Some(entry) = omni_iterator.next(){
-            let curr_k = num2str(*entry.0);
-            counter+=1;
-            if !(entry.1.get()){
-                to_remove += 1;
-                let mut multi_kmer_map_lock = multi_kmer_map.get(i).unwrap().lock().unwrap();
-                multi_kmer_map_lock.entry(*entry.0).and_modify(|pair|{
-                    pair.0.set(file_number, false);
-                }).or_insert_with(|| {
-                    let mut bv: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-                    let mut i = 0;
-                    while i < file_number{
-                        bv.set(i, true);
-                        i += 1;
-                    }
-                    (bv, Cell::new(false))
-                });
-                drop(multi_kmer_map_lock);
+        if args.abundance_threshold.is_some() && !matches!(do_decompress.as_str(), "compress" | "decompress") {
+            eprintln!("Error: --abundance-threshold is a compression or decompression option.");
+            std::process::exit(2);
+        }
+        if (args.abundance_exact || args.abundance_u16) && do_decompress != "compress" {
+            eprintln!("Error: --abundance-exact and --abundance-u16 are compression options; decompress with --stored-tigs --abundance.");
+            std::process::exit(2);
+        }
+        let Some(memory) = args.memory else {
+            eprintln!("Error: please provide a memory budget with -r/--memory <GB>.");
+            std::process::exit(2);
+        };
+        if do_decompress == "decompress" {
+            if args.stored_tigs && (tig_flags_set > 0 || ggcat_rebuild) {
+                eprintln!("Error: --stored-tigs cannot be combined with a rebuild mode.");
+                std::process::exit(2);
+            }
+            if args.color_set_operation.is_some() && wanted_path.is_empty() {
+                eprintln!(
+                    "Error: --color-set-operation requires -Q/--wanted-files with the selected colors."
+                );
+                std::process::exit(2);
+            }
+            if args.color_set_operation.is_some() && args.abundance {
+                eprintln!(
+                    "Error: --abundance cannot be combined with --color-set-operation because one combined output has no single per-dataset abundance."
+                );
+                std::process::exit(2);
+            }
+            println!("Checking archive integrity...");
+            is_compressed_dir_complete(input_dir.clone());
+            let rebuild_cfg = decompress::GgcatRebuildConfig {
+                enabled: !args.stored_tigs,
+                threads,
+                memory_gb: memory,
+                k,
+                temp_dir: temp_dir.clone(),
+                use_unitigs,
+                use_matchtigs,
+                use_eulertigs,
+                use_simplitigs: args.simplitig,
+                restore_abundance: args.abundance,
+                abundance_threshold: args.abundance_threshold,
+                output_compression: args.output_compression,
+                color_set_operation: args.color_set_operation,
+            };
+            if let Err(err) = decompress::decompress_with_options(
+                &String::from("bucket_sizes.txt"),
+                &String::from("id_to_color_id.txt.zst"),
+                &String::from("tigs_kloe.fa"),
+                &String::from("positions_kloe.bin"),
+                &String::from("filenames_id.txt"),
+                &output_dir,
+                &wanted_path,
+                input_dir,
+                rebuild_cfg,
+            ) {
+                eprintln!("decompression failed: {err}");
+                std::process::exit(1);
+            }
+            //let _ = graph_build::init_decompress(String::from("bucket_sizes.txt.zst"), String::from("id_to_color_id.txt.zst"), unitigs_file, &output_dir, &wanted_path, &input_dir);
+        } else if do_decompress == "compress" {
+            if args.stored_tigs {
+                eprintln!("Error: --stored-tigs is a decompression option.");
+                std::process::exit(2);
+            }
+            /*let _ = compress::compress(
+                &output_dir,
+                &input_fof,
+                threads,
+                &temp_dir,
+                k,
+                m,
+                partition_power,
+                compaction_threads
+            );*/
+            //parser::run_parser(k, m, 10_u32, PathBuf::from(output_dir), PathBuf::from(input_fof), threads, compaction_threads, false);
+            let ggcat_cfg = compress::GgcatCompressionConfig {
+                memory_gb: memory,
+                temp_dir,
+                abundance_log_base: None,
+                abundance_bits: args.abundance_bits,
+                abundance_max: (args.abundance && !args.abundance_exact && !args.abundance_u16)
+                    .then_some(args.abundance_max),
+                abundance_exact: args.abundance_exact,
+                abundance_u16: args.abundance_u16,
+                use_simplitigs: args.simplitig,
+                abundance_threshold: args.abundance_threshold,
+                logan: args.logan_accessions.as_ref().map(|_| {
+                    logan::LoganConfig::new(&args.logan_base_url, usize::from(args.logan_downloads))
+                        .map(|config| config.with_policy(args.logan_strict, args.logan_retries))
+                        .unwrap_or_else(|err| { eprintln!("Error: {err}"); std::process::exit(2); })
+                }),
+            };
+            if let Err(err) = compress::compress_with_ggcat(
+                &output_dir,
+                &input_fof,
+                threads,
+                k,
+                m,
+                args.partition_power,
+                args.verify_kmers,
+                args.skip_sort,
+                use_unitigs,
+                use_matchtigs,
+                use_eulertigs,
+                ggcat_cfg,
+            ) {
+                eprintln!("compression failed: {err}");
+                std::process::exit(1);
+            }
+            //let _ = graph_build::build_graphs(&output_dir, &input_fof, &threads, &temp_dir, &memory);
+        } else if do_decompress == "merge" {
+            if args.stored_tigs {
+                eprintln!("Error: --stored-tigs is a decompression option.");
+                std::process::exit(2);
+            }
+            if input_dir.is_empty() || input_dir_b.is_empty() {
+                eprintln!(
+                    "merge requires two archives: use -c/--compressed-dir for archive A and --compressed-dir-b for archive B"
+                );
+                std::process::exit(2);
+            }
+            let merge_cfg = merge::MergeConfig {
+                threads,
+                minimizer_size: m,
+                partition_power: args.partition_power,
+                temp_dir: temp_dir.clone(),
+                verify_kmers: args.verify_kmers,
+                skip_sort: args.skip_sort,
+                use_unitigs,
+                use_matchtigs,
+                use_eulertigs,
+                structural: args.structural_merge,
+                use_simplitigs: args.simplitig,
+            };
+            if let Err(err) = merge::merge_archives_with_config(
+                &input_dir,
+                &input_dir_b,
+                &output_dir,
+                args.k_size.unwrap_or(0),
+                memory,
+                merge_cfg,
+            ) {
+                eprintln!("merge failed: {err}");
+                std::process::exit(1);
             }
         }
-        *kmer_counter_mutex.lock().unwrap() += counter;
-        *kmer_to_remove_mutex.lock().unwrap() += to_remove;
-        omni_kmer_map_lock.retain(|_k,v| v.get());
-        for elem in omni_kmer_map_lock.iter(){
-            elem.1.set(false);
-        }
-    });
-    println!("I have seen {} k-mers total in the omnicolor", kmer_counter_mutex.lock().unwrap());
-    println!("I have seen {} k-mers to be removed from omnicolor", kmer_to_remove_mutex.lock().unwrap());
-    
+    }
 }
 
-/*
-CONSTRUCTS SIMPLITIGS FROM K-MERS GATHERED IN "READ_FASTA".
-SIMPLITIGS ARE MONOCHROMATIC.
-OMNICOLORED (SEEN IN EVERY INPUT FILE) SIMPLITIGS ARE WRITTEN IN THE SAME FILE (omnicolor.kloe)
-SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
-*/
-fn compute_omnicolored_simplitigs(omni_kmer_map:  &mut Vec<HashMap<KT, Cell<bool>>>, output_dir: &String){
-    let mut nb_kmer = 0;
-    for i in 0..SHARD_AMOUNT{
-        nb_kmer += omni_kmer_map.get(i).unwrap().len();
-        let kmer_map = omni_kmer_map.get(i).unwrap();
-        let mut kmer_iterator = kmer_map.iter();
-        while let Some(entry) = kmer_iterator.next(){
-            if entry.1.get(){
-                entry.1.set(false);
+fn is_compressed_dir_complete(input_dir: String) {
+    if !Path::new(&format!("{input_dir}/filenames_id.txt")).exists() {
+        panic!("file not found: {input_dir}/filenames_id.txt");
+    } else if !Path::new(&format!("{input_dir}/positions_kloe.bin")).exists() {
+        panic!("Positions file not found");
+    } else if !Path::new(&format!("{input_dir}/bucket_sizes.txt")).exists() {
+        panic!("Tigs sizes file not found");
+    } else if !Path::new(&format!("{input_dir}/id_to_color_id.txt.zst")).exists()
+        && !Path::new(&format!("{input_dir}/{}", compress::CID_TO_DATASET_FILE)).exists()
+        && !Path::new(&format!("{input_dir}/{}", compress::DATASET_TO_CID_FILE)).exists()
+    {
+        panic!("archive membership index not found");
+    } else if !Path::new(&format!("{input_dir}/tigs_kloe.fa")).exists() {
+        panic!("Tigs file not found");
+    } else if Path::new(&format!("{input_dir}/{}", compress::DATASET_TO_CID_FILE)).exists() {
+        for index in [
+            compress::ARCHIVE_MANIFEST_FILE,
+            compress::FILENAME_INDEX_FILE,
+            compress::POSITIONS_INDEX_FILE,
+            compress::BUCKET_SIZES_INDEX_FILE,
+            compress::TIGS_INDEX_FILE,
+        ] {
+            if !Path::new(&format!("{input_dir}/{index}")).exists() {
+                panic!("KLOE v4 index not found: {input_dir}/{index}");
             }
         }
     }
-    println!("I will reconstruct omnicolored simplitigs from {} kmers", nb_kmer);
+    println!("Archive complete, starting decompression...");
+}
 
-    let omni_simpli = Instant::now();
-    //let mut omni_f = Encoder::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("Unable to create file"), 0).unwrap();
-    let mut omni_f = BufWriter::new(File::create(output_dir.clone()+"omnicolor.kloe").expect("unable to create file"));
-    let mut cpt = 0;
-    for i in 0..SHARD_AMOUNT{
-        let kmer_map = omni_kmer_map.get(i).unwrap();
-        let mut kmer_iterator = kmer_map.iter();
-        while let Some(entry) = kmer_iterator.next(){
-            if !entry.1.get(){
-                entry.1.set(true);
-                let mut forward = true;
-                let mut backward = true;
-                let mut simplitig = num2str(entry.0.clone());
-                while forward{
-                    let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
-                    forward = extend_omnicolor_forward(&curr_kmer, omni_kmer_map, &mut simplitig);
+#[cfg(test)]
+mod tests {
+    use super::{compress, decompress, merge};
+    use std::collections::BTreeSet;
+    use std::fs::{self, File};
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use tempfile::TempDir;
+
+    const K: usize = 31;
+    const MODES: [&str; 4] = ["simplitigs", "unitigs", "matchtigs", "eulertigs"];
+    const SEQ_SHARED_12: &str = "ACGTACGTTGCAACGTACGTTGCAACGTACGTACGTA";
+    const SEQ_ONLY_1: &str = "TTGCAACGTACGTTTGCAACGTACGTTTGCAACGTAC";
+    const SEQ_ONLY_2: &str = "GGATCCGGATCCGGATCCGGATCCGGATCCGGATCCA";
+    const SEQ_SHARED_23: &str = "CCGTAACCGTAACCGTAACCGTAACCGTAACCGTAAC";
+    const SEQ_ONLY_3: &str = "ATGCTTATGCTTATGCTTATGCTTATGCTTATGCTTA";
+
+    pub(super) fn ggcat_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn write_fasta(path: &Path, seqs: &[&str]) {
+        let mut fasta = String::new();
+        for (i, seq) in seqs.iter().enumerate() {
+            fasta.push_str(&format!(">seq{}\n{}\n", i + 1, seq));
+        }
+        fs::write(path, fasta).expect("write source fasta");
+    }
+
+    fn parse_fasta_sequences(path: &Path) -> Vec<String> {
+        if fs::metadata(path).expect("stat FASTA").len() == 0 {
+            return Vec::new();
+        }
+        let file = File::open(path).expect("open fasta");
+        let (mut reader, _) =
+            niffler::get_reader(Box::new(file)).expect("detect fasta compression");
+        let mut content = String::new();
+        reader.read_to_string(&mut content).expect("read fasta");
+        let mut seqs = Vec::new();
+        let mut current = String::new();
+        for line in content.lines() {
+            if line.starts_with('>') {
+                if !current.is_empty() {
+                    seqs.push(current.clone());
+                    current.clear();
                 }
-                while backward{
-                    let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
-                    backward = extend_omnicolor_backward(&curr_kmer, omni_kmer_map, &mut simplitig);
-                }
-                let simplitig_size:u32 = simplitig.len().to_u32().unwrap();
-                //println!("CURR KMER = {}", num2str(*entry.0));
-                /*println!("SIMPLITIG SIZE = {}", simplitig_size);
-                if usize::BITS == 64{
-                    println!("OUI");
-                }else {
-                    println!("NON");
-                }
-                //println!("SIMPLITIG = {}", &simplitig);
-                let mut input = String::new();
-                io::stdin().read_line(&mut input).expect("error: unable to read user input"); */
-                cpt += simplitig.len() - K + 1;
-                omni_f.write_all(&simplitig_size.to_le_bytes()).expect("Unable to write simplitig size");  
-                omni_f.write_all(&str2num(&simplitig)).expect("Unable to write data");
+            } else if !line.trim().is_empty() {
+                current.push_str(line.trim());
             }
         }
-    }    
-    omni_f.flush();         
-    println!("NB KMERS: {}", cpt);
-    let fin_omni_simpli = omni_simpli.elapsed();
-    println!("Construction of omnicolored simplitigs took: {:.2?} seconds.", fin_omni_simpli);
-}
+        if !current.is_empty() {
+            seqs.push(current);
+        }
+        seqs
+    }
 
-/*
-FORWARD EXTENSION FOR SIMPLITIG CREATION.
-CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
-*/
-fn extend_omnicolor_forward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<KT, Cell<bool>>>, simplitig: &mut String) -> bool{
-    for succs in curr_kmer.successors(){
-        let canon = succs.canonical();
-        //let mini = find_min(succs.canonical());
-        //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-        //let canon_succs = succs.clone().canonical();
-        let pos = canon.to_int().to_usize().unwrap()%SHARD_AMOUNT;
-        let kmer_map = kmer_map.get(pos).unwrap();
-        if kmer_map.contains_key(&canon.to_int()){
-            if !kmer_map.get(&canon.to_int()).unwrap().get() {
-                simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                kmer_map.get(&canon.to_int()).unwrap().set(true);
-                return true;
-            }
+    fn revcomp(seq: &str) -> String {
+        seq.chars()
+            .rev()
+            .map(|b| match b {
+                'A' => 'T',
+                'C' => 'G',
+                'G' => 'C',
+                'T' => 'A',
+                _ => 'N',
+            })
+            .collect()
+    }
+
+    fn canonical_kmer(kmer: &str) -> String {
+        let rc = revcomp(kmer);
+        if rc.as_str() < kmer {
+            rc
+        } else {
+            kmer.to_string()
         }
     }
-    false
-}
 
-/*
-BACKWARD EXTENSION FOR SIMPLITIG CREATION.
-CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
-INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
-*/
-fn extend_omnicolor_backward(curr_kmer: &RawKmer<K, KT>, kmer_map:  &Vec<HashMap<KT, Cell<bool>>>, simplitig: &mut String) -> bool{
-    for preds in curr_kmer.predecessors(){
-        let canon = preds.canonical();
-        //let mini = find_min(preds.canonical());
-        //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-        let pos = canon.to_int().to_usize().unwrap()%SHARD_AMOUNT;
-        let kmer_map = kmer_map.get(pos).unwrap();
-        if kmer_map.contains_key(&canon.to_int()){
-            if !kmer_map.get(&canon.to_int()).unwrap().get() {
-                simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
-                kmer_map.get(&canon.to_int()).unwrap().set(true);
-                return true;
+    fn kmer_set_from_seqs(seqs: &[String], k: usize) -> BTreeSet<String> {
+        let mut kmers = BTreeSet::new();
+        for seq in seqs {
+            assert!(
+                seq.len() >= k,
+                "sequence shorter than k: len={}, k={}",
+                seq.len(),
+                k
+            );
+            for i in 0..=seq.len() - k {
+                let kmer = &seq[i..i + k];
+                kmers.insert(canonical_kmer(kmer));
             }
         }
+        kmers
     }
-    false
-}
 
-
-/*
-CONSTRUCTS SIMPLITIGS FROM K-MERS GATHERED IN "READ_FASTA".
-SIMPLITIGS ARE MONOCHROMATIC.
-OMNICOLORED (SEEN IN EVERY INPUT FILE) SIMPLITIGS ARE WRITTEN IN THE SAME FILE (omnicolor.fa.zstd)
-MULTICOLORED SIMPLITIGS ARE WRITTEN IN ANOTHER FILE (multicolor.fa.zstd).
-SIMPLITIGS ARE CONSTRUCTED USING PROPHASM'S GREEDY ALGORITHM.
-*/
-fn compute_multicolored_simplitigs(multi_kmer_map:  &mut Vec<HashMap<KT, COLORPAIR>>, output_dir: &String) -> HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>{//Arc<Mutex<HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>>>{
-    let mut nb_kmer = 0;
-    for i in 0..SHARD_AMOUNT{
-        nb_kmer += multi_kmer_map.get(i).unwrap().len();
+    pub(super) fn assert_kmer_equivalent(expected: &[String], dumped_fasta: &Path, k: usize) {
+        let expected_kmers = kmer_set_from_seqs(expected, k);
+        let dumped_kmers = kmer_set_from_seqs(&parse_fasta_sequences(dumped_fasta), k);
+        assert_eq!(dumped_kmers, expected_kmers, "k-mer content mismatch");
     }
-    println!("I will reconstruct multicolored simplitigs from {} kmers", nb_kmer);
 
-    let multi_simpli = Instant::now();
-    let mut multi_f = BufWriter::new(File::create(output_dir.clone()+"temp_multicolor.fa").expect("Unable to create file"));
-    //let mut color_simplitig_size: Arc<Mutex<HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mut color_simplitig_size: HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)> = HashMap::new();
-    for i in 0..SHARD_AMOUNT{
-        let kmer_map = multi_kmer_map.get(i).unwrap();
-        let mut kmer_iterator = kmer_map.iter();
-        while let Some((key, curr_cell)) = kmer_iterator.next(){
-            if !curr_cell.1.get(){
-                curr_cell.1.set(true);
-                let mut forward = true;
-                let mut backward = true;
-                let mut simplitig = num2str(*key);
-                while forward{
-                    let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[(simplitig.len()-K)..].as_bytes());
-                    forward = extend_forward(&curr_kmer, &multi_kmer_map, &mut simplitig, &curr_cell.0, i);
-                }
-                while backward{
-                    let curr_kmer = RawKmer::<K, KT>::from_nucs(&simplitig[0..K].as_bytes());
-                    backward = extend_backward(&curr_kmer, &multi_kmer_map, &mut simplitig, &curr_cell.0, i);
-                }
-                let simplitig_size = simplitig.len();
-                color_simplitig_size.entry(curr_cell.0)
-                            .and_modify(|total_size| {
-                                total_size.0 += simplitig_size.div_ceil(4);
-                                total_size.1.push(simplitig_size);
-                            })
-                            .or_insert((simplitig_size.div_ceil(4), vec![simplitig_size]));
-                write_multicolored_simplitig(&str2num(&simplitig), &mut multi_f,&curr_cell.0, &simplitig.len());
-            }
+    fn kmer_set_from_fasta(path: &Path, k: usize) -> BTreeSet<String> {
+        let seqs = parse_fasta_sequences(path);
+        kmer_set_from_seqs(&seqs, k)
+    }
+
+    fn assert_kmer_maps_equal(left: &Path, right: &Path, k: usize, context: &str) {
+        let left_map = kmer_set_from_fasta(left, k);
+        let right_map = kmer_set_from_fasta(right, k);
+        assert_eq!(left_map, right_map, "{}", context);
+    }
+
+    fn mode_archive_path(archive_dir: &Path, mode: &str) -> PathBuf {
+        archive_dir.join(format!("{mode}.fa.zst"))
+    }
+
+    fn make_dump_path(out_dir: &Path, source_path: &Path, dataset_id: usize) -> PathBuf {
+        let stem = source_path
+            .file_stem()
+            .expect("missing file stem")
+            .to_str()
+            .expect("invalid utf8 stem");
+        out_dir.join(format!("Dump_{dataset_id}_{stem}.fa"))
+    }
+
+    fn count_dump_files(out_dir: &Path) -> usize {
+        fs::read_dir(out_dir)
+            .expect("read output directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|name| name.starts_with("Dump_") && name.ends_with(".fa"))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    fn multi_case_expected() -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            vec![SEQ_SHARED_12.to_string(), SEQ_ONLY_1.to_string()],
+            vec![
+                SEQ_SHARED_12.to_string(),
+                SEQ_ONLY_2.to_string(),
+                SEQ_SHARED_23.to_string(),
+            ],
+            vec![SEQ_SHARED_23.to_string(), SEQ_ONLY_3.to_string()],
+        )
+    }
+
+    fn multi_case_records() -> Vec<(String, String)> {
+        vec![
+            ("1,2".to_string(), SEQ_SHARED_12.to_string()),
+            ("1".to_string(), SEQ_ONLY_1.to_string()),
+            ("2".to_string(), SEQ_ONLY_2.to_string()),
+            ("2,3".to_string(), SEQ_SHARED_23.to_string()),
+            ("3".to_string(), SEQ_ONLY_3.to_string()),
+        ]
+    }
+
+    fn multi_case_records_permuted() -> Vec<(String, String)> {
+        let records = multi_case_records();
+        vec![
+            records[3].clone(),
+            records[1].clone(),
+            records[4].clone(),
+            records[0].clone(),
+            records[2].clone(),
+        ]
+    }
+
+    fn run_compression(
+        input_files: &[PathBuf],
+        output_dir: &Path,
+        k: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        run_compression_with_simplitigs(input_files, output_dir, k, false)
+    }
+
+    fn run_compression_with_simplitigs(
+        input_files: &[PathBuf],
+        output_dir: &Path,
+        k: usize,
+        use_simplitigs: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ggcat_guard = ggcat_test_lock();
+        // Create a file-of-files list
+        let fof_path = output_dir.join("input.fof");
+        let mut fof = File::create(&fof_path)?;
+        for file in input_files {
+            writeln!(fof, "{}", file.display())?;
+        }
+        drop(fof);
+
+        // Run the streaming compression
+        let output_dir_str = output_dir.display().to_string() + "/";
+        compress::compress_with_ggcat(
+            &output_dir_str,
+            &fof_path.display().to_string(),
+            1, // threads
+            k,
+            7,     // minimizer size
+            10,    // partition power
+            false, // verify_kmers
+            false, // skip_sort
+            false, // use_unitigs
+            false, // use_matchtigs
+            false, // use_eulertigs
+            compress::GgcatCompressionConfig {
+                use_simplitigs,
+                logan: None,
+                abundance_threshold: None,
+                ..compress::GgcatCompressionConfig::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    fn write_filenames_id(path: &Path, files: &[PathBuf], offsets: &[usize]) {
+        assert_eq!(
+            files.len(),
+            offsets.len(),
+            "files and offsets length mismatch"
+        );
+        let mut out = File::create(path).expect("create filenames_id.txt");
+        for i in 0..files.len() {
+            writeln!(out, "{}:{}", files[i].display(), offsets[i]).expect("write filenames_id row");
         }
     }
-    multi_f.flush();
-    let fin_multi_simpli = multi_simpli.elapsed();
-    println!("Construction of multicolored simplitigs took: {:.2?} seconds.", fin_multi_simpli);
-    color_simplitig_size
-}
-/*
-FORWARD EXTENSION FOR SIMPLITIG CREATION.
-CHECKS IF SUCCESSORS ARE THE SAME COLOR AS CURRENT K-MER.
-*/
-fn extend_forward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>, pos_curr_kmer: usize) -> bool{
-    for succs in curr_kmer.successors(){
-        let canon = succs.canonical().to_int();
-        if let Some(succ_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&canon){
-            if succ_pair.0.eq(color) & !succ_pair.1.get() {
-                simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                succ_pair.1.set(true);
-                return true;
-            }
-        }else{
-            //let mini = find_min(succs.canonical());
-            //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-            let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
-            let kmer_map = vec_kmer_map.get(pos).unwrap();
-            if let Some(succ_pair) = kmer_map.get(&canon){
-                if succ_pair.0.eq(color) & !succ_pair.1.get() {
-                    simplitig.push(*succs.to_nucs().last().unwrap() as char);
-                    succ_pair.1.set(true);
-                    return true;
-                }
-            }
+
+    struct MultiFixture {
+        _workdir: TempDir,
+        archive_dir: PathBuf,
+        full_out_dir: PathBuf,
+        targeted_out_dir: PathBuf,
+        file1: PathBuf,
+        file2: PathBuf,
+        file3: PathBuf,
+        dump1_full: PathBuf,
+        dump2_full: PathBuf,
+        dump3_full: PathBuf,
+        dump1_targeted: PathBuf,
+        dump2_targeted: PathBuf,
+        dump3_targeted: PathBuf,
+        expected1: Vec<String>,
+        expected2: Vec<String>,
+        expected3: Vec<String>,
+    }
+
+    struct LargeFixture {
+        _workdir: TempDir,
+        archive_dir: PathBuf,
+        full_out_dir: PathBuf,
+        targeted_out_dir: PathBuf,
+        source_files: Vec<PathBuf>,
+        expected_seqs: Vec<String>,
+        dump_full: Vec<PathBuf>,
+        dump_targeted: Vec<PathBuf>,
+        targeted_indices: Vec<usize>,
+    }
+
+    fn setup_multi_fixture(_mode: &str, _records: Vec<(String, String)>) -> MultiFixture {
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive_dir = workdir.path().join("archive");
+        let full_out_dir = workdir.path().join("out_full");
+        let targeted_out_dir = workdir.path().join("out_targeted");
+        fs::create_dir_all(&archive_dir).expect("create archive directory");
+        fs::create_dir_all(&full_out_dir).expect("create full output directory");
+        fs::create_dir_all(&targeted_out_dir).expect("create targeted output directory");
+
+        let file1 = workdir.path().join("sample1.fa");
+        let file2 = workdir.path().join("sample2.fa");
+        let file3 = workdir.path().join("sample3.fa");
+
+        let (expected1, expected2, expected3) = multi_case_expected();
+        let exp1_refs: Vec<&str> = expected1.iter().map(String::as_str).collect();
+        let exp2_refs: Vec<&str> = expected2.iter().map(String::as_str).collect();
+        let exp3_refs: Vec<&str> = expected3.iter().map(String::as_str).collect();
+        write_fasta(&file1, &exp1_refs);
+        write_fasta(&file2, &exp2_refs);
+        write_fasta(&file3, &exp3_refs);
+
+        // Run streaming compression instead of write_records_archive
+        run_compression(
+            &[file1.clone(), file2.clone(), file3.clone()],
+            &archive_dir,
+            K,
+        )
+        .expect("compression failed");
+
+        MultiFixture {
+            _workdir: workdir,
+            archive_dir,
+            full_out_dir: full_out_dir.clone(),
+            targeted_out_dir: targeted_out_dir.clone(),
+            file1: file1.clone(),
+            file2: file2.clone(),
+            file3: file3.clone(),
+            dump1_full: make_dump_path(&full_out_dir, &file1, 0),
+            dump2_full: make_dump_path(&full_out_dir, &file2, 1),
+            dump3_full: make_dump_path(&full_out_dir, &file3, 2),
+            dump1_targeted: make_dump_path(&targeted_out_dir, &file1, 0),
+            dump2_targeted: make_dump_path(&targeted_out_dir, &file2, 1),
+            dump3_targeted: make_dump_path(&targeted_out_dir, &file3, 2),
+            expected1,
+            expected2,
+            expected3,
         }
     }
-    false
-}
 
-/*
-BACKWARD EXTENSION FOR SIMPLITIG CREATION.
-CHECKS IF PREDECESSORS ARE THE SAME COLOR AS CURRENT K-MER.
-INSERTS FIRST NUCLEOTIDE OF PREDECESSOR (CHECKED MULTIPLE TIMES)
-*/
-fn extend_backward(curr_kmer: &RawKmer<K, KT>, vec_kmer_map:  &Vec<HashMap<KT, COLORPAIR>>, simplitig: &mut String, color: &BitArray<[u8;ARRAY_SIZE]>, pos_curr_kmer: usize) -> bool{
-    for preds in curr_kmer.predecessors(){
-        let canon = preds.canonical().to_int();
-        if let Some(pred_pair) = vec_kmer_map.get(pos_curr_kmer).unwrap().get(&canon){
-            if pred_pair.0.eq(color) & !pred_pair.1.get() {
-                simplitig.insert(0, *preds.to_nucs().first().unwrap() as char);
-                pred_pair.1.set(true);
-                return true;
-            }
-        }else{
-            //let mini = find_min(preds.canonical());
-            //let pos = mini.to_usize().unwrap()%SHARD_AMOUNT;
-            let pos = canon.to_usize().unwrap()%SHARD_AMOUNT;
-            let kmer_map = vec_kmer_map.get(pos).unwrap();
-            if let Some(pred_pair) = kmer_map.get(&canon){
-                if pred_pair.0.eq(color) & !pred_pair.1.get() {
-                    simplitig.insert(0,*preds.to_nucs().first().unwrap() as char);
-                    pred_pair.1.set(true);
-                    return true;
-                }
-            }
+    fn generate_len100_sequence(index: usize) -> String {
+        let bases = ['A', 'C', 'G', 'T'];
+        let mut seq = String::with_capacity(100);
+
+        let mut x = index;
+        let mut prefix = ['A'; 20];
+        for i in (0..20).rev() {
+            prefix[i] = bases[x & 0b11];
+            x >>= 2;
         }
-    }
-    false
-}
+        for c in prefix {
+            seq.push(c);
+        }
 
-fn compute_cursor_start_pos(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>) -> IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>{
-    let mut color_to_cursor = IndexMap::new();
-    let mut prev_cursor: u64 = 0;
-    for (key, value) in color_simplitig.iter(){
-        if key.count_ones() != NB_FILES{
-            color_to_cursor.entry(*key).or_insert({
-                let proxy = prev_cursor;
-                prev_cursor += value.0 as u64;
-                proxy
+        let mut state = (index as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        for _ in 20..100 {
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            seq.push(match state & 0b11 {
+                0 => 'A',
+                1 => 'C',
+                2 => 'G',
+                _ => 'T',
             });
         }
+
+        seq
     }
-    color_to_cursor
-}
-// save simplitig as vec of u8, save taille reelle, pour obtenir la taille u8: taille reelle/4 arrondi sup.
-// COMME SUIT: 00110001 taille_a_lire U8U8U8U8U8
-// THEN ON LES LIT UN A UN POUR LES TRIER, LA TAILLE DOIT ETRE STOCKEE QQPART (COLOR_SIMPLITIG_SIZE ?)
-// ADDITION DES TAILLES/4 ARRONDI SUP POUR AVOIR LA TAILLE DU BUCKET ET AINSI CALCULER LES CURSEURS
-// REECRITURE TRIÉ PUIS COMPRESSION
-fn sort_simplitigs(color_simplitig: &mut HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, output_dir: &String ) {
-    let path = output_dir.clone()+"multicolor.kloe";
-    //let compressed_path = output_dir.clone()+"multicolor.zstd";
-    let mut out_mult_file = BufWriter::new(File::options().write(true).read(true).create(true).open(path.clone()).expect("Unable to create file"));
-    //let mut color_set = HashSet::new();
-    let mut color_cursor_pos = compute_cursor_start_pos(color_simplitig);
-    let temp_multicolor_file = File::open(output_dir.clone()+"temp_multicolor.fa").unwrap();
-    let mut temp_multicolor_reader = BufReader::new(&temp_multicolor_file);
-    const COLOR_SIZE: usize = NB_FILES.div_ceil(8);
-    let mut cursor: usize = 0;
-    let metadata = temp_multicolor_file.metadata().unwrap();
-    let file_size: usize = metadata.len() as usize;
-    println!("FILE SIZE = {}", file_size);
-    while cursor < file_size{
-        cursor+= COLOR_SIZE;
-        let mut id = [0; ARRAY_SIZE];
-        temp_multicolor_reader.read_exact(&mut id).expect("Error reading color in temp file");
-        let mut size_buf = [0; 4];
-        cursor += 4;
-        temp_multicolor_reader.read_exact(&mut size_buf).expect("Error reading simplitig size in temp file");
-        let size_to_read: u32 = u32::from_le_bytes(size_buf).div_ceil(4);
-        //let size_simplitig: u32 = u32::from_le_bytes(size_buf);
-        //println!("READING CURSOR = {}", cursor);
-        cursor += size_to_read as usize;
-        //println!("COLOR: {}\nSIZE: {}", &id.to_vec()[0], size_simplitig);
-        let mut simplitig = vec![0; size_to_read as usize];
-        //println!("Reading {} Bytes", simplitig.len());
-        temp_multicolor_reader.read_exact(&mut simplitig).expect("Error reading simplitig");
-        //println!("SIMPLITIG: {}", vec2str(&simplitig.to_vec(), &(size_simplitig as usize)));
-        let _ = write_sorted(&mut out_mult_file, simplitig, &mut color_cursor_pos, &id.to_vec());
-        //println!("READING CURSOR = {}", cursor);
-        //let mut input = String::new();
-        //io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    }
-    out_mult_file.flush();
-    let _ = remove_file(output_dir.clone()+"temp_multicolor.fa");
-    //zstd_compress_file(&out_mult_file, compressed_path);
-    write_interface_file(color_simplitig, color_cursor_pos, output_dir);
-}
 
-/* fn zstd_compress_file(in_file: &File, output_path: &Path) -> io::Result<()> {
-    let in_file = File::open(input_path)?;
-    let mut reader = BufReader::new(input_file);
+    fn setup_large_fixture(_mode: &str, n_files: usize) -> LargeFixture {
+        assert!(n_files >= 100, "stress test expects at least 100 files");
 
-    let output_file = File::create(output_path)?;
-    let mut writer = BufWriter::new(output_file);
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive_dir = workdir.path().join("archive");
+        let full_out_dir = workdir.path().join("out_full");
+        let targeted_out_dir = workdir.path().join("out_targeted");
+        fs::create_dir_all(&archive_dir).expect("create archive directory");
+        fs::create_dir_all(&full_out_dir).expect("create full output directory");
+        fs::create_dir_all(&targeted_out_dir).expect("create targeted output directory");
 
-    copy_encode(&mut reader, &mut writer, 9)?;
-    Ok(())
-} */
+        let mut source_files = Vec::with_capacity(n_files);
+        let mut expected_seqs = Vec::with_capacity(n_files);
+        for i in 0..n_files {
+            let source = workdir.path().join(format!("sample_{i:05}.fa"));
+            let seq = generate_len100_sequence(i);
+            expected_seqs.push(seq.clone());
+            write_fasta(&source, &[seq.as_str()]);
+            source_files.push(source);
+        }
 
-fn write_sorted(out_mult_file: &mut BufWriter<File>, content: Vec<u8>, color_cursor_pos: &mut IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, color: &Vec<u8>) -> io::Result<()> {
-    //let mut encoder = Compressor::new(12).unwrap();
-    //let compressed = encoder.compress(content.as_bytes()).unwrap();
-    let mut color_vec: BitArr!(for NB_FILES, in u8) = BitArray::<_>::ZERO;
-    let mut str_color= String::new();
-    for i in 0..NB_FILES{
-        let part = i/8;
-        let bit = (color.get(part).unwrap() >> i) & 1;
-        if bit == 1{
-            color_vec.set(i,true);
-            str_color.push('1');
-        }else {
-            str_color.push('0');
+        // Run streaming compression (mode parameter is unused but kept for test consistency)
+        run_compression(&source_files, &archive_dir, K).expect("compression failed");
+
+        let dump_full: Vec<PathBuf> = source_files
+            .iter()
+            .enumerate().map(|(id, p)| make_dump_path(&full_out_dir, p, id))
+            .collect();
+        let dump_targeted: Vec<PathBuf> = source_files
+            .iter()
+            .enumerate().map(|(id, p)| make_dump_path(&targeted_out_dir, p, id))
+            .collect();
+
+        let targeted_indices = vec![0, 1, 17, 23, 50, 79, 99];
+
+        LargeFixture {
+            _workdir: workdir,
+            archive_dir,
+            full_out_dir,
+            targeted_out_dir,
+            source_files,
+            expected_seqs,
+            dump_full,
+            dump_targeted,
+            targeted_indices,
         }
     }
-    //println!("COLOR = {}", str_color);
-    
-    let position = color_cursor_pos.get(&color_vec).unwrap();
-    out_mult_file.seek(SeekFrom::Start(*position))?;
-    //let mut encoder = zstd::Encoder::new(out_mult_file, 9);
-    out_mult_file.write_all(&content)?;
-    //*position += compressed.len() as u64;
-    //encoder.finish()?;
-    color_cursor_pos.entry(color_vec).and_modify(|cursor| {*cursor += content.len() as u64});
-    Ok(())
-}
 
+    fn reverse_complement(seq: &str) -> String {
+        seq.chars()
+            .rev()
+            .map(|base| match base {
+                'A' => 'T',
+                'C' => 'G',
+                'G' => 'C',
+                'T' => 'A',
+                _ => panic!("invalid nucleotide in test sequence: {}", base),
+            })
+            .collect()
+    }
 
+    fn hamming_distance(a: &str, b: &str) -> usize {
+        assert_eq!(a.len(), b.len(), "hamming distance needs same length");
+        a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count()
+    }
 
-fn write_interface_file(color_simplitig: &HashMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, (usize, Vec<usize>)>, color_cursor_pos: IndexMap<bitvec::prelude::BitArray<[u8; ARRAY_SIZE]>, u64>, output_dir: &String){
-    //let mut file = Encoder::new(File::create(output_dir.clone()+"multicolor_bucket_size.txt.zst").expect("Unable to create interface file"));
-    let mut nb_seen = 0;
-    let mut color_file = Encoder::new(File::create(output_dir.clone()+"multicolor_bucket_size.txt.zst").expect("Unable to create file"), 12).unwrap();
-    for (key, cursor_end) in color_cursor_pos{
-        let mut color = String::new();
-        for e in key.iter(){
-            if *e{
-                color.push('1');
-                nb_seen += 1;
-            }else{
-                color.push('0');
+    struct TwoFileCaseFixture {
+        _workdir: TempDir,
+        archive_dir: PathBuf,
+        full_out_dir: PathBuf,
+        targeted_out_dir: PathBuf,
+        case_file: PathBuf,
+        case_dump_full: PathBuf,
+        case_dump_targeted: PathBuf,
+        control_dump_full: PathBuf,
+        control_dump_targeted: PathBuf,
+    }
+
+    fn setup_two_file_case_fixture(
+        _mode: &str,
+        case_filename: &str,
+        case_seqs: &[String],
+        control_filename: &str,
+        control_seqs: &[String],
+    ) -> TwoFileCaseFixture {
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive_dir = workdir.path().join("archive");
+        let full_out_dir = workdir.path().join("out_full");
+        let targeted_out_dir = workdir.path().join("out_targeted");
+        fs::create_dir_all(&archive_dir).expect("create archive directory");
+        fs::create_dir_all(&full_out_dir).expect("create full output directory");
+        fs::create_dir_all(&targeted_out_dir).expect("create targeted output directory");
+
+        let case_file = workdir.path().join(case_filename);
+        let control_file = workdir.path().join(control_filename);
+        let case_refs: Vec<&str> = case_seqs.iter().map(String::as_str).collect();
+        let control_refs: Vec<&str> = control_seqs.iter().map(String::as_str).collect();
+        write_fasta(&case_file, &case_refs);
+        write_fasta(&control_file, &control_refs);
+
+        // Run streaming compression instead of write_records_archive
+        run_compression(&[case_file.clone(), control_file.clone()], &archive_dir, K)
+            .expect("compression failed");
+
+        TwoFileCaseFixture {
+            _workdir: workdir,
+            archive_dir,
+            full_out_dir: full_out_dir.clone(),
+            targeted_out_dir: targeted_out_dir.clone(),
+            case_file: case_file.clone(),
+            case_dump_full: make_dump_path(&full_out_dir, &case_file, 0),
+            case_dump_targeted: make_dump_path(&targeted_out_dir, &case_file, 0),
+            control_dump_full: make_dump_path(&full_out_dir, &control_file, 1),
+            control_dump_targeted: make_dump_path(&targeted_out_dir, &control_file, 1),
+        }
+    }
+
+    fn run_full_decompression(archive_dir: &Path, out_dir: &Path) {
+        let archive_dir_s = format!("{}/", archive_dir.display());
+        let out_dir_s = format!("{}/", out_dir.display());
+        decompress::decompress_with_options(
+            &String::from("bucket_sizes.txt"),
+            &String::from("id_to_color_id.txt.zst"),
+            &String::from("tigs_kloe.fa"),
+            &String::from("positions_kloe.bin"),
+            &String::from("filenames_id.txt"),
+            &out_dir_s,
+            &String::from(""),
+            archive_dir_s,
+            decompress::GgcatRebuildConfig {
+                enabled: false,
+                output_compression: decompress::OutputCompression::Fasta,
+                ..decompress::GgcatRebuildConfig::default()
+            },
+        )
+        .expect("decompress full archive");
+    }
+
+    fn run_targeted_decompression(archive_dir: &Path, out_dir: &Path, wanted_files: &[PathBuf]) {
+        let wanted = archive_dir.join("wanted.txt");
+        let mut wanted_content = String::new();
+        for file in wanted_files {
+            wanted_content.push_str(&format!("{}\n", file.display()));
+        }
+        fs::write(&wanted, wanted_content).expect("write wanted files list");
+
+        let archive_dir_s = format!("{}/", archive_dir.display());
+        let out_dir_s = format!("{}/", out_dir.display());
+        decompress::decompress_with_options(
+            &String::from("bucket_sizes.txt"),
+            &String::from("id_to_color_id.txt.zst"),
+            &String::from("tigs_kloe.fa"),
+            &String::from("positions_kloe.bin"),
+            &String::from("filenames_id.txt"),
+            &out_dir_s,
+            &wanted.display().to_string(),
+            archive_dir_s,
+            decompress::GgcatRebuildConfig {
+                enabled: false,
+                output_compression: decompress::OutputCompression::Fasta,
+                ..decompress::GgcatRebuildConfig::default()
+            },
+        )
+        .expect("decompress targeted archive");
+    }
+
+    #[test]
+    fn multi_file_full_and_targeted_preserve_kmer_content_all_modes() {
+        for mode in MODES {
+            let fixture = setup_multi_fixture(mode, multi_case_records());
+
+            run_full_decompression(&fixture.archive_dir, &fixture.full_out_dir);
+            assert_kmer_equivalent(&fixture.expected1, &fixture.dump1_full, K);
+            assert_kmer_equivalent(&fixture.expected2, &fixture.dump2_full, K);
+            assert_kmer_equivalent(&fixture.expected3, &fixture.dump3_full, K);
+
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &[fixture.file1.clone(), fixture.file3.clone()],
+            );
+            assert_kmer_equivalent(&fixture.expected1, &fixture.dump1_targeted, K);
+            assert_kmer_equivalent(&fixture.expected3, &fixture.dump3_targeted, K);
+            assert!(
+                !fixture.dump2_targeted.exists(),
+                "mode={mode}: targeted decompression should not create non-target files"
+            );
+        }
+    }
+
+    #[test]
+    fn simplitig_archive_preserves_full_and_targeted_dataset_kmers() {
+        let work = tempfile::tempdir().unwrap();
+        let archive = work.path().join("archive");
+        let full = work.path().join("full");
+        let targeted = work.path().join("targeted");
+        for path in [&archive, &full, &targeted] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let (first, second, third) = multi_case_expected();
+        let expected = [first, second, third];
+        let inputs: Vec<_> = expected
+            .iter()
+            .enumerate()
+            .map(|(dataset, sequences)| {
+                let file = work.path().join(format!("dataset{dataset}.fa"));
+                write_fasta(
+                    &file,
+                    &sequences.iter().map(String::as_str).collect::<Vec<_>>(),
+                );
+                file
+            })
+            .collect();
+        run_compression_with_simplitigs(&inputs, &archive, K, true).unwrap();
+        run_full_decompression(&archive, &full);
+        run_targeted_decompression(&archive, &targeted, &[inputs[1].clone()]);
+        for (dataset, input) in inputs.iter().enumerate() {
+            assert_kmer_equivalent(&expected[dataset], &make_dump_path(&full, input, dataset), K);
+        }
+        assert_kmer_equivalent(&expected[1], &make_dump_path(&targeted, &inputs[1], 1), K);
+        assert_eq!(count_dump_files(&targeted), 1);
+    }
+
+    #[test]
+    fn selected_color_union_and_intersection_emit_one_deduplicated_fasta() {
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let wanted = fixture.archive_dir.join("wanted_color_set.txt");
+        fs::write(
+            &wanted,
+            format!("{}\n{}\n", fixture.file1.display(), fixture.file2.display()),
+        )
+        .unwrap();
+
+        let run = |operation: decompress::ColorSetOperation, output: &Path| {
+            fs::create_dir_all(output).unwrap();
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(),
+                &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(),
+                &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(),
+                &(output.display().to_string() + "/"),
+                &wanted.display().to_string(),
+                fixture.archive_dir.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false,
+                    output_compression: decompress::OutputCompression::Fasta,
+                    color_set_operation: Some(operation),
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            )
+            .unwrap();
+        };
+
+        let union_out = fixture._workdir.path().join("out_union");
+        run(decompress::ColorSetOperation::Union, &union_out);
+        let mut union_expected = fixture.expected1.clone();
+        union_expected.extend(fixture.expected2.clone());
+        assert_kmer_equivalent(&union_expected, &union_out.join("Dump_union.fa"), K);
+
+        let intersection_out = fixture._workdir.path().join("out_intersection");
+        run(
+            decompress::ColorSetOperation::Intersection,
+            &intersection_out,
+        );
+        assert_kmer_equivalent(
+            &[SEQ_SHARED_12.to_string()],
+            &intersection_out.join("Dump_intersection.fa"),
+            K,
+        );
+    }
+
+    #[test]
+    fn abundance_threshold_requires_metadata_and_nonnegative_integer() {
+        use super::Args;
+        use clap::Parser;
+        assert!(Args::try_parse_from(["kloe", "decompress", "--abundance-threshold", "-1"]).is_err());
+        assert!(Args::try_parse_from(["kloe", "decompress", "--abundance-threshold", "1.5"]).is_err());
+        assert_eq!(Args::try_parse_from(["kloe", "decompress", "--abundance-threshold", "0"])
+            .unwrap().abundance_threshold, Some(0));
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let wanted = fixture.archive_dir.join("wanted_threshold.txt");
+        fs::write(&wanted, format!("{}\n", fixture.file1.display())).unwrap();
+        for operation in [None, Some(decompress::ColorSetOperation::Union)] {
+            let output = fixture._workdir.path().join(format!("no_metadata_{operation:?}"));
+            let result = decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(output.display().to_string() + "/"),
+                &wanted.display().to_string(), fixture.archive_dir.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false, abundance_threshold: Some(0),
+                    color_set_operation: operation,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains("abundance metadata"));
+        }
+    }
+
+    #[test]
+    fn selected_color_differences_match_kmer_set_algebra() {
+        use decompress::{ColorSetOperation as Op, OutputCompression};
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let _ggcat_guard = ggcat_test_lock();
+        let files = [&fixture.file1, &fixture.file2, &fixture.file3];
+        let sets = [&fixture.expected1, &fixture.expected2, &fixture.expected3]
+            .map(|seqs| kmer_set_from_seqs(seqs, K));
+        // Check operand order, duplicate operands, and more than two operands,
+        // both as stored tigs and after rebuilding the selected graph.
+        for (case, operands) in [vec![0, 1], vec![1, 0], vec![0, 0], vec![0, 1, 2]]
+            .into_iter().enumerate()
+        {
+            let wanted = fixture.archive_dir.join(format!("wanted_difference_{case}.txt"));
+            fs::write(&wanted, operands.iter()
+                .map(|&i| format!("{}\n\n", files[i].display())).collect::<String>()).unwrap();
+            for op in [Op::Difference, Op::SymmetricDifference] {
+                let mut expected = sets[operands[0]].clone();
+                for &i in &operands[1..] {
+                    expected = match op {
+                        Op::Difference => expected.difference(&sets[i]).cloned().collect(),
+                        Op::SymmetricDifference => expected.symmetric_difference(&sets[i]).cloned().collect(),
+                        _ => unreachable!(),
+                    };
+                }
+                for rebuilt in [false, true] {
+                    let output = fixture._workdir.path().join(format!("out_{op}_{case}_{rebuilt}"));
+                    fs::create_dir_all(&output).unwrap();
+                    decompress::decompress_with_options(
+                        &"bucket_sizes.txt".to_string(),
+                        &"id_to_color_id.txt.zst".to_string(),
+                        &"tigs_kloe.fa".to_string(),
+                        &"positions_kloe.bin".to_string(),
+                        &"filenames_id.txt".to_string(),
+                        &(output.display().to_string() + "/"),
+                        &wanted.display().to_string(),
+                        fixture.archive_dir.display().to_string() + "/",
+                        decompress::GgcatRebuildConfig {
+                            enabled: rebuilt, threads: 1, memory_gb: 1, k: K,
+                            temp_dir: output.join("tmp").display().to_string(),
+                            use_unitigs: true,
+                            output_compression: OutputCompression::Zstd,
+                            color_set_operation: Some(op),
+                            ..decompress::GgcatRebuildConfig::default()
+                        },
+                    ).unwrap();
+                    let suffix = if rebuilt { ".unitigs.fa.zst" } else { ".fa.zst" };
+                    let observed = parse_fasta_sequences(&output.join(format!("Dump_{op}{suffix}")));
+                    assert_eq!(kmer_set_from_seqs(&observed, K), expected,
+                        "operation={op}, operands={operands:?}, rebuilt={rebuilt}");
+                }
             }
         }
-        let mut bucket_sizes = String::new();
-        let curr_values = color_simplitig.get(&key).unwrap();
-        for e in curr_values.1.iter(){
-            bucket_sizes += &(e.to_string().to_owned()+",");
+    }
+
+    #[test]
+    fn decompression_unitig_mode_rebuilds_actual_unitigs() {
+        let fixture = setup_multi_fixture("simplitigs", multi_case_records());
+        let _ggcat_guard = ggcat_test_lock();
+        for (compression, label, suffix) in [
+            (decompress::OutputCompression::Zstd, "zstd", ".fa.zst"),
+            (decompress::OutputCompression::Xz, "xz", ".fa.xz"),
+        ] {
+            let output = fixture
+                ._workdir
+                .path()
+                .join(format!("out_rebuilt_unitigs_{label}"));
+            let temp = fixture
+                ._workdir
+                .path()
+                .join(format!("unitig_rebuild_tmp_{label}"));
+            fs::create_dir_all(&output).unwrap();
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(),
+                &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(),
+                &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(),
+                &(output.display().to_string() + "/"),
+                &String::new(),
+                fixture.archive_dir.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: true,
+                    threads: 1,
+                    memory_gb: 1,
+                    k: K,
+                    temp_dir: temp.display().to_string(),
+                    use_unitigs: true,
+                    output_compression: compression,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            )
+            .unwrap();
+
+            for (id, expected) in [&fixture.expected1, &fixture.expected2, &fixture.expected3]
+                .into_iter()
+                .enumerate()
+            {
+                let rebuilt =
+                    output.join(format!("Dump_{}_sample{}.unitigs{}", id, id + 1, suffix));
+                assert!(
+                    rebuilt.is_file(),
+                    "{label} dataset {id} unitig output was not created"
+                );
+                assert_kmer_equivalent(expected, &rebuilt, K);
+            }
+            assert_eq!(fs::read_dir(&output).unwrap().count(), 3);
         }
-        if nb_seen < NB_FILES{
-            bucket_sizes.pop();
-            let buf : String = String::from(color + "," + &(cursor_end.to_string()) + ":" + &bucket_sizes + "\n");
-            let _ = color_file.write_all(buf.as_bytes());
-            
-            //writeln!(file, "{},{}:{}", color, cursor_end, bucket_sizes).unwrap();
+    }
+
+    #[test]
+    fn reverse_complement_case_preserves_content_in_full_and_targeted_decompression() {
+        for mode in MODES {
+            let seq = "ACGTTAGCCATGATCGTACCGTTAGGCTAACCGTTAACGA".to_string();
+            let rc = reverse_complement(&seq);
+            assert_ne!(
+                seq, rc,
+                "test sequence should not be self reverse-complement"
+            );
+            let case_expected = vec![seq.clone(), rc.clone()];
+            let control_expected = vec!["GGTACCGATCGTACCGATCGTACCGATCGTACCGAT".to_string()];
+
+            let fixture = setup_two_file_case_fixture(
+                mode,
+                "reverse_complement.fa",
+                &case_expected,
+                "reverse_complement_control.fa",
+                &control_expected,
+            );
+
+            run_full_decompression(&fixture.archive_dir, &fixture.full_out_dir);
+            assert_kmer_equivalent(&case_expected, &fixture.case_dump_full, K);
+            assert_kmer_equivalent(&control_expected, &fixture.control_dump_full, K);
+
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &[fixture.case_file.clone()],
+            );
+            assert_kmer_equivalent(&case_expected, &fixture.case_dump_targeted, K);
+            assert!(
+                !fixture.control_dump_targeted.exists(),
+                "mode={mode}: targeted decompression should not create non-target files"
+            );
         }
-        nb_seen = 0;
     }
-    color_file.flush();
-    let _ = color_file.finish();
-}
 
+    #[test]
+    fn single_nucleotide_difference_case_preserves_content_in_full_and_targeted_decompression() {
+        for mode in MODES {
+            let seq1 = "TTGACCGTTAACCGGTTAACCGGTTAACCGGTTAACCGGT".to_string();
+            let mut seq2_bytes = seq1.as_bytes().to_vec();
+            let idx = 20;
+            seq2_bytes[idx] = if seq2_bytes[idx] == b'A' { b'C' } else { b'A' };
+            let seq2 = String::from_utf8(seq2_bytes).expect("build mutated sequence");
+            assert_eq!(
+                hamming_distance(&seq1, &seq2),
+                1,
+                "mutated sequence should differ by one nucleotide"
+            );
+            let case_expected = vec![seq1.clone(), seq2.clone()];
+            let control_expected = vec!["AACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTT".to_string()];
 
+            let fixture = setup_two_file_case_fixture(
+                mode,
+                "single_nt_diff.fa",
+                &case_expected,
+                "single_nt_diff_control.fa",
+                &control_expected,
+            );
 
+            run_full_decompression(&fixture.archive_dir, &fixture.full_out_dir);
+            assert_kmer_equivalent(&case_expected, &fixture.case_dump_full, K);
+            assert_kmer_equivalent(&control_expected, &fixture.control_dump_full, K);
 
-
-fn write_multicolored_simplitig(simplitig: &Vec<u8>, multi_f: &mut BufWriter<File>, color: &BitArray<[u8;ARRAY_SIZE]>, size_str : &usize){
-    let size:u32 = *size_str as u32;
-    let mut id = Vec::new();
-    let mut cpt = 0;
-    let mut curr_int: u8 = 0;
-    //let mut str_color = String::new();
-    for e in color.iter(){
-        if *e{
-            curr_int +=1 << cpt;
-            //str_color.push('1');
-        }/*else {
-            str_color.push('0');
-        }*/
-        cpt += 1;
-        if cpt == 8{
-            cpt = 0;
-            id.push(curr_int);
-            curr_int = 0;
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &[fixture.case_file.clone()],
+            );
+            assert_kmer_equivalent(&case_expected, &fixture.case_dump_targeted, K);
+            assert!(
+                !fixture.control_dump_targeted.exists(),
+                "mode={mode}: targeted decompression should not create non-target files"
+            );
         }
     }
-    //println!("");
-    //println!("str color: {}", str_color);
-    //println!("color size = {}", id.len());
-    //println!("simplitig size = {}", simplitig.len());
-    //println!("Simplitig after convert: {}", vec2str(&simplitig, size_str));
-    //println!("SIZE: {}", simplitig.len());
-    //println!("Color size {}", id.len());
-    //let mut input = String::new();
-    //io::stdin().read_line(&mut input).expect("error: unable to read user input");
-    multi_f.write_all(&id).expect("Unable to write color");
-    multi_f.write_all(&size.to_le_bytes()).expect("Unable to write simplitig size");  
-    multi_f.write_all(&simplitig).expect("Unable to write data");
-    
-}
 
-#[test]
-fn test_bitvec_eq_omni(){
-    let mut omni: BitArr!(for 8, in u8) = BitArray::<_>::ZERO;
-    for i in 0..8{
-        omni.set(i, true);
+    #[test]
+    fn mutation_plus_reverse_complement_case_preserves_content_in_full_and_targeted_decompression()
+    {
+        for mode in MODES {
+            let seq = "GCTAACCGTTAACCGGTTACCGATGCTAACCGTTAACCGG".to_string();
+            let perfect_rc = reverse_complement(&seq);
+            let mut mutated_rc_bytes = perfect_rc.as_bytes().to_vec();
+            let idx = 15;
+            mutated_rc_bytes[idx] = if mutated_rc_bytes[idx] == b'A' {
+                b'C'
+            } else {
+                b'A'
+            };
+            let mutated_rc =
+                String::from_utf8(mutated_rc_bytes).expect("build mutation+reverse-complement");
+
+            assert_eq!(
+                hamming_distance(&perfect_rc, &mutated_rc),
+                1,
+                "mutated reverse complement should differ by one nucleotide"
+            );
+
+            let case_expected = vec![seq.clone(), mutated_rc.clone()];
+            let control_expected = vec!["TTGCCATTGCCATTGCCATTGCCATTGCCATTGCCAT".to_string()];
+
+            let fixture = setup_two_file_case_fixture(
+                mode,
+                "mut_plus_rc.fa",
+                &case_expected,
+                "mut_plus_rc_control.fa",
+                &control_expected,
+            );
+
+            run_full_decompression(&fixture.archive_dir, &fixture.full_out_dir);
+            assert_kmer_equivalent(&case_expected, &fixture.case_dump_full, K);
+            assert_kmer_equivalent(&control_expected, &fixture.control_dump_full, K);
+
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &[fixture.case_file.clone()],
+            );
+            assert_kmer_equivalent(&case_expected, &fixture.case_dump_targeted, K);
+            assert!(
+                !fixture.control_dump_targeted.exists(),
+                "mode={mode}: targeted decompression should not create non-target files"
+            );
+        }
     }
-    assert_eq!(omni.all(), true);
-}
 
-#[test]
-fn test_bitvec_eq_non_omni(){
-    let mut omni: BitArr!(for 8, in u8) = BitArray::<_>::ZERO;
-    for i in 0..7{
-        omni.set(i, true);
+    #[test]
+    fn order_invariance_preserves_full_and_targeted_decompression_all_modes() {
+        for mode in MODES {
+            let baseline = setup_multi_fixture(mode, multi_case_records());
+            let permuted = setup_multi_fixture(mode, multi_case_records_permuted());
+
+            run_full_decompression(&baseline.archive_dir, &baseline.full_out_dir);
+            run_full_decompression(&permuted.archive_dir, &permuted.full_out_dir);
+
+            assert_kmer_maps_equal(
+                &baseline.dump1_full,
+                &permuted.dump1_full,
+                K,
+                &format!("mode={mode}: full decompression differs for sample1"),
+            );
+            assert_kmer_maps_equal(
+                &baseline.dump2_full,
+                &permuted.dump2_full,
+                K,
+                &format!("mode={mode}: full decompression differs for sample2"),
+            );
+            assert_kmer_maps_equal(
+                &baseline.dump3_full,
+                &permuted.dump3_full,
+                K,
+                &format!("mode={mode}: full decompression differs for sample3"),
+            );
+
+            run_targeted_decompression(
+                &baseline.archive_dir,
+                &baseline.targeted_out_dir,
+                &[baseline.file1.clone(), baseline.file3.clone()],
+            );
+            run_targeted_decompression(
+                &permuted.archive_dir,
+                &permuted.targeted_out_dir,
+                &[permuted.file1.clone(), permuted.file3.clone()],
+            );
+
+            assert_kmer_maps_equal(
+                &baseline.dump1_targeted,
+                &permuted.dump1_targeted,
+                K,
+                &format!("mode={mode}: targeted decompression differs for sample1"),
+            );
+            assert_kmer_maps_equal(
+                &baseline.dump3_targeted,
+                &permuted.dump3_targeted,
+                K,
+                &format!("mode={mode}: targeted decompression differs for sample3"),
+            );
+
+            assert!(
+                !baseline.dump2_targeted.exists(),
+                "mode={mode}: targeted baseline should not create non-target files"
+            );
+            assert!(
+                !permuted.dump2_targeted.exists(),
+                "mode={mode}: targeted permuted should not create non-target files"
+            );
+        }
     }
-    assert_eq!(omni.all(), false);
-}
 
-#[test]
-fn test_rev_comp_str(){
-    let kmer = String::from("AGCTTTTCATTCTGACTGCAACGGGCAATAT");
-    let revcomp = rev_comp_str(&kmer);
-    assert_eq!(revcomp, "ATATTGCCCGTTGCAGTCAGAATGAAAAGCT");
+    #[test]
+    fn large_100_files_len100_preserve_full_and_targeted_kmers_all_modes() {
+        for mode in MODES {
+            let fixture = setup_large_fixture(mode, 100);
+
+            run_full_decompression(&fixture.archive_dir, &fixture.full_out_dir);
+            assert_eq!(
+                count_dump_files(&fixture.full_out_dir),
+                100,
+                "mode={mode}: full decompression should emit one file per input"
+            );
+            for i in 0..fixture.expected_seqs.len() {
+                let expected = vec![fixture.expected_seqs[i].clone()];
+                assert_kmer_equivalent(&expected, &fixture.dump_full[i], K);
+            }
+
+            let wanted_files: Vec<PathBuf> = fixture
+                .targeted_indices
+                .iter()
+                .map(|&i| fixture.source_files[i].clone())
+                .collect();
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &wanted_files,
+            );
+            assert_eq!(
+                count_dump_files(&fixture.targeted_out_dir),
+                fixture.targeted_indices.len(),
+                "mode={mode}: targeted decompression should only emit requested files"
+            );
+            for &i in &fixture.targeted_indices {
+                let expected = vec![fixture.expected_seqs[i].clone()];
+                assert_kmer_equivalent(&expected, &fixture.dump_targeted[i], K);
+            }
+            assert!(
+                !fixture.dump_targeted[2].exists(),
+                "mode={mode}: non-target file should not be emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn various_k_below_31_preserved_in_full_and_targeted_all_modes() {
+        let ks = [3_usize, 5, 7, 11, 17, 23, 29, 30];
+
+        for mode in MODES {
+            let fixture = setup_multi_fixture(mode, multi_case_records());
+            run_full_decompression(&fixture.archive_dir, &fixture.full_out_dir);
+            run_targeted_decompression(
+                &fixture.archive_dir,
+                &fixture.targeted_out_dir,
+                &[fixture.file1.clone(), fixture.file3.clone()],
+            );
+
+            for k in ks {
+                assert_kmer_equivalent(&fixture.expected1, &fixture.dump1_full, k);
+                assert_kmer_equivalent(&fixture.expected2, &fixture.dump2_full, k);
+                assert_kmer_equivalent(&fixture.expected3, &fixture.dump3_full, k);
+                assert_kmer_equivalent(&fixture.expected1, &fixture.dump1_targeted, k);
+                assert_kmer_equivalent(&fixture.expected3, &fixture.dump3_targeted, k);
+            }
+
+            assert!(
+                !fixture.dump2_targeted.exists(),
+                "mode={mode}: targeted decompression should not create non-target files"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_abundance_archive_restores_targeted_headers_without_cid_sidecar() {
+        check_abundance_archive_roundtrip(8, 1.05);
+    }
+
+    #[test]
+    fn abundance_precision_modes_roundtrip() {
+        for bits in [2, 4, 5, 6, 7, 8, 16, 32] {
+            check_abundance_archive_roundtrip(bits, compress::default_abundance_log_base(bits));
+        }
+    }
+
+    #[test]
+    fn exact_abundance_archive_roundtrip() {
+        check_abundance_archive_roundtrip(8, crate::abundance::EXACT_BASE);
+    }
+
+    #[test]
+    fn u16_abundance_archive_roundtrip() {
+        for simplitig in [false, true] {
+            check_abundance_archive_roundtrip_mode(16, crate::abundance::EXACT_BASE, simplitig);
+        }
+    }
+
+    #[test]
+    fn u16_abundance_cli_rejects_conflicting_encodings() {
+        use clap::Parser;
+        assert!(super::Args::try_parse_from(["kloe", "compress", "--abundance-u16"]).unwrap().abundance_u16);
+        for extra in [vec!["--abundance-exact"], vec!["--abundance-bits", "16"], vec!["--abundance-max", "500"]] {
+            let mut args = vec!["kloe", "compress", "--abundance-u16"];
+            args.extend(extra);
+            assert!(super::Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_abundance_cli_rejects_quantization_options() {
+        use clap::Parser;
+        assert!(
+            super::Args::try_parse_from(["kloe", "compress", "--abundance-exact"])
+                .unwrap()
+                .abundance_exact
+        );
+        for option in [["--abundance-bits", "8"], ["--abundance-max", "500"]] {
+            assert!(super::Args::try_parse_from([
+                "kloe",
+                "compress",
+                "--abundance-exact",
+                option[0],
+                option[1]
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn exact_abundance_many_values_and_merge_preserve_targeted_kmers() {
+        check_many_abundances_and_merge(false, false, None);
+    }
+
+    #[test]
+    fn simplitig_exact_abundance_and_merge_preserve_targeted_kmers() {
+        check_many_abundances_and_merge(true, false, None);
+    }
+
+    #[test]
+    fn u16_abundance_merge_preserves_targeted_kmers() {
+        check_many_abundances_and_merge(false, true, None);
+    }
+
+    #[test]
+    fn dense_quantized_abundance_merge_preserves_decoded_values() {
+        for bits in [8, 14] {
+            check_many_abundances_and_merge(false, false, Some(bits));
+        }
+    }
+
+    fn check_many_abundances_and_merge(use_simplitigs: bool, u16_mode: bool, log_bits: Option<u8>) {
+        use std::collections::BTreeMap;
+        let _ggcat_guard = ggcat_test_lock();
+        let work = tempfile::tempdir().unwrap();
+        let first = work.path().join("first.fa");
+        let second = work.path().join("second.fa");
+        let mut expected = [BTreeMap::new(), BTreeMap::new()];
+        let mut inputs = [String::new(), String::new()];
+        for index in 0..300usize {
+            let middle: String = (0..5)
+                .map(|shift| b"ACGT"[(index >> (2 * shift)) & 3] as char)
+                .collect();
+            let sequence = format!("AAA{middle}CCCCCCC");
+            for dataset in 0..2 {
+                if dataset == 1 && index >= 100 {
+                    continue;
+                }
+                let value = if dataset == 0 {
+                    index as u64 + 1
+                } else if log_bits.is_some() {
+                    50_000 - index as u64
+                } else if u16_mode {
+                    u16::MAX as u64 - index as u64
+                } else {
+                    u64::MAX - index as u64
+                };
+                inputs[dataset].push_str(&format!(">r{index} ka:f:{value}\n{sequence}\n"));
+                let decoded = log_bits.map_or(value, |bits| {
+                    let base = compress::default_abundance_log_base(bits);
+                    compress::decode_abundance(compress::encode_abundance_with_bits(value, base, bits), base)
+                });
+                expected[dataset].insert(canonical_kmer(&sequence), decoded);
+            }
+        }
+        fs::write(&first, &inputs[0]).unwrap();
+        fs::write(&second, &inputs[1]).unwrap();
+        let build = |name: &str, files: &[&Path]| {
+            let archive = work.path().join(name);
+            fs::create_dir_all(&archive).unwrap();
+            let fof = work.path().join(format!("{name}.fof"));
+            fs::write(
+                &fof,
+                files
+                    .iter()
+                    .map(|file| format!("{}\n", file.display()))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            compress::compress_with_ggcat(
+                &(archive.display().to_string() + "/"),
+                &fof.display().to_string(),
+                1,
+                15,
+                5,
+                10,
+                false,
+                false,
+                false,
+                false,
+                false,
+                compress::GgcatCompressionConfig {
+                    memory_gb: 1,
+                    temp_dir: work.path().join("tmp").display().to_string(),
+                    abundance_exact: !u16_mode && log_bits.is_none(),
+                    abundance_u16: u16_mode,
+                    abundance_bits: log_bits.unwrap_or(8),
+                    abundance_max: log_bits.map(|_| 50_000),
+                    use_simplitigs,
+                    ..compress::GgcatCompressionConfig::default()
+                },
+            )
+            .unwrap();
+            archive
+        };
+        let direct = build("direct", &[&first, &second]);
+        let a = build("a", &[&first]);
+        let b = build("b", &[&second]);
+        let merged = work.path().join("merged");
+        merge::merge_archives_with_config(
+            &a.display().to_string(),
+            &b.display().to_string(),
+            &merged.display().to_string(),
+            15,
+            1,
+            merge::MergeConfig {
+                minimizer_size: 5,
+                temp_dir: work.path().join("tmp").display().to_string(),
+                use_simplitigs,
+                ..merge::MergeConfig::default()
+            },
+        )
+        .unwrap();
+        for (archive_index, archive) in [direct, merged].iter().enumerate() {
+            for (dataset, source) in [&first, &second].iter().enumerate() {
+                let output = work.path().join(format!("out_{archive_index}_{dataset}"));
+                fs::create_dir_all(&output).unwrap();
+                let wanted = work.path().join("wanted.txt");
+                fs::write(&wanted, format!("{}\n", source.display())).unwrap();
+                decompress::decompress_with_options(
+                    &"bucket_sizes.txt".to_string(),
+                    &"id_to_color_id.txt.zst".to_string(),
+                    &"tigs_kloe.fa".to_string(),
+                    &"positions_kloe.bin".to_string(),
+                    &"filenames_id.txt".to_string(),
+                    &(output.display().to_string() + "/"),
+                    &wanted.display().to_string(),
+                    archive.display().to_string() + "/",
+                    decompress::GgcatRebuildConfig {
+                        enabled: false,
+                        restore_abundance: true,
+                        output_compression: decompress::OutputCompression::Fasta,
+                        ..decompress::GgcatRebuildConfig::default()
+                    },
+                )
+                .unwrap();
+                let text = fs::read_to_string(make_dump_path(&output, source, dataset)).unwrap();
+                let mut actual = BTreeMap::new();
+                let mut value = None;
+                for line in text.lines() {
+                    if line.starts_with('>') {
+                        value = Some(crate::abundance::parse_header(line.as_bytes()).unwrap());
+                    } else {
+                        for kmer in line.as_bytes().windows(15) {
+                            actual.insert(
+                                canonical_kmer(std::str::from_utf8(kmer).unwrap()),
+                                value.unwrap(),
+                            );
+                        }
+                    }
+                }
+                assert_eq!(actual, expected[dataset]);
+                assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_abundance_roundtrips_exact_logarithmic_and_capped_values() {
+        let _ggcat_guard = ggcat_test_lock();
+        let work = tempfile::tempdir().unwrap();
+        for (bits, maximum) in [(8, 50_000u64), (10, 50_000), (12, 50_000), (14, 50_000), (4, 500), (8, 255), (8, 256),
+                                (9, 500), (16, 50_000), (32, 1_000_000), (2, 3)] {
+            let dir = work.path().join(format!("{bits}-{maximum}"));
+            let archive = dir.join("archive");
+            fs::create_dir_all(&archive).unwrap();
+            let first = dir.join("first.fa");
+            let second = dir.join("second.fa");
+            let value = (maximum / 3).max(1);
+            fs::write(&first, format!(">a ka:f:{value}.25\nACGTACGTACGTACGT\n")).unwrap();
+            fs::write(&second, format!(">b ka:f:{}\nACGTACGTACGTACGT\n", maximum + 100)).unwrap();
+            let fof = dir.join("input.fof");
+            fs::write(&fof, format!("{}\n{}\n", first.display(), second.display())).unwrap();
+            compress::compress_with_ggcat(
+                &(archive.display().to_string() + "/"), &fof.display().to_string(),
+                1, 7, 5, 10, false, false, false, false, false,
+                compress::GgcatCompressionConfig {
+                    memory_gb: 1, temp_dir: work.path().join("tmp").display().to_string(),
+                    abundance_bits: bits, abundance_max: Some(maximum),
+                    ..compress::GgcatCompressionConfig::default()
+                },
+            ).unwrap();
+            let output = dir.join("out");
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(output.display().to_string() + "/"),
+                &String::new(), archive.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false, restore_abundance: true,
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            ).unwrap();
+            let encoding = crate::abundance::Encoding::automatic(bits, maximum).unwrap();
+            let expected_first = if encoding.base == crate::abundance::EXACT_BASE { value }
+                else { compress::decode_abundance(compress::encode_abundance_with_bits(value, encoding.base, bits), encoding.base) };
+            for (dataset, (source, expected)) in [(&first, expected_first), (&second, maximum)].into_iter().enumerate() {
+                let dump = make_dump_path(&output, source, dataset);
+                assert_kmer_equivalent(&["ACGTACGTACGTACGT".to_string()], &dump, 7);
+                for header in fs::read_to_string(dump).unwrap().lines().filter(|line| line.starts_with('>')) {
+                    assert_eq!(crate::abundance::parse_header(header.as_bytes()).unwrap(), expected,
+                        "bits={bits}, maximum={maximum}, source={source:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abundance_precision_cli_accepts_only_supported_bits() {
+        use clap::Parser;
+        let defaults = super::Args::try_parse_from(["kloe", "compress", "--abundance"]).unwrap();
+        assert_eq!(defaults.abundance_bits, 8);
+        assert_eq!(defaults.abundance_max, 50_000);
+        assert!(super::Args::try_parse_from(["kloe", "compress", "--abundance", "--abundance-max", "0"]).is_err());
+        assert!(super::Args::try_parse_from(["kloe", "compress", "--abundance-bits", "16"]).is_err());
+        for bits in [2, 4, 5, 6, 7, 8, 16, 32] {
+            let args = super::Args::try_parse_from([
+                "kloe",
+                "compress",
+                "--abundance",
+                "--abundance-bits",
+                &bits.to_string(),
+                "--abundance-max",
+                "500",
+            ])
+            .unwrap();
+            assert_eq!(args.abundance_bits, bits);
+            assert_eq!(args.abundance_max, 500);
+        }
+        for bits in ["0", "1", "33", "255"] {
+            assert!(super::Args::try_parse_from([
+                "kloe",
+                "compress",
+                "--abundance",
+                "--abundance-bits",
+                bits,
+            ])
+            .is_err());
+        }
+    }
+
+    mod logan_streaming_tests {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::thread;
+        use std::time::Duration;
+
+        struct Server {
+            url: String,
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<thread::JoinHandle<()>>,
+        }
+
+        impl Server {
+            fn new(payloads: Vec<(&str, &str)>, failed_get: usize, truncated_get: usize) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                listener.set_nonblocking(true).unwrap();
+                let payloads: BTreeMap<_, _> = payloads.into_iter().map(|(name, fasta)| {
+                    // Logan/f2sz streams can consist of concatenated Zstandard frames.
+                    let split = fasta.len() / 2;
+                    let mut compressed = zstd::stream::encode_all(&fasta.as_bytes()[..split], 1).unwrap();
+                    compressed.extend(zstd::stream::encode_all(&fasta.as_bytes()[split..], 1).unwrap());
+                    (format!("/u/{name}/{name}.unitigs.fa.zst"), compressed)
+                }).collect();
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let seen = Arc::clone(&requests);
+                let stopping = Arc::clone(&stop);
+                let handle = thread::spawn(move || {
+                    let mut gets = 0;
+                    while !stopping.load(Ordering::Relaxed) {
+                        let (mut socket, _) = match listener.accept() {
+                            Ok(connection) => connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5)); continue;
+                            }
+                            Err(error) => panic!("{error}"),
+                        };
+                        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut reader = BufReader::new(socket.try_clone().unwrap());
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let parts: Vec<_> = line.split_whitespace().collect();
+                        if parts.len() < 2 { continue; }
+                        let (method, path) = (parts[0].to_owned(), parts[1].to_owned());
+                        seen.lock().unwrap().push((method.clone(), path.clone()));
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                        }
+                        if method == "GET" { gets += 1; }
+                        let body = payloads.get(&path);
+                        let missing = body.is_none() || (method == "GET" && gets == failed_get);
+                        let body = body.map(Vec::as_slice).unwrap_or(b"missing");
+                        let status = if missing { "404 Not Found" } else { "200 OK" };
+                        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        if method != "HEAD" {
+                            let body = if gets == truncated_get {
+                                let second = body.windows(4).enumerate().skip(1)
+                                    .find_map(|(i, magic)| (magic == [0x28, 0xb5, 0x2f, 0xfd]).then_some(i)).unwrap_or(0);
+                                &body[..second + (body.len() - second)/2]
+                            } else { body };
+                            let _ = socket.write_all(body);
+                        }
+                    }
+                });
+                Self { url, requests, stop, thread: Some(handle) }
+            }
+        }
+
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+
+        fn compress_logan(work: &Path, server: &Server, bits: Option<u8>) -> std::io::Result<()> {
+            compress_logan_options(work, server, bits, true, None, 1, "SRR1\nERR2\n")
+        }
+
+        #[test]
+        fn logan_report_failure_never_publishes_a_complete_archive() {
+            let _guard = ggcat_test_lock();
+            let work = tempfile::tempdir().unwrap();
+            fs::create_dir_all(work.path().join("archive/logan-skipped.tsv")).unwrap();
+            let server = Server::new(vec![
+                ("SRR1", ">a\nACGTACGTACGTACGT\n"),
+                ("ERR2", ">b\nTGCATGCATGCATGCA\n"),
+            ], 0, 0);
+            assert!(compress_logan(work.path(), &server, None).is_err());
+            assert!(work.path().join("archive/filenames.idx").is_file());
+            assert!(!work.path().join("archive/manifest.kloe").exists());
+        }
+
+        fn compress_logan_options(
+            work: &Path,
+            server: &Server,
+            bits: Option<u8>,
+            strict: bool,
+            threshold: Option<u64>,
+            downloads: usize,
+            names: &str,
+        ) -> std::io::Result<()> {
+            let archive = work.join("archive");
+            fs::create_dir_all(&archive).unwrap();
+            let accessions = work.join("accessions.txt");
+            fs::write(&accessions, names).unwrap();
+            compress::compress_with_ggcat(
+                &(archive.display().to_string() + "/"),
+                &accessions.display().to_string(),
+                2,
+                7,
+                5,
+                10,
+                false,
+                false,
+                true,
+                false,
+                false,
+                compress::GgcatCompressionConfig {
+                    memory_gb: 1,
+                    temp_dir: work.join("tmp").display().to_string(),
+                    abundance_bits: bits.unwrap_or(8),
+                    abundance_max: bits.map(|_| 50_000),
+                    logan: Some(
+                        crate::logan::LoganConfig::new(&server.url, downloads)
+                            .unwrap()
+                            .with_policy(strict, 0),
+                    ),
+                    abundance_threshold: threshold,
+                    ..compress::GgcatCompressionConfig::default()
+                },
+            )
+        }
+
+        #[test]
+        fn logan_streaming_roundtrips_and_downloads_once_or_twice() {
+            let _guard = ggcat_test_lock();
+            let fasta_a = ">a ka:f:17.25\nacgtACGT\nACGTACGT\n";
+            let fasta_b = ">b km:f:50100\nTGCATGCATGCATGCA\n";
+            for bits in [None, Some(4), Some(8), Some(16)] {
+                let server = Server::new(vec![("SRR1", fasta_a), ("ERR2", fasta_b)], 0, 0);
+                let work = tempfile::tempdir().unwrap();
+                compress_logan(work.path(), &server, bits).unwrap();
+                let output = work.path().join("out");
+                decompress::decompress_with_options(
+                    &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                    &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                    &"filenames_id.txt".to_string(), &(output.display().to_string() + "/"),
+                    &String::new(), work.path().join("archive").display().to_string() + "/",
+                    decompress::GgcatRebuildConfig {
+                        enabled: false, restore_abundance: bits.is_some(),
+                        output_compression: decompress::OutputCompression::Fasta,
+                        ..decompress::GgcatRebuildConfig::default()
+                    },
+                ).unwrap();
+                for (dataset, (accession, seq, value)) in [("SRR1", "ACGTACGTACGTACGT", 17), ("ERR2", "TGCATGCATGCATGCA", 50_000)].into_iter().enumerate() {
+                    let dump = make_dump_path(&output, Path::new(accession), dataset);
+                    assert_kmer_equivalent(&[seq.to_owned()], &dump, 7);
+                    if let Some(bits) = bits {
+                        let encoding = crate::abundance::Encoding::automatic(bits, 50_000).unwrap();
+                        let expected = if encoding.base == crate::abundance::EXACT_BASE { value }
+                            else { compress::decode_abundance(compress::encode_abundance_with_bits(value, encoding.base, bits), encoding.base) };
+                        for header in fs::read_to_string(&dump).unwrap().lines().filter(|line| line.starts_with('>')) {
+                            assert_eq!(crate::abundance::parse_header(header.as_bytes()).unwrap(), expected);
+                        }
+                    }
+                    let path = format!("/u/{accession}/{accession}.unitigs.fa.zst");
+                    assert_eq!(server.requests.lock().unwrap().iter().filter(|(method, p)| method == "GET" && p == &path).count(), if bits.is_some() { 2 } else { 1 });
+                }
+                assert!(!work.path().join("SRR1.unitigs.fa.zst").exists());
+                assert!(!work.path().join("ERR2.unitigs.fa").exists());
+            }
+        }
+
+        #[test]
+        fn logan_failed_graph_download_never_creates_a_complete_archive() {
+            let _guard = ggcat_test_lock();
+            for (bits, failed_get, truncated_get) in [(None, 1, 0), (Some(8), 3, 0), (Some(16), 0, 3)] {
+                let server = Server::new(vec![("SRR1", ">a ka:f:10\nACGTACGTACGTACGT\n"), ("ERR2", ">b ka:f:20\nTGCATGCATGCATGCA\n")], failed_get, truncated_get);
+                let work = tempfile::tempdir().unwrap();
+                let error = compress_logan(work.path(), &server, bits).unwrap_err();
+                assert!(error.to_string().contains("Logan download failed"), "{error}");
+                assert!(!work.path().join("archive/manifest.kloe").exists());
+            }
+        }
+
+        #[test]
+        fn logan_cli_requires_an_accession_list_and_rejects_local_input_mix() {
+            use clap::Parser;
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt"]).is_ok());
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt", "-i", "local.fof"]).is_err());
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-downloads", "2"]).is_err());
+            assert!(super::super::Args::try_parse_from(["kloe", "compress", "--logan-accessions", "accessions.txt", "--logan-downloads", "0"]).is_err());
+        }
+
+        fn restore(work: &Path, abundance: bool) -> PathBuf {
+            let output = work.join("restored");
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(),
+                &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(),
+                &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(),
+                &(output.display().to_string() + "/"),
+                &String::new(),
+                work.join("archive").display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false,
+                    restore_abundance: abundance,
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            )
+            .unwrap();
+            output
+        }
+
+        #[test]
+        fn logan_tolerant_mode_excludes_failed_and_partial_datasets_completely() {
+            let _guard = ggcat_test_lock();
+            let bad = ">a ka:f:7\nAAAAAAAAACGTACGTACGT\n>b ka:f:7\nCCCCCCCCCTTTTTTTTTT\n>c ka:f:7\nGGGGGGGGGAAAAAAAAA\n";
+            let good = ">a ka:f:17\nACGTACGTACGTACGTTGCATGCATGCATGCA\n";
+            for bits in [None, Some(8), Some(16)] {
+                for partial in [false, true] {
+                    let get = if bits.is_some() { 4 } else { 1 };
+                    let server = Server::new(
+                        vec![("SRR1", bad), ("ERR2", good)],
+                        if partial { 0 } else { get },
+                        if partial { get } else { 0 },
+                    );
+                    let work = tempfile::tempdir().unwrap();
+                    compress_logan_options(
+                        work.path(),
+                        &server,
+                        bits,
+                        false,
+                        None,
+                        1,
+                        "invalid-run\nSRR999\nSRR1\nERR2\nERR2\n",
+                    )
+                    .unwrap();
+                    let names =
+                        fs::read_to_string(work.path().join("archive/filenames_id.txt")).unwrap();
+                    assert_eq!(names.lines().count(), 1);
+                    assert!(names.starts_with("ERR2:"), "{names}");
+                    let report =
+                        fs::read_to_string(work.path().join("archive/logan-skipped.tsv")).unwrap();
+                    for excluded in ["invalid-run", "SRR999", "SRR1"] {
+                        assert!(report.contains(excluded), "{report}");
+                    }
+                    assert!(!report.contains("ERR2"));
+                    let output = restore(work.path(), bits.is_some());
+                    let dump = make_dump_path(&output, Path::new("ERR2"), 0);
+                    assert_kmer_equivalent(
+                        &["ACGTACGTACGTACGTTGCATGCATGCATGCA".to_owned()],
+                        &dump,
+                        7,
+                    );
+                    assert!(!make_dump_path(&output, Path::new("SRR1"), 0).exists());
+                }
+            }
+        }
+
+        #[test]
+        fn logan_all_failed_never_creates_a_complete_archive() {
+            let _guard = ggcat_test_lock();
+            for bits in [None, Some(8)] {
+                let server = Server::new(vec![], 0, 0);
+                let work = tempfile::tempdir().unwrap();
+                assert!(compress_logan_options(
+                    work.path(),
+                    &server,
+                    bits,
+                    false,
+                    None,
+                    2,
+                    "bad\nSRR999\nERR999\n"
+                )
+                .is_err());
+                assert!(!work.path().join("archive/manifest.kloe").exists());
+                let report =
+                    fs::read_to_string(work.path().join("archive/logan-skipped.tsv")).unwrap();
+                assert!(
+                    report.contains("SRR999")
+                        && report.contains("ERR999")
+                        && report.contains("bad")
+                );
+            }
+        }
+
+        #[test]
+        fn compression_filter_local_and_logan_works_with_or_without_stored_abundance() {
+            let _guard = ggcat_test_lock();
+            let input = ">low ka:f:9.99\nAAAAAAAAACCCCCCCCCC\n>equal ka:f:10\nGGGGGGGGGAAAAAAAAA\n>keep ka:f:10.01\nACGTACGTACGTACGT\n>high ka:f:50100\nTGCATGCATGCATGCA\n";
+            for remote in [false, true] {
+                for bits in [None, Some(4), Some(8), Some(16)] {
+                    let work = tempfile::tempdir().unwrap();
+                    if remote {
+                        let server = Server::new(vec![("SRR1", input)], 0, 0);
+                        compress_logan_options(
+                            work.path(),
+                            &server,
+                            bits,
+                            false,
+                            Some(10),
+                            2,
+                            "SRR1\n",
+                        )
+                        .unwrap();
+                    } else {
+                        let file = work.path().join("input.fa");
+                        fs::write(&file, input).unwrap();
+                        let fof = work.path().join("input.fof");
+                        fs::write(&fof, format!("{}\n", file.display())).unwrap();
+                        fs::create_dir_all(work.path().join("archive")).unwrap();
+                        compress::compress_with_ggcat(
+                            &(work.path().join("archive").display().to_string() + "/"),
+                            &fof.display().to_string(),
+                            2,
+                            7,
+                            5,
+                            10,
+                            false,
+                            false,
+                            true,
+                            false,
+                            false,
+                            compress::GgcatCompressionConfig {
+                                memory_gb: 1,
+                                temp_dir: work.path().join("tmp").display().to_string(),
+                                abundance_bits: bits.unwrap_or(8),
+                                abundance_max: bits.map(|_| 50_000),
+                                abundance_threshold: Some(10),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let output = restore(work.path(), bits.is_some());
+                    let name = if remote {
+                        PathBuf::from("SRR1")
+                    } else {
+                        work.path().join("input.fa")
+                    };
+                    let dump = make_dump_path(&output, &name, 0);
+                    assert_kmer_equivalent(
+                        &["ACGTACGTACGTACGT".to_owned(), "TGCATGCATGCATGCA".to_owned()],
+                        &dump,
+                        7,
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn cli_minimizer_default_is_twelve_and_compression_filter_is_independent() {
+            use clap::Parser;
+            let args = super::super::Args::try_parse_from([
+                "kloe",
+                "compress",
+                "--abundance-threshold",
+                "10",
+            ])
+            .unwrap();
+            assert_eq!(args.minimizer_size, 12);
+            assert_eq!(args.abundance_threshold, Some(10));
+            assert!(!args.abundance);
+            assert!(!args.logan_strict);
+            assert_eq!(args.logan_retries, 2);
+            assert!(
+                super::super::Args::try_parse_from(["kloe", "compress", "--logan-strict"]).is_err()
+            );
+        }
+
+        #[test]
+        fn compression_filter_can_produce_a_valid_empty_archive() {
+            let _guard = ggcat_test_lock();
+            for remote in [false, true] {
+                for bits in [None, Some(8)] {
+                    let work = tempfile::tempdir().unwrap();
+                    let input = ">a ka:f:10\nACGTACGTACGTACGT\n";
+                    if remote {
+                        let server = Server::new(vec![("SRR1", input)], 0, 0);
+                        compress_logan_options(
+                            work.path(),
+                            &server,
+                            bits,
+                            false,
+                            Some(10),
+                            2,
+                            "SRR1\n",
+                        )
+                        .unwrap();
+                    } else {
+                        let input_file = work.path().join("input.fa");
+                        fs::write(&input_file, input).unwrap();
+                        let fof = work.path().join("input.fof");
+                        fs::write(&fof, format!("{}\n", input_file.display())).unwrap();
+                        fs::create_dir_all(work.path().join("archive")).unwrap();
+                        compress::compress_with_ggcat(
+                            &(work.path().join("archive").display().to_string() + "/"),
+                            &fof.display().to_string(),
+                            2,
+                            7,
+                            5,
+                            10,
+                            false,
+                            false,
+                            true,
+                            false,
+                            false,
+                            compress::GgcatCompressionConfig {
+                                memory_gb: 1,
+                                temp_dir: work.path().join("tmp").display().to_string(),
+                                abundance_bits: bits.unwrap_or(8),
+                                abundance_max: bits.map(|_| 50_000),
+                                abundance_threshold: Some(10),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let manifest = fs::read(work.path().join("archive/manifest.kloe")).unwrap();
+                    assert_eq!(u64::from_le_bytes(manifest[16..24].try_into().unwrap()), 1);
+                    assert_eq!(u64::from_le_bytes(manifest[24..32].try_into().unwrap()), 0);
+                    assert_eq!(
+                        fs::read_to_string(work.path().join("archive/filenames_id.txt"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        1
+                    );
+                    restore(work.path(), bits.is_some());
+                }
+            }
+        }
+    }
+
+    fn check_abundance_archive_roundtrip(bits: u8, base: f64) {
+        check_abundance_archive_roundtrip_mode(bits, base, false);
+    }
+
+    #[test]
+    fn simplitig_quantized_abundance_roundtrip() {
+        for bits in [2, 4, 5, 6, 7, 8, 16, 32] {
+            check_abundance_archive_roundtrip_mode(
+                bits,
+                compress::default_abundance_log_base(bits),
+                true,
+            );
+        }
+    }
+
+    fn check_abundance_archive_roundtrip_mode(bits: u8, base: f64, use_simplitigs: bool) {
+        let exact = base == crate::abundance::EXACT_BASE;
+        let u16_mode = exact && bits == 16;
+        let _ggcat_guard = ggcat_test_lock();
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive = workdir.path().join("archive");
+        let output = workdir.path().join("output");
+        fs::create_dir_all(&archive).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let first = workdir.path().join("abundance_a.fa");
+        let second = workdir.path().join("abundance_b.fa");
+        let first_value = if u16_mode { 6143 } else if exact { 9_007_199_254_740_993u64 } else { 17 };
+        let second_value = if u16_mode { u16::MAX as u64 } else if exact { u64::MAX } else { 50_000 };
+        let first_header = if u16_mode { "6142.75".to_string() } else { first_value.to_string() };
+        fs::write(&first, format!(">a ka:f:{first_header}\nACGTACGTACGTACGT\n")).unwrap();
+        fs::write(
+            &second,
+            format!(">b ka:f:{second_value}\nACGTACGTACGTACGT\n"),
+        )
+        .unwrap();
+        let fof = workdir.path().join("input.fof");
+        fs::write(&fof, format!("{}\n{}\n", first.display(), second.display())).unwrap();
+        compress::compress_with_ggcat(
+            &(archive.display().to_string() + "/"),
+            &fof.display().to_string(),
+            1,
+            7,
+            5,
+            10,
+            false,
+            false,
+            false,
+            false,
+            false,
+            compress::GgcatCompressionConfig {
+                memory_gb: 1,
+                temp_dir: workdir.path().join("tmp").display().to_string(),
+                abundance_log_base: (!exact).then_some(base),
+                abundance_bits: bits,
+                abundance_max: None,
+                abundance_exact: exact && !u16_mode,
+                abundance_u16: u16_mode,
+                use_simplitigs,
+                logan: None,
+                abundance_threshold: None,
+            },
+        )
+        .unwrap();
+        assert!(!archive.join(compress::CID_TO_DATASET_FILE).exists());
+
+        let wanted = workdir.path().join("wanted.txt");
+        fs::write(
+            &wanted,
+            format!("{}\n{}\n", first.display(), second.display()),
+        )
+        .unwrap();
+        decompress::decompress_with_options(
+            &"bucket_sizes.txt".to_string(),
+            &"id_to_color_id.txt.zst".to_string(),
+            &"tigs_kloe.fa".to_string(),
+            &"positions_kloe.bin".to_string(),
+            &"filenames_id.txt".to_string(),
+            &(output.display().to_string() + "/"),
+            &wanted.display().to_string(),
+            archive.display().to_string() + "/",
+            decompress::GgcatRebuildConfig {
+                enabled: false,
+                restore_abundance: true,
+                output_compression: decompress::OutputCompression::Fasta,
+                ..decompress::GgcatRebuildConfig::default()
+            },
+        )
+        .unwrap();
+        let first_dump = fs::read_to_string(make_dump_path(&output, &first, 0)).unwrap();
+        let second_dump = fs::read_to_string(make_dump_path(&output, &second, 1)).unwrap();
+        let restored_17 = if exact {
+            first_value
+        } else {
+            compress::decode_abundance(
+                compress::encode_abundance_with_bits(first_value, base, bits),
+                base,
+            )
+        };
+        let restored_max = if exact {
+            second_value
+        } else {
+            compress::decode_abundance(
+                compress::encode_abundance_with_bits(second_value, base, bits),
+                base,
+            )
+        };
+        assert!(
+            first_dump.contains(&format!("ka:f:{restored_17}")),
+            "{first_dump}"
+        );
+        assert!(
+            second_dump.contains(&format!("ka:f:{restored_max}")),
+            "{second_dump}"
+        );
+        // Both colors share their k-mers but have different abundances. Filtering
+        // must restore each residual with its CID base before comparing values.
+        for (case, (targeted, headers, rebuilt, threshold)) in [
+            (true, true, false, restored_17),
+            (false, false, false, restored_17),
+            (true, false, true, restored_17),
+            (true, false, false, restored_max),
+        ].into_iter().enumerate() {
+            let filtered = workdir.path().join(format!("filtered_{case}"));
+            let wanted_path = if targeted { wanted.display().to_string() } else { String::new() };
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(filtered.display().to_string() + "/"),
+                &wanted_path, archive.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: rebuilt, threads: 1, memory_gb: 1, k: 7,
+                    temp_dir: workdir.path().join("filter_tmp").display().to_string(),
+                    restore_abundance: headers, abundance_threshold: Some(threshold),
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            ).unwrap();
+            for (id, source) in [&first, &second].into_iter().enumerate() {
+                let path = if rebuilt {
+                    filtered.join(format!("Dump_{id}_{}.unitigs.fa", source.file_stem().unwrap().to_str().unwrap()))
+                } else { make_dump_path(&filtered, source, id) };
+                let sequences = parse_fasta_sequences(&path);
+                let expected = if id == 1 && restored_max > threshold {
+                    vec!["ACGTACGTACGTACGT".to_string()]
+                } else { vec![] };
+                assert_eq!(kmer_set_from_seqs(&sequences, 7), kmer_set_from_seqs(&expected, 7));
+                if !headers { assert!(!fs::read_to_string(path).unwrap().contains("ka:f:")); }
+            }
+        }
+        for op in [decompress::ColorSetOperation::Union, decompress::ColorSetOperation::Intersection,
+                   decompress::ColorSetOperation::Difference, decompress::ColorSetOperation::SymmetricDifference] {
+            let filtered = workdir.path().join(format!("filtered_{op}"));
+            decompress::decompress_with_options(
+                &"bucket_sizes.txt".to_string(), &"id_to_color_id.txt.zst".to_string(),
+                &"tigs_kloe.fa".to_string(), &"positions_kloe.bin".to_string(),
+                &"filenames_id.txt".to_string(), &(filtered.display().to_string() + "/"),
+                &wanted.display().to_string(), archive.display().to_string() + "/",
+                decompress::GgcatRebuildConfig {
+                    enabled: false, abundance_threshold: Some(restored_17),
+                    color_set_operation: Some(op),
+                    output_compression: decompress::OutputCompression::Fasta,
+                    ..decompress::GgcatRebuildConfig::default()
+                },
+            ).unwrap();
+            let observed = parse_fasta_sequences(&filtered.join(format!("Dump_{op}.fa")));
+            let expected = match op {
+                decompress::ColorSetOperation::Union | decompress::ColorSetOperation::SymmetricDifference =>
+                    vec!["ACGTACGTACGTACGT".to_string()],
+                _ => vec![],
+            };
+            assert_eq!(kmer_set_from_seqs(&observed, 7), kmer_set_from_seqs(&expected, 7), "filtered {op}");
+        }
+    }
+
+    #[test]
+    fn merge_two_archives_preserves_per_file_kmer_content() {
+        let workdir = tempfile::tempdir().expect("create temp workdir");
+        let archive_a = workdir.path().join("archive_a");
+        let archive_b = workdir.path().join("archive_b");
+        let merged_archive = workdir.path().join("archive_merged");
+        let merged_out = workdir.path().join("merged_out");
+        fs::create_dir_all(&archive_a).expect("create archive_a directory");
+        fs::create_dir_all(&archive_b).expect("create archive_b directory");
+        fs::create_dir_all(&merged_archive).expect("create merged archive directory");
+        fs::create_dir_all(&merged_out).expect("create merged output directory");
+
+        let shared = "ACGTACGTTGCAACGTACGTTGCAACGTACGTACGTA".to_string();
+        let a1_only = "TTGCAACGTACGTTTGCAACGTACGTTTGCAACGTAC".to_string();
+        let a2_only = "GGATCCGGATCCGGATCCGGATCCGGATCCGGATCCA".to_string();
+        let b2_only = "CCGTAACCGTAACCGTAACCGTAACCGTAACCGTAAC".to_string();
+
+        let a_file1 = workdir.path().join("a_sample1.fa");
+        let a_file2 = workdir.path().join("a_sample2.fa");
+        let b_file1 = workdir.path().join("b_sample1.fa");
+        let b_file2 = workdir.path().join("b_sample2.fa");
+
+        write_fasta(&a_file1, &[shared.as_str(), a1_only.as_str()]);
+        write_fasta(&a_file2, &[a2_only.as_str()]);
+        write_fasta(&b_file1, &[shared.as_str()]);
+        write_fasta(&b_file2, &[b2_only.as_str()]);
+
+        run_compression(&[a_file1.clone(), a_file2.clone()], &archive_a, K)
+            .expect("compress archive A");
+        run_compression(&[b_file1.clone(), b_file2.clone()], &archive_b, K)
+            .expect("compress archive B");
+        for archive in [&archive_a, &archive_b] {
+            assert!(archive.join(compress::DATASET_TO_CID_FILE).is_file());
+            assert!(
+                !archive.join(compress::CID_TO_DATASET_FILE).exists()
+                    && !archive.join("id_to_color_id.txt.zst").exists(),
+                "new archives must not duplicate the membership relation"
+            );
+        }
+
+        {
+            let _ggcat_guard = ggcat_test_lock();
+            merge::merge_archives(
+                &archive_a.display().to_string(),
+                &archive_b.display().to_string(),
+                &merged_archive.display().to_string(),
+                K,
+                1,
+            )
+            .expect("merge archives");
+        }
+        assert!(merged_archive.join(compress::DATASET_TO_CID_FILE).is_file());
+        assert!(!merged_archive.join("id_to_color_id.txt.zst").exists());
+
+        run_full_decompression(&merged_archive, &merged_out);
+
+        assert_kmer_equivalent(
+            &[shared.clone(), a1_only.clone()],
+            &make_dump_path(&merged_out, &a_file1, 0),
+            K,
+        );
+        assert_kmer_equivalent(
+            &[a2_only.clone()],
+            &make_dump_path(&merged_out, &a_file2, 1),
+            K,
+        );
+        assert_kmer_equivalent(&[shared.clone()], &make_dump_path(&merged_out, &b_file1, 2), K);
+        assert_kmer_equivalent(
+            &[b2_only.clone()],
+            &make_dump_path(&merged_out, &b_file2, 3),
+            K,
+        );
+    }
 }
