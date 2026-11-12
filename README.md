@@ -32,35 +32,16 @@ cargo build --release --bin kloe
 ```
 Builds are configured to always use optimized profiles and native CPU flags from `.cargo/config.toml`.
 
-This creates a KLOE v4 archive containing the k-mer content of the available files
-in the input file-of-files. Missing local files are skipped with a warning naming
-the path and its line in the list, before dataset IDs are assigned. This applies
-with or without abundance storage and abundance filtering. Only retained inputs
-appear in the archive, in their original order. If none remain, compression
-returns an error without creating a complete archive. The input list itself must
-exist, and other input errors (such as permission errors or corrupt data) still
-stop construction.
+This creates a KLOE archive containing the k-mer content of the available files
+in the input file-of-files.
 
-New archives use a dataset-major membership index; they do
-not store the inverse CID-to-dataset relation a second time.
-
-Output paths work with or without a trailing slash. Compression and merge refuse
-to overwrite archive files already present in the destination, including legacy
-archives and incomplete previous runs. Use a fresh directory for each archive.
-The v4 completion marker, `manifest.kloe`, is published atomically only after all
-payloads, indexes and any Logan report have been written successfully. An error
-may leave incomplete files in the destination, but no completion manifest.
-A temporary `.kloe-write.lock` also prevents simultaneous writers from using the
-same destination. It is removed on normal completion or error; after a forced
-termination, use a fresh destination if the lock remains.
+Use a fresh directory for each archive, KLOE does not automatically replace or merge existing archives.
 
 ### Stream Logan unitigs from accession names
 
 Use `--logan-accessions accessions.txt` instead of `-i/--input-list` to fetch
-Logan unitigs directly from the public bucket. The list contains one SRA run
-accession (`SRR`, `ERR`, or `DRR` followed by digits) per line; blank lines and
-lines starting with `#` are ignored. Invalid accessions are skipped with a
-warning by default; duplicate valid accessions are read only once.
+Logan unitigs directly from the public bucket. The list should contain one SRA run
+accession per line.
 
 For example, create an accession list and choose whether to retain abundances:
 
@@ -85,69 +66,11 @@ EOF
   --abundance --abundance-bits 16 --abundance-max 50000 --logan-downloads 4
 ```
 
-Downloads use the HTTP(S) client embedded in KLOE; no external downloader is
-required. Downloads are decompressed and parsed in memory: neither downloaded
-`.zst` files nor decoded input FASTA files are
-written to disk. GGCAT intermediates and the final archive still require disk
-space. `--logan-downloads` limits simultaneous downloads (default 4), including
-metadata requests, retries and resumed streams. One failed accession does not
-cancel the other downloads in the default tolerant mode.
-The default endpoint is `https://s3.amazonaws.com/logan-pub`, using the paths
-specified in the [Logan unitig documentation](https://github.com/IndexThePlanet/Logan/blob/main/Unitigs.md).
-Use `--logan-base-url` for a HTTP(S) mirror with the same `/u/ACCESSION/ACCESSION.unitigs.fa.zst` layout.
+`--logan-downloads` limits simultaneous downloads (default 4)
 
-Without abundance, each accession has one body download, preceded by a small
-HTTP HEAD request to estimate its size. Unsupported or failed metadata requests
-fall back to a size estimate and do not prevent the GET download; a metadata
-404 or 410 excludes the missing accession. Abundance modes normally use two body
-downloads: one to identify observed abundance values, and another for graph
-construction. Both passes process accessions in parallel, bounded by
-`--logan-downloads`; graph-pass concurrency also depends on GGCAT's reader
-threads, controlled by `-t`. The first abundance pass scans headers without
-copying DNA, and keeps the observed abundance dictionaries and compressed byte counts.
-Bucket planning uses the same file-size heuristic as the corresponding local
-input mode: half the compressed size for ordinary FASTA input, or the compressed
-size for abundance/filter input. The abundance scan does not replace this hint
-with decoded sequence length. Missing size metadata uses an advisory estimate;
-accessions known to have failed before planning contribute zero. These estimates
-control GGCAT's bucket plan, not the amount of input retained in memory.
-Construction writes the first-stage temporary buckets to disk as well as later
-intermediates. A slow temporary disk applies backpressure through the bounded
-write queue; in-flight writes are counted while waiting for their buffers to be
-released. Put `-d` on a disk-backed filesystem with enough temporary space, not
-on a RAM-backed filesystem such as `tmpfs`. The `-r` value remains a working
-memory budget, not a hard limit on every graph-library allocation.
-Input-bucket LZ4 compressors are created on demand and retained in a bounded
-cache sized from the temporary-memory budget, rather than creating one for
-every bucket before the first download. Eviction closes an indexed compression
-frame; checkpoints with metadata and explicitly indivisible frames are preserved.
-Idle disk buckets also flush their partial output buffer and return it to the
-allocator; the next write acquires a buffer again.
-Stream fingerprints detect objects that change between abundance passes.
-Transient connection errors, HTTP 408/429 and server errors are retried with
-backoff. A server's `Retry-After` delay is honored, whether specified as seconds
-or an HTTP date. Retry waits stop promptly when a fatal error cancels the job.
-`--logan-retries N` sets the number of additional attempts (default 2,
-so at most 3 attempts per metadata request or body download). A stalled body
-read times out after 120 seconds. Interrupted bodies can resume at the exact
-compressed byte offset when the server supports HTTP ranges and confirms the
-same strong ETag. Records already streamed into the graph are never replayed.
-If safe recovery is unavailable or attempts are exhausted, the entire accession
-is excluded, including any sequences already read from it. Invalid FASTA,
-invalid Zstandard data and objects that change between abundance passes are
-also excluded. A 404 is not retried.
+`--logan-retries N` sets the number of additional attempts (default 2) Use `--logan-strict` to stop on
+the first invalid, duplicate or failed accession.
 
-The output directory contains `logan-skipped.tsv`, listing excluded accessions
-and reasons. Only successful accessions appear in the archive's dataset index;
-their order follows the input list. If none succeed, compression returns an
-error and does not create a complete archive. Use `--logan-strict` to stop on
-the first invalid, duplicate or failed accession instead. Local output, memory
-or graph-construction errors remain fatal in both modes.
-
-Dataset names in the archive are the accessions themselves, so a targeted
-decompression list supplied with `-Q` should contain those accession names.
-The output directory must not already contain archive files. This option
-is available only for compression; archive decompression remains unchanged.
 
 To restore abundance-annotated FASTA from either abundance archive, use
 `--stored-tigs --abundance`; the precision is read from the archive:
@@ -157,15 +80,11 @@ To restore abundance-annotated FASTA from either abundance archive, use
   --stored-tigs --abundance
 ```
 
-Output is Zstandard-compressed FASTA by default; add
-`--output-compression fasta` for plain FASTA. The emitted records are the
-archive's stored tigs, whose boundaries can differ from the original Logan
-unitigs. Abundances are rounded and capped at `--abundance-max` before encoding;
-16-bit exactness applies to those rounded, capped values. See
-[automatic abundance encoding](#automatic-abundance-encoding---abundance)
-for the approximation rule.
+Output is Zstandard-compressed FASTA by default. Add
+`--output-compression fasta` for plain FASTA.
+Abundances are rounded and capped at `--abundance-max` before encoding.
 
-### KLOE v4 archive layout
+### KLOE archive layout
 
 - `manifest.kloe`: format version, k and minimizer sizes, dataset/CID counts,
   and abundance configuration.
